@@ -1,6 +1,8 @@
 """Static candidate selection: which tests could a patch possibly break."""
 from __future__ import annotations
 
+import ast
+import functools
 import gzip
 import json
 import os
@@ -25,6 +27,9 @@ class Map:
         self.opened = {p: set(s) for p, s in d["opened"].items()}
         self.file_of = [t.split("::", 1)[0] for t in self.tests]
         self._file_users = {}
+        self._tests_by_file = {}
+        for i, f in enumerate(self.file_of):
+            self._tests_by_file.setdefault(f, set()).add(i)
 
     def covering(self, f, start, end):
         m = self.lines.get(f)
@@ -52,7 +57,7 @@ class Map:
         return self._file_users[f]
 
     def tests_in_file(self, tf):
-        return {i for i, f in enumerate(self.file_of) if f == tf}
+        return set(self._tests_by_file.get(tf, ()))
 
 
 def dialect_name(path):
@@ -67,6 +72,7 @@ class Decision:
         self.cands: set[int] = set()
         self.precise: set[int] = set()   # candidates not coming from broad import-time guesses
         self.all = False
+        self.parsed = {}  # patched trees reused when instrumenting this change
         self.reasons: list[str] = []
         self.import_change = False   # something changed at import time
         self.files: dict[str, str] = {}  # path -> new content (None = deleted)
@@ -96,6 +102,7 @@ def analyze(patch_text: str, repo: Path, M: Map) -> Decision:
     return D
 
 
+@functools.lru_cache(maxsize=256)
 def _read(repo, rel):
     p = repo / rel
     try:
@@ -164,6 +171,10 @@ def _opened_users(p, M):
     for q, users in M.opened.items():
         if q == p or (q.endswith("/") and p.startswith(q)):
             s |= users
+    if "tests/fixtures/optimizer/tpc-ds" in p:
+        s = {u for u in s if not (M.file_of[u] == "tests/test_executor.py" and "test_execute_tpcds" not in M.tests[u])}
+    elif "tests/fixtures/optimizer/tpc-h" in p:
+        s = {u for u in s if not (M.file_of[u] == "tests/test_executor.py" and "test_execute_tpch" not in M.tests[u] and "test_optimized_tpch" not in M.tests[u])}
     return s
 
 
@@ -208,7 +219,10 @@ def _python(p, old_text, new_text, fp, M, D):
     if old_text is None:
         return
     try:
-        same, changes = ast_changes(old_text, new_text)
+        tree = ast.parse(new_text)
+        same, changes = ast_changes(old_text, new_text, tree)
+        if not same:
+            D.parsed[p] = tree
     except SyntaxError:
         # module cannot be imported any more
         D.import_change = True

@@ -61,6 +61,6 @@ built from the pinned commit.
   - `buildimports.py`: the sqlglot modules each test imports
   - `optfrac.py`: share of each test's time spent in `optimize()`
   - `genmutants.py`, `fastlabel.py` and friends: evaluation on synthetic mutants
-- `make sample` runs the image under the scorer's flags on the sample and scores it.
+- `make sample` scores three fresh containers and reports the median of simulated time plus measured CPU. The default build targets linux/amd64. On ARM, use `make sample PLATFORM=linux/arm64 IMAGE=blast-radius-native` for native CPU measurements. AMD64 emulation can crash DuckDB during preparation and exercise a slower fallback. A native AMD64 Docker host gives the closest hardware comparison with the fleet.
 
 The tools expect a dev container with this repo at `/w`, the sqlglot checkout at `/w/sqlglot`, and the starter kit at `/kit`.

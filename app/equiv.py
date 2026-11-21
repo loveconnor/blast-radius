@@ -53,8 +53,9 @@ def _dump(n):
 
 def _pairs(old_src, new_src):
     """Expression pairs that are the whole difference, or None if we cannot see it all."""
-    if patchlib._same_ast(ast.parse(old_src), ast.parse(new_src)) or old_src == new_src:
+    if old_src == new_src:
         return []
+    # _same_ast compares statements by their source lines, which it reads from these
     patchlib._LA = old_src.splitlines()
     patchlib._LB = new_src.splitlines()
     old, new = patchlib._parse_old(old_src), ast.parse(new_src)
@@ -464,20 +465,30 @@ def _syntax_not(old, new):
     return _dump(bare.left) == _dump(wrapped.left) and _dump(bare.comparators) == _dump(wrapped.comparators)
 
 
-def unload():
-    """Drop sqlglot modules imported while proving equivalence.
-
-    The flag `expressions.core.UNITTEST` is set from whether unittest is already
-    imported. Proving a patch imports sqlglot before the test modules, so those
-    modules must be imported again later, once unittest is loaded, or the state
-    diff reports a phantom change.
-    """
-    for name in list(sys.modules):
-        if name == "sqlglot" or name.startswith("sqlglot."):
-            del sys.modules[name]
+_CONST_SHAPES = (ast.Constant, ast.Name, ast.Attribute, ast.UnaryOp)
 
 
-def proven_equivalent(files: dict, repo) -> bool:
+def _provable_shape(old, new):
+    """Whether _prove could accept this pair at all. Needs no import of the edited module."""
+    if _syntax_not(old, new):
+        return True
+    if not (isinstance(old, ast.Compare) and isinstance(new, ast.Compare)):
+        return isinstance(old, _CONST_SHAPES) and isinstance(new, _CONST_SHAPES)
+    if len(old.ops) != 1 or len(new.ops) != 1:
+        return False
+    if _dump(old.left) != _dump(new.left) or _dump(old.comparators) != _dump(new.comparators):
+        return False
+    if {type(old.ops[0]), type(new.ops[0])} in ({ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq}):
+        return True
+    return all(isinstance(s, _CONST_SHAPES) for s in (old.left, *old.comparators))
+
+
+def maybe_equivalent(files: dict, repo) -> bool:
+    """Cheap screen for proven_equivalent: False means the proof would fail."""
+    return proven_equivalent(files, repo, _provable_shape)
+
+
+def proven_equivalent(files: dict, repo, prove=None) -> bool:
     """True when every edited file is behavior-preserving and at least one edit was proven so.
 
     `files` maps a repo-relative path to its new text (None when the file is deleted).
@@ -499,7 +510,7 @@ def proven_equivalent(files: dict, repo) -> bool:
         if not pairs:
             continue
         for a, b in pairs:
-            if not _prove(a, b, repo, rel):
+            if not (prove(a, b) if prove else _prove(a, b, repo, rel)):
                 return False
         proved = True
     return proved

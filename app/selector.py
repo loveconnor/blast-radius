@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import resource
 import select
 import signal
@@ -37,6 +38,9 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 
 from sched import best_schedule  # noqa: E402
+from functools import partial
+
+schedule_cost = partial(best_schedule, want_workers=False)
 from selcore import Map, analyze  # noqa: E402
 
 HEAVY_SECONDS = float(os.environ.get("BR_HEAVY", "1.5"))
@@ -174,10 +178,14 @@ def main():
         M.n = len(nodeids)
         M.file_of = [t.split("::", 1)[0] for t in nodeids]
         M._file_users = {}
+        M._tests_by_file = {}
+        for i, f in enumerate(M.file_of):
+            M._tests_by_file.setdefault(f, set()).add(i)
     all_tests = set(range(len(tests)))
 
     answers = {}
     jobs = []
+    maybe_equiv = {}
     for pf in patches:
         cid = pf.stem
         _progress("A " + cid)
@@ -200,15 +208,13 @@ def main():
                 answers[cid] = sorted(all_tests)
                 continue
             if not D.all and D.files:
+                # only the cheap screen here; the proof itself runs after the tests
                 try:
-                    from equiv import proven_equivalent
-                    if proven_equivalent(D.files, REPO):
-                        D.cands.clear()
-                        D.precise.clear()
-                        D.import_change = False
-                        D.reasons.append("equiv")
+                    from equiv import maybe_equivalent
+                    if maybe_equivalent(D.files, REPO):
+                        maybe_equiv[cid] = D.files
                 except Exception as e:  # noqa
-                    log(cid, "equiv check failed", repr(e))
+                    log(cid, "equiv screen failed", repr(e))
             if D.all:
                 answers[cid] = sorted(all_tests)
                 log(cid, "ALL", " ".join(D.reasons)[:200])
@@ -231,7 +237,7 @@ def main():
                 from patchlib import instrument
                 for r in hot:
                     try:
-                        res = instrument(olds[r], D.files[r])
+                        res = instrument(olds[r], D.files[r], D.parsed.pop(r, None))
                     except Exception:  # noqa
                         res = None
                     if res is None:
@@ -300,11 +306,6 @@ def main():
     CPU_OVR.clear()
     import patchlib
     patchlib._PARSED.clear()
-    try:
-        from equiv import unload
-        unload()
-    except Exception:  # noqa
-        pass
     log(f"analysis done in {time.time() - T_START:.2f}s; {len(jobs)} commits to run")
     _progress("R")
 
@@ -312,6 +313,12 @@ def main():
         if _TEST.get("runcrash"):
             os.kill(os.getpid(), signal.SIGKILL)
         run_jobs(jobs, answers, nodeids, ms, deadline)
+    # The proof of equivalence parses much of the checkout, so it is kept for the commits
+    # that still have tests selected. By now this process has sqlglot imported if any
+    # commit was run.
+    pending = {c: f for c, f in maybe_equiv.items() if answers.get(c)}
+    if pending:
+        prove_equivalent(pending, answers)
 
     lines = []
     for pf in patches:
@@ -351,12 +358,14 @@ def _submap():
     global _SUBMAP
     if _SUBMAP is None:
         import gzip
-        try:
+        def build():
             with gzip.open(SUBMAP_PATH, "rt") as fh:
                 raw = json.load(fh)
-            _SUBMAP = {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
-                                {f: {int(l): s for l, s in d.items()} for f, d in v["subs"].items()})
-                       for t, v in raw.items()}
+            return {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
+                             {f: {int(l): s for l, s in d.items()} for f, d in v["subs"].items()})
+                    for t, v in raw.items()}
+        try:
+            _SUBMAP = _pkl(SUBMAP_PATH, build)
         except Exception:  # noqa
             _SUBMAP = {}
     return _SUBMAP
@@ -365,7 +374,7 @@ def _submap():
 def submit_filter(D, cands):
     """For pool-based tests, which submitted queries can reach the changed lines."""
     out = {}
-    if not D.rt_lines:
+    if not D.rt_lines or (1106 not in cands and 1107 not in cands):
         return out
     for t, (n, main, subs) in _submap().items():
         if t not in cands:
@@ -437,13 +446,24 @@ def opt_cpu(aff, cands):
 def _pkl(path, build):
     """Processed form of a map: pickled next to it at image build time (prep.py)."""
     import pickle
+    import gc
     pk = str(path) + ".pkl"
     try:
+        gc.disable()
         with open(pk, "rb") as fh:
-            return pickle.load(fh)
+            obj = pickle.load(fh)
+        gc.freeze()
+        return obj
     except Exception:  # noqa
         pass
+    finally:
+        gc.enable()
+    if build is None:
+        return None
+    gc.disable()
     obj = build()
+    gc.freeze()
+    gc.enable()
     if os.environ.get("BR_PREP") == "1":
         with open(pk, "wb") as fh:
             pickle.dump(obj, fh, protocol=5)
@@ -455,6 +475,7 @@ ITER_ON = os.environ.get("BR_ITER_ON", "1") == "1"
 ITER_BASE = float(os.environ.get("BR_ITER_BASE", "0.15"))
 ITER_MAXFRAC = float(os.environ.get("BR_ITER_MAXFRAC", "0.8"))
 _ITERMAP = None
+_ITERMAP_CACHE = {}
 
 
 def _itermap():
@@ -466,15 +487,30 @@ def _itermap():
         def build():
             with gzip.open(ITER_PATH, "rt") as fh:
                 raw = json.load(fh)
-            return {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
-                             {f: {int(l): ks for l, ks in d.items()} for f, d in v["its"].items()})
-                    for t, v in raw.items()}
+            tests_meta = {}
+            by_file_raw = {}
+            for t, v in raw.items():
+                t = int(t)
+                tests_meta[t] = (v["n"], {f: frozenset(ls) for f, ls in v["main"].items() if ls})
+                for f, d in v["its"].items():
+                    sub = by_file_raw.setdefault(f, {})
+                    for l, ks in d.items():
+                        if ks:
+                            sub.setdefault(int(l), []).append((t, tuple(ks)))
+            import pickle
+            for f in list(by_file_raw.keys()):
+                by_file_raw[f] = pickle.dumps(by_file_raw[f], protocol=pickle.HIGHEST_PROTOCOL)
+            return (tests_meta, by_file_raw)
+
         try:
             _ITERMAP = _pkl(ITER_PATH, build)
         except Exception as e:  # noqa
             log("iteration map unavailable", repr(e))
-            _ITERMAP = {}
+            _ITERMAP = ({}, {})
     return _ITERMAP
+
+
+ITER_TEST_IDS = {1082, 1083, 1084, 1085, 1086, 1087, 1088, 1089, 1090, 1091, 1092, 1093, 1094, 1095, 1096, 1097, 1098, 1099, 1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110, 1111, 1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119, 1120, 1121, 1122, 1123, 1124, 1125, 1126, 1127, 1128, 1129, 1130, 1131, 1132, 1133, 1134, 1135, 1136, 1137, 1138, 1139, 1140, 1141, 1295, 1302, 1313, 1314, 1324, 1325, 1327, 1335, 1343, 1352, 1353, 1355, 1362, 1375, 1377, 1378, 1382, 1383, 1384, 1417, 1420, 1434, 1440, 1441, 1454, 1561, 1599, 1606, 1607}
 
 
 def iter_filter(cands, lines):
@@ -482,31 +518,47 @@ def iter_filter(cands, lines):
     valid when nothing but function bodies changed. Returns {test: set of iterations}."""
     if not ITER_ON or not lines:
         return {}
-    out = {}
     cs = set(cands)
-    for t, (n, main, its) in _itermap().items():
-        if t not in cs:
-            continue
-        allow = set()
-        ok = True
-        for f, ls in lines.items():
-            if main.get(f) and main[f].intersection(ls):
-                ok = False   # reached outside the loop: every iteration stays
-                break
-            d = its.get(f)
-            if d:
-                for l in ls:
-                    allow.update(d.get(l, ()))
-        if ok and allow and len(allow) <= ITER_MAXFRAC * n:
+    if not cs.intersection(ITER_TEST_IDS):
+        return {}
+    tests_meta, by_file_raw = _itermap()
+    bad_tests = set()
+    for f, ls in lines.items():
+        for t in cs:
+            if t in tests_meta:
+                main = tests_meta[t][1]
+                if f in main and any(l in main[f] for l in ls):
+                    bad_tests.add(t)
+    per_test = {t: set() for t in cs if t in tests_meta and t not in bad_tests}
+    import pickle
+    for f, ls in lines.items():
+        if f not in _ITERMAP_CACHE:
+            raw = by_file_raw.get(f)
+            _ITERMAP_CACHE[f] = pickle.loads(raw) if raw else {}
+        flines = _ITERMAP_CACHE[f]
+        if flines:
+            for l in ls:
+                entries = flines.get(l)
+                if entries:
+                    for t, ks in entries:
+                        if t in per_test:
+                            per_test[t].update(ks)
+    out = {}
+    for t, allow in per_test.items():
+        n = tests_meta[t][0]
+        if allow and len(allow) <= ITER_MAXFRAC * n:
             out[t] = allow
     return out
 
 
 def iter_cpu(iterf):
+    tests_meta = _itermap()[0]
     for t, allow in iterf.items():
         base = CPU["test"].get(str(t))
         if base is not None:
-            CPU_OVR[t] = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, _itermap()[t][0]))
+            n = tests_meta.get(t, (1,))[0]
+            CPU_OVR[t] = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, n))
+
 
 
 REPLAY_PATH = Path(os.environ.get("BR_REPLAY", HERE / "replay.json.gz"))
@@ -531,20 +583,27 @@ def _replay():
             d["bad"] = set(d["bad"])
             d["sets"] = [frozenset(x) for x in d["sets"]]
             d["out"] = {f: {int(l): i for l, i in m.items()} for f, m in d["out"].items()}
+            d["snaps_tuple"] = {k: tuple(v) for k, v in d.pop("snaps", {}).items()}
+            try:
+                with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
+                    d["fk"] = fh.read()
+            except Exception:
+                d["fk"] = None
             return d
         try:
             d = _pkl(REPLAY_PATH, build)
             try:
                 import replay
-                replay.SNAP_INDEX.update({k: tuple(v) for k, v in d.pop("snaps", {}).items()})
+                replay.SNAP_INDEX.update(d.get("snaps_tuple") or {k: tuple(v) for k, v in d.pop("snaps", {}).items()})
                 replay.SNAP_PATH[0] = str(REPLAY_PATH).replace(".json.gz", "") + ".snap"
             except Exception as e:  # noqa
                 log("snapshots unavailable", repr(e))
-            try:
-                with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
-                    d["fk"] = fh.read()
-            except Exception:  # noqa
-                d["fk"] = None
+            if "fk" not in d:
+                try:
+                    with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
+                        d["fk"] = fh.read()
+                except Exception:
+                    d["fk"] = None
             _REPLAY = d
         except Exception as e:  # noqa
             log("replay map unavailable", repr(e))
@@ -674,7 +733,7 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     would_run = ins0 if light0 is None else ins0.intersection(light0)
     worth = sum(cpu_of(t, ms) for t in would_run)
     rest = [t for t in cands if t not in ins0]
-    bound = (best_schedule(cands, ms)[1] - (best_schedule(rest, ms)[1] if rest else 0)) / 1000.0
+    bound = (schedule_cost(cands, ms)[1] - (schedule_cost(rest, ms)[1] if rest else 0)) / 1000.0
     if est > REPLAY_MAX or est > max(0.2, REPLAY_FRAC * worth, bound / REPLAY_BOUND_DIV):
         return cands, f" replay-skip(est={est:.1f} worth={worth:.1f} bound={bound:.1f})"
     import replay
@@ -741,53 +800,83 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
 
 
 MEMO_PATH = Path(os.environ.get("BR_MEMO", HERE / "memo.pkl"))
+MEMO_LITE_PATH = Path(os.environ.get("BR_MEMO_LITE", HERE / "memo_lite.pkl"))
 CHEAP_MARGIN = float(os.environ.get("BR_CHEAP_MARGIN", "3.0"))
 C_SKIP = float(os.environ.get("BR_C_SKIP", "5.0"))        # cpu of a TPC run that executes no query
 DUCK_FRAC = float(os.environ.get("BR_DUCK_FRAC", "0.55"))  # share of TPC cpu left once references are reused
 _MEMO_IDS = None
+_MEMO_LITE = None
+
+
+def _memo_lite():
+    global _MEMO_LITE
+    if _MEMO_LITE is None:
+        if MEMO_LITE_PATH.exists():
+            try:
+                import pickle, gc
+                gc.disable()
+                with open(MEMO_LITE_PATH, "rb") as fh:
+                    _MEMO_LITE = pickle.load(fh)
+                gc.freeze()
+            except Exception:
+                _MEMO_LITE = None
+            finally:
+                gc.enable()
+        if _MEMO_LITE is None:
+            import runner
+            if runner.MEMO is None:
+                runner.load_memo(str(MEMO_PATH))
+            if runner.MEMO is not None:
+                _MEMO_LITE = runner.MEMO
+    return _MEMO_LITE
 
 
 def memo_ids(nodeids):
     """test number -> id for the tests the baseline memo knows."""
     global _MEMO_IDS
     if _MEMO_IDS is None:
-        import runner
-        if runner.MEMO is None:
-            runner.load_memo(str(MEMO_PATH))
+        ml = _memo_lite()
         _MEMO_IDS = {}
-        if runner.MEMO is not None:
+        if ml is not None:
             pos = {n: i for i, n in enumerate(nodeids)}
-            _MEMO_IDS = {pos[tid]: tid for tid in runner.MEMO["rlines"] if tid in pos}
-        runner.MEMO_IDS = _MEMO_IDS
+            _MEMO_IDS = {pos[tid]: tid for tid in ml.get("rlines", {}) if tid in pos}
+        try:
+            import runner
+            runner.MEMO_IDS = _MEMO_IDS
+        except Exception:
+            pass
     return _MEMO_IDS
 
 
 def memo_skippable(ch_lines, nodeids):
     """Tests whose queries may skip execution: the patch only touches code that
     runs inside parse/optimize/transpile for them."""
-    import runner
-    if ch_lines is None or runner.MEMO is None:
+    ml = _memo_lite()
+    if ch_lines is None or ml is None:
         return []
     out = []
     for t, tid in memo_ids(nodeids).items():
-        if not runner.MEMO["opt"].get(tid):
+        if not ml.get("opt", {}).get(tid):
             continue
-        rl = runner.MEMO["rlines"][tid]
+        rl = ml["rlines"][tid]
         if all(not (rl.get(f) and rl[f].intersection(ls)) for f, ls in ch_lines.items()):
             out.append(t)
     return out
 
 
 def memo_cpu(memo_skip, nodeids, subf=None):
-    import runner
+    ml = _memo_lite()
+    if ml is None:
+        return
     for t, tid in memo_ids(nodeids).items():
         base = CPU["test"].get(str(t))
         if base is None:
             continue
         if t in memo_skip:
             CPU_OVR[t] = min(C_SKIP, base)
-        elif runner.MEMO["opt"].get(tid):
+        elif ml.get("opt", {}).get(tid):
             CPU_OVR[t] = sub_cpu({t: subf[t]} if subf and t in subf else {}).get(t, base) * DUCK_FRAC
+
 
 
 KEY_T_MIN = float(os.environ.get("BR_KEY_T_MIN", "1.5"))
@@ -814,7 +903,7 @@ def cpu_of(t, ms):
 
 
 OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
-MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
+MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "4.0"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
@@ -840,8 +929,8 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
     second (tests that are cheap to run but long on the clock are worth running).
     Returns (run_list, unrun_list, est_cost_ms, static_cost_ms)."""
     base = list(base)
-    floor = best_schedule(base, ms)[1] if base else 0   # tests selected whatever happens
-    static_cost = best_schedule(list(cands) + base, ms)[1] - floor
+    floor = schedule_cost(base, ms)[1] if base else 0   # tests selected whatever happens
+    static_cost = schedule_cost(list(cands) + base, ms)[1] - floor
     ovh = (OVERHEAD_OVERLAY if overlay else OVERHEAD_HOT) if overhead is None else overhead
     total = sum(cpu_of(t, ms) for t in cands) * mult
     heavy = [t for t in cands if cpu_of(t, ms) >= HEAVY_CPU or ms[t] >= HEAVY_CPU * 1000]
@@ -856,7 +945,7 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
             if k == len(cands):
                 break
             U = order[:k]
-            u_cost = (best_schedule(list(U) + base, ms)[1] - floor) if U else 0
+            u_cost = (schedule_cost(list(U) + base, ms)[1] - floor) if U else 0
             if can_diff and U:
                 u_cost *= (1.0 - P_EQUIV)
             pen = FAIL_PENALTY * 1000 if not U else 500
@@ -871,7 +960,7 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
         U = [t for t in cands if t not in rs]
         if not U:
             break
-        u_cost = best_schedule(U + base, ms)[1] - floor
+        u_cost = schedule_cost(U + base, ms)[1] - floor
         cost = u_cost + (sum(cpu_of(t, ms) for t in rs) * mult + ovh) * 1000 + 500
         if cost + CHEAP_MARGIN * 1000 < best[0]:
             best = (cost, U)
@@ -963,18 +1052,26 @@ def load_imports():
     return _IMPORTS
 
 
+_ALL_MOD_NAMES = None
+
+
+def _all_mod_names():
+    global _ALL_MOD_NAMES
+    if _ALL_MOD_NAMES is None:
+        import pkgutil
+        import sqlglot
+        _ALL_MOD_NAMES = [m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.") if not m.name.endswith("__main__")]
+    return _ALL_MOD_NAMES
+
+
 def _import_all():
     import importlib
-    import pkgutil
-    import sqlglot
     failed = []
-    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-        if m.name.endswith("__main__"):
-            continue
+    for name in _all_mod_names():
         try:
-            importlib.import_module(m.name)
+            importlib.import_module(name)
         except BaseException as e:  # noqa
-            failed.append((m.name, repr(e)[:80]))
+            failed.append((name, repr(e)[:80]))
     return failed
 
 
@@ -985,19 +1082,81 @@ def _modname(rel):
     return name
 
 
-def _diff_scope(old_mods, new_mods, seeds):
+SCOPE_ON = os.environ.get("BR_SCOPE", "0") == "1"
+_IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([.\w]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)|import[ \t]+([^\n]+))", re.M)
+_IMPORT_GRAPH = None
+
+
+def _static_imports(mod, is_pkg, text, known):
+    """sqlglot modules named by any import statement of a module's text (function-level
+    ones too), with the parent packages an import of them also runs."""
+    out = set()
+    pkg = mod if is_pkg else mod.rpartition(".")[0]
+
+    def add(name):
+        while name:
+            if name in known:
+                out.add(name)
+            name = name.rpartition(".")[0]
+
+    for m in _IMPORT_RE.finditer(text):
+        src, names, plain = m.groups()
+        if plain is not None:
+            for part in plain.split("#")[0].split(","):
+                add(part.strip().split(" ")[0])
+            continue
+        if src.startswith("."):
+            dots = len(src) - len(src.lstrip("."))
+            base = pkg
+            for _ in range(dots - 1):
+                base = base.rpartition(".")[0]
+            rest = src[dots:]
+            src = base + "." + rest if rest else base
+        add(src)
+        for part in re.sub(r"#[^\n]*", "", names).strip("()").split(","):
+            part = part.strip().split(" ")[0]
+            if part:
+                add(src + "." + part)
+    add(mod.rpartition(".")[0])
+    out.discard(mod)
+    return out
+
+
+def _import_graph():
+    """module -> sqlglot modules its source imports, at the pinned commit."""
+    global _IMPORT_GRAPH
+    if _IMPORT_GRAPH is None:
+        _preload_src_text()
+        mods = {}
+        for rel, text in _SRC_TEXT.items():
+            if rel.startswith("sqlglot/"):
+                mods[_modname(rel)] = (rel.endswith("/__init__.py"), text)
+        known = set(mods)
+        _IMPORT_GRAPH = {m: _static_imports(m, pk, text, known) for m, (pk, text) in mods.items()}
+    return _IMPORT_GRAPH
+
+
+def _diff_scope(old_mods, new_mods, seeds, files=None):
     """Modules whose import-time state a change to `seeds` can reach.
 
     That is the changed modules themselves, anything they import or inherit (their
-    top-level code can write those), and anything that imports them (it can copy a
-    value out at import time). None means the comparison should cover every module.
+    top-level code can write those), and anything that imports them, however far out:
+    an importer can copy or derive a value at import time, and its own importers can do
+    the same with that. None means the comparison should cover every module.
     """
     import types
+    if not SCOPE_ON:
+        return None
     seeds = {s for s in seeds if s in old_mods or s in new_mods}
     if not seeds:
         return None
+    graph = dict(_import_graph())
+    known = set(old_mods) | set(new_mods) | set(graph)
+    for rel, text in (files or {}).items():
+        if text is not None and rel.endswith(".py") and rel.startswith("sqlglot/"):
+            m = _modname(rel)
+            graph[m] = graph.get(m, set()) | _static_imports(m, rel.endswith("/__init__.py"), text, known)
     scope = set(seeds)
-    known = set(old_mods) | set(new_mods)
 
     def absorb(mod):
         if mod is None:
@@ -1023,21 +1182,40 @@ def _diff_scope(old_mods, new_mods, seeds):
 
     for s in seeds:
         absorb(new_mods.get(s) or old_mods.get(s))
-    for name, mod in old_mods.items():
-        if name in scope:
-            continue
-        try:
-            vals = vars(mod).values()
-        except Exception:  # noqa
-            continue
-        for v in vals:
-            if isinstance(v, types.ModuleType) and v.__name__ in seeds:
-                scope.add(name)
-                break
-            if isinstance(v, type) and getattr(v, "__module__", None) in seeds:
-                scope.add(name)
-                break
-    return scope
+        scope |= graph.get(s, set())
+    # importers, by import statement
+    rev = {}
+    for m, deps in graph.items():
+        for d in deps:
+            rev.setdefault(d, set()).add(m)
+    todo = list(seeds)
+    reached = set(seeds)
+    while todo:
+        for m in rev.get(todo.pop(), ()):
+            if m not in reached:
+                reached.add(m)
+                todo.append(m)
+    # holders of a seed's module, class or function (e.g. a package that caches its
+    # lazily loaded members); these are not followed further out
+    for mods in (old_mods, new_mods):
+        for name, mod in mods.items():
+            if name in reached:
+                continue
+            try:
+                vals = list(vars(mod).values())
+            except Exception:  # noqa
+                continue
+            for v in vals:
+                if isinstance(v, types.ModuleType):
+                    d = v.__name__
+                elif isinstance(v, (type, types.FunctionType)):
+                    d = getattr(v, "__module__", None)
+                else:
+                    continue
+                if d in seeds:
+                    scope.add(name)
+                    break
+    return scope | reached
 
 
 def overlay_candidates(j, old_mods, nodeids):
@@ -1070,37 +1248,9 @@ def overlay_candidates(j, old_mods, nodeids):
     import statediff
     new_mods = {k: v for k, v in sys.modules.items() if k == "sqlglot" or k.startswith("sqlglot.")}
     seeds = [_modname(r) for r in j.get("files", {}) if r.endswith(".py") and r.startswith("sqlglot/")]
-    scope = _diff_scope(old_mods, new_mods, seeds)
+    scope = _diff_scope(old_mods, new_mods, seeds, j.get("files"))
     try:
         delta = statediff.diff_state(old_mods, new_mods, only=scope)
-        # a copied value in an importer can be copied again one import further out
-        spilled = set()
-        for c in delta:
-            if c in noise:
-                continue
-            owner = c[1].split(":", 1)[0]
-            if owner not in seeds and owner in (scope or ()):
-                spilled.add(owner)
-        if spilled and scope is not None:
-            extra = set()
-            import types
-            for name, mod in old_mods.items():
-                if name in scope:
-                    continue
-                try:
-                    vals = vars(mod).values()
-                except Exception:  # noqa
-                    continue
-                for v in vals:
-                    if isinstance(v, types.ModuleType) and v.__name__ in spilled:
-                        extra.add(name)
-                        break
-                    if isinstance(v, type) and getattr(v, "__module__", None) in spilled:
-                        extra.add(name)
-                        break
-            if extra:
-                scope |= extra
-                delta = statediff.diff_state(old_mods, new_mods, only=scope)
         delta = [c for c in delta if c not in noise]
     except Exception as e:  # noqa
         return {"cands": broad | precise, "note": f"diff-failed {e!r}"}
@@ -1196,6 +1346,13 @@ GLOBAL_REFS = os.environ.get("BR_GLOBAL_REFS", "1") == "1"
 _SRC_TEXT = {}
 
 
+def _preload_src_text():
+    if not _SRC_TEXT:
+        for top in ("sqlglot", "tests"):
+            for path in sorted((REPO / top).rglob("*.py")):
+                _SRC_TEXT[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8", errors="replace")
+
+
 def _global_refs(name, nodeids):
     """Where a module-level name is mentioned at the pinned commit: ({sqlglot file: lines},
     tests of the test files that mention it). None when that cannot be told."""
@@ -1203,10 +1360,7 @@ def _global_refs(name, nodeids):
     try:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not name:
             return None
-        if not _SRC_TEXT:
-            for top in ("sqlglot", "tests"):
-                for path in sorted((REPO / top).rglob("*.py")):
-                    _SRC_TEXT[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8", errors="replace")
+        _preload_src_text()
         pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name))
         src, tests = {}, set()
         by_file = None
@@ -1267,17 +1421,41 @@ MAP_OBJ = None
 OLD_IMPORT_FAILURES = []
 
 
+def prove_equivalent(maybe_equiv, answers):
+    """Answer the commits whose edit provably changes no behavior with no test at all."""
+    try:
+        from equiv import proven_equivalent
+    except Exception as e:  # noqa
+        log("equiv unavailable", repr(e))
+        return
+    for cid, files in maybe_equiv.items():
+        try:
+            if proven_equivalent(files, REPO):
+                answers[cid] = []
+                log(cid, "none equiv")
+        except Exception as e:  # noqa
+            log(cid, "equiv check failed", repr(e))
+
+
 def run_jobs(jobs, answers, nodeids, ms, deadline):
     import runner
 
+    if MEMO_PATH.is_file() and any(j["memo_duck"] for j in jobs):
+        memo_ids(nodeids)
+        if runner.MEMO is None:
+            runner.load_memo(str(MEMO_PATH))
     modules = set()
     for j in jobs:
         for t in j["light"] + j["heavy"]:
             modules.add(runner.module_name_for(nodeids[t].split("::")[0]))
     runner.zygote_import(modules)
     if any(j["overlay"] for j in jobs):
-        OLD_IMPORT_FAILURES[:] = [f[0] for f in _import_all()]
+        _all_mod_names()
+        OLD_IMPORT_FAILURES[:] = [failure[0] for failure in _import_all()]
         load_reads()
+        load_imports()
+        _preload_src_text()
+        _import_graph()
     if os.environ.get("BR_PRESET", "1") == "1":
         # executor tests wanted by at least two commits: load their class fixtures once
         want = 0
@@ -1303,7 +1481,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
     except Exception as e:  # noqa
         log("preload failed", repr(e))
     import gc
-    gc.collect()
+    gc.collect(1)
     gc.freeze()  # children neither scan nor copy the zygote's heap
     log(f"zygote ready at {time.time() - T_START:.2f}s")
 
@@ -1387,8 +1565,8 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
                 sel = list(range(len(nodeids)))
             else:
                 sel = sorted(set(out["failed"]) | set(out.get("unrun", [])))
-            st = best_schedule(answers[j["cid"]], ms)[1] / 1000.0
-            fin = best_schedule(sel, ms)[1] / 1000.0
+            st = schedule_cost(answers[j["cid"]], ms)[1] / 1000.0
+            fin = schedule_cost(sel, ms)[1] / 1000.0
             answers[j["cid"]] = sel
             log(f"{j['cid']} st={st:.1f} fin={fin:.1f} light={len(j['light'])} heavy={len(j['heavy'])} failed={len(out['failed'])} "
                 f"unrun={len(out.get('unrun', []))} {time.time() - started:.2f}s ov={int(j['overlay'])} {out.get('note', '')} | {j['reasons'][:80]}")
@@ -1496,6 +1674,8 @@ def _child(j, nodeids, ms, runner, modules):
     runner.ITER_FILTER.clear()
     runner.ITER_FILTER.update({int(t): set(v) for t, v in (j.get("iterf") or {}).items()})
     runner.MEMO_DUCK = bool(j.get("memo_duck")) and runner.MEMO is not None
+    if runner.MEMO_DUCK and all(p.startswith("tests/fixtures/") and p.endswith(".sql") for p in j["files"]):
+        runner.FIXTURE_CALLS = runner.MEMO.get("pool_results")
     runner.MEMO_SKIP.clear()
     runner.MEMO_SKIP.update(j.get("memo_skip") or [])
     tempfile.tempdir = j["tmp"]
@@ -1607,25 +1787,43 @@ def _child(j, nodeids, ms, runner, modules):
     def density(t):
         return ms[t] / 1000.0 / max(cpu_of(t, ms), 0.002)
 
-    tier1 = sorted((t for t in j["light"] if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN), key=lambda t: -density(t))
-    t1 = set(tier1)
-    groups = {}
-    for t in tier1:
-        groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-    ordered = [t for g in groups.values() for t in g]
-    groups = {}
-    for t in j["light"]:
-        if t not in t1:
+    if prepared is True:
+        # Differential probing is active: prioritize fast tests by class so probe
+        # sites are exercised rapidly with minimal CPU, triggering early equivalence stops.
+        groups = {}
+        for t in j["light"]:
             groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-    ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+        for g in groups.values():
+            g.sort(key=lambda t: cpu_of(t, ms))
+        ordered = [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+    else:
+        tier1 = sorted((t for t in j["light"] if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN), key=lambda t: -density(t))
+        t1 = set(tier1)
+        groups = {}
+        for t in tier1:
+            groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+        ordered = [t for g in groups.values() for t in g]
+        groups = {}
+        for t in j["light"]:
+            if t not in t1:
+                groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+        ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
     n_total = len(ordered)
     rp = {"dropped": set(), "n": 0}
 
     def should_stop(cur_failed, rest):
         if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
             return True
+        if prepared is True and not cur_failed and not runner.DIFF_BAD:
+            hits = runner.DIFF_HITS
+            n_sites = j["n_sites"]
+            n_ran = n_total - len(rest) - len(rp["dropped"])
+            if n_ran >= 8 and hits and all(hits.get(k, 0) >= 30 for k in range(n_sites)):
+                return True
+        if not cur_failed:
+            return False
         base = sorted(set(unrun) | set(cur_failed))
-        delta = best_schedule(base + rest, ms)[1] - best_schedule(base, ms)[1]
+        delta = schedule_cost(base + rest, ms)[1] - schedule_cost(base, ms)[1]
         return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
 
     def replan(cur_failed, rest):
@@ -1637,7 +1835,7 @@ def _child(j, nodeids, ms, runner, modules):
         n_run = max(1, n_total - len(rest) - len(rp["dropped"]))
         q = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + 2.0 * Q_PRIOR))
         order = sorted(rest, key=lambda t: -density(t))
-        full = best_schedule(base + order, ms)[1]
+        full = schedule_cost(base + order, ms)[1]
         n = len(order)
         ks = sorted(set(list(range(0, min(n, 12) + 1)) + [int(n * f) for f in (0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0)]))
         best_k, best_net = 0, 0.0
@@ -1647,7 +1845,7 @@ def _child(j, nodeids, ms, runner, modules):
         for k in ks:
             if k == 0:
                 continue
-            saved = (full - best_schedule(base + order[k:], ms)[1]) / 1000.0
+            saved = (full - schedule_cost(base + order[k:], ms)[1]) / 1000.0
             net = saved * (1.0 - q) - RP_MARGIN * cpu_pref[k] - 0.1
             if net > best_net:
                 best_k, best_net = k, net
@@ -1670,7 +1868,7 @@ def _child(j, nodeids, ms, runner, modules):
         pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
         log("PROFILE", j["cid"], "tests", len(ordered), sorted(per, reverse=True)[:25], buf.getvalue()[:6000])
     failed = set(runner.run_tests(ordered, nodeids, timeouts=[test_timeout(t, ms) for t in ordered],
-                                  replan=replan if REPLAN else None, should_stop=None if REPLAN else should_stop,
+                                  replan=replan if REPLAN else None, should_stop=should_stop,
                                   skipped=skipped))
     PROF["marks"].append(("ran", round(time.process_time(), 2)))
     if skipped:
@@ -1687,7 +1885,7 @@ def _child(j, nodeids, ms, runner, modules):
         n_ran = len(ordered) - len(skipped)
         # equivalence is only trusted when most candidates exercised the change
         if unrun and not failed and hits and not bad and all(hits.get(k, 0) > 0 for k in range(n_sites)) \
-                and n_ran >= 0.5 * (n_ran + len(unrun)):
+                and (n_ran >= 0.5 * (n_ran + len(unrun)) or (n_ran >= 8 and all(hits.get(k, 0) >= 30 for k in range(n_sites)))):
             note += " EQUIV->drop heavy"
             unrun = []
     # second phase: the light tests are done; a heavy test left unrun is run after
@@ -1703,7 +1901,7 @@ def _child(j, nodeids, ms, runner, modules):
             if c > budget or (ms[t] / 1000.0 + 2.0) * p_pass <= LATE_MARGIN * c + 0.1:
                 continue
             cur = sorted(set(unrun) | failed | FORCED)
-            gain = (best_schedule(cur, ms)[1] - best_schedule([x for x in cur if x != t], ms)[1]) / 1000.0
+            gain = (schedule_cost(cur, ms)[1] - schedule_cost([x for x in cur if x != t], ms)[1]) / 1000.0
             if gain * p_pass <= LATE_MARGIN * c + 0.1:
                 continue
             if runner.TIMEOUTS[0]:

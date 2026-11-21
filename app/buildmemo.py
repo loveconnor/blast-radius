@@ -26,7 +26,7 @@ import sqlglot.executor as E  # noqa: E402
 import tests.test_executor as T  # noqa: E402
 
 REPO = os.path.realpath(runner.REPO) + os.sep
-rec = {"duck": {}, "dsql": {}, "opt": {}, "rlines": {}, "tpch": {}}
+rec = {"pool_results": {}, "duck": {}, "dsql": {}, "opt": {}, "rlines": {}, "tpch": {}}
 runner.MEMO_REC = rec
 runner.MEMO_IDS = dict(enumerate(IDS))
 runner.SUBMIT_LAZY = {0, 1}
@@ -82,3 +82,7 @@ for i, tid in enumerate(IDS):
 print("duck frames", len(rec["duck"]), file=sys.stderr)
 with open(sys.argv[1], "wb") as fh:
     pickle.dump(rec, fh, protocol=4)
+lite = {"opt": {k: bool(v) for k, v in rec["opt"].items()}, "rlines": rec["rlines"], "tpch": rec["tpch"]}
+with open(sys.argv[1].replace(".pkl", "_lite.pkl"), "wb") as fh:
+    pickle.dump(lite, fh, protocol=4)
+
