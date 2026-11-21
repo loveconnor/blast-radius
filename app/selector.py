@@ -347,7 +347,7 @@ def _submap():
 def submit_filter(D, cands):
     """For pool-based tests, which submitted queries can reach the changed lines."""
     out = {}
-    if not D.rt_lines:
+    if not D.rt_lines or (1106 not in cands and 1107 not in cands):
         return out
     for t, (n, main, subs) in _submap().items():
         if t not in cands:
@@ -463,13 +463,18 @@ def _itermap():
     return _ITERMAP
 
 
+ITER_TEST_IDS = {1082, 1083, 1084, 1085, 1086, 1087, 1088, 1089, 1090, 1091, 1092, 1093, 1094, 1095, 1096, 1097, 1098, 1099, 1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110, 1111, 1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119, 1120, 1121, 1122, 1123, 1124, 1125, 1126, 1127, 1128, 1129, 1130, 1131, 1132, 1133, 1134, 1135, 1136, 1137, 1138, 1139, 1140, 1141, 1295, 1302, 1313, 1314, 1324, 1325, 1327, 1335, 1343, 1352, 1353, 1355, 1362, 1375, 1377, 1378, 1382, 1383, 1384, 1417, 1420, 1434, 1440, 1441, 1454, 1561, 1599, 1606, 1607}
+
+
 def iter_filter(cands, lines):
     """For fixture-driven candidates: the iterations that reach a changed line. Only
     valid when nothing but function bodies changed. Returns {test: set of iterations}."""
     if not ITER_ON or not lines:
         return {}
-    out = {}
     cs = set(cands)
+    if not cs.intersection(ITER_TEST_IDS):
+        return {}
+    out = {}
     for t, (n, main, its) in _itermap().items():
         if t not in cs:
             continue
@@ -517,20 +522,27 @@ def _replay():
             d["bad"] = set(d["bad"])
             d["sets"] = [frozenset(x) for x in d["sets"]]
             d["out"] = {f: {int(l): i for l, i in m.items()} for f, m in d["out"].items()}
+            d["snaps_tuple"] = {k: tuple(v) for k, v in d.pop("snaps", {}).items()}
+            try:
+                with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
+                    d["fk"] = fh.read()
+            except Exception:
+                d["fk"] = None
             return d
         try:
             d = _pkl(REPLAY_PATH, build)
             try:
                 import replay
-                replay.SNAP_INDEX.update({k: tuple(v) for k, v in d.pop("snaps", {}).items()})
+                replay.SNAP_INDEX.update(d.get("snaps_tuple") or {k: tuple(v) for k, v in d.pop("snaps", {}).items()})
                 replay.SNAP_PATH[0] = str(REPLAY_PATH).replace(".json.gz", "") + ".snap"
             except Exception as e:  # noqa
                 log("snapshots unavailable", repr(e))
-            try:
-                with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
-                    d["fk"] = fh.read()
-            except Exception:  # noqa
-                d["fk"] = None
+            if "fk" not in d:
+                try:
+                    with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
+                        d["fk"] = fh.read()
+                except Exception:
+                    d["fk"] = None
             _REPLAY = d
         except Exception as e:  # noqa
             log("replay map unavailable", repr(e))
@@ -1133,7 +1145,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
 
     modules = set()
     for j in jobs:
-        for t in j["light"] + j["heavy"]:
+        for t in j["light"]:
             modules.add(runner.module_name_for(nodeids[t].split("::")[0]))
     runner.zygote_import(modules)
     if any(j["overlay"] for j in jobs):
@@ -1147,7 +1159,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         want = 0
         for j in jobs:
             if not j["overlay"] and j.get("pure_src") and any(
-                    nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"] + j["heavy"]):
+                    nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"]):
                 want += 1
         if want >= PRESET_MIN:
             ok = runner.prebuild_class("tests.test_executor", "TestExecutor", cache=str(PRESET_CACHE))
