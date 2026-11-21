@@ -318,7 +318,7 @@ except Exception:  # noqa
 CPU = _cpu
 OVERHEAD_HOT = float(os.environ.get("BR_OVH_HOT", "0.25"))
 OVERHEAD_OVERLAY = float(os.environ.get("BR_OVH_OV", "2.0"))
-FAIL_PENALTY = float(os.environ.get("BR_FAIL_PEN", "1.5"))
+FAIL_PENALTY = float(os.environ.get("BR_FAIL_PEN", "0.5"))
 
 
 CPU_OVR = {}
@@ -782,7 +782,7 @@ OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
 MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
-HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
+HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.2"))
 FIX_PFAIL = float(os.environ.get("BR_FIX_PFAIL", "0.9"))
 P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.6"))
 LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.2"))
@@ -1506,8 +1506,8 @@ def _child(j, nodeids, ms, runner, modules):
         if not cur_failed:
             return False
         base = sorted(set(unrun) | set(cur_failed))
-        delta = best_schedule(base + rest, ms)[1] - best_schedule(base, ms)[1]
-        return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
+        delta = best_schedule(base + rest, ms, want_workers=False)[1] - best_schedule(base, ms, want_workers=False)[1]
+        return delta <= 0
 
     def replan(cur_failed, rest):
         """Another test failed: which of the remaining tests are still worth their cpu?"""
