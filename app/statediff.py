@@ -86,6 +86,18 @@ class _Cmp:
             return True
         if isinstance(a, re.Pattern):
             return a.pattern == b.pattern and a.flags == b.flags
+        tn = type(a).__name__
+        if tn in ("dict_values", "dict_keys", "dict_items"):
+            # views compare by identity; what they show is what matters
+            return self.same(list(a), list(b), depth + 1)
+        if tn == "_tuplegetter":
+            # a NamedTuple field: (index, doc)
+            try:
+                return a.__reduce__()[1] == b.__reduce__()[1]
+            except Exception:  # noqa
+                return False
+        if tn == "_abc_data":
+            return True
         if isinstance(a, types.ModuleType):
             return a.__name__ == b.__name__
         try:
@@ -262,6 +274,27 @@ def diff_state(old_mods: dict, new_mods: dict, only=None):
                 if not cmp.same(x, y):
                     _record(cmp, changes, ("cls", f"{name}:{q}", k), x, y)
     return changes
+
+
+def reordered_only(old_mods, new_mods, change):
+    """For a module global that differs after every re-import (a tuple made from a set
+    comes out in another order): True when old and new hold the same members."""
+    if change[0] != "mod" or change[3] is not None:
+        return True
+    try:
+        a = vars(old_mods[change[1]])[change[2]]
+        b = vars(new_mods[change[1]])[change[2]]
+    except Exception:  # noqa
+        return False
+    if not isinstance(a, (tuple, list)) or type(a) is not type(b) or len(a) != len(b):
+        return False
+    cmp = _Cmp()
+    try:
+        ka = sorted(repr(cmp.key(x)) for x in a)
+        kb = sorted(repr(cmp.key(x)) for x in b)
+    except Exception:  # noqa
+        return False
+    return ka == kb
 
 
 def _record(cmp, changes, base, a, b):

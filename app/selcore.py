@@ -73,6 +73,7 @@ class Decision:
         self.precise: set[int] = set()   # candidates not coming from broad import-time guesses
         self.all = False
         self.parsed = {}  # patched trees reused when instrumenting this change
+        self.must: set[int] = set()      # tests that fail for certain: selected without being run
         self.reasons: list[str] = []
         self.import_change = False   # something changed at import time
         self.files: dict[str, str] = {}  # path -> new content (None = deleted)
@@ -111,6 +112,87 @@ def _read(repo, rel):
         return None
 
 
+_TEST_IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([.\w]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)|import[ \t]+([^\n]+))", re.M)
+
+
+@functools.lru_cache(maxsize=4)
+def _test_importers(repo):
+    """tests/ file -> the tests/ files that import it, directly or through others (and
+    itself). A package's __init__.py is imported by everything below it."""
+    files = {}
+    for path in sorted((repo / "tests").rglob("*.py")):
+        rel = str(path.relative_to(repo))
+        try:
+            files[rel] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            files[rel] = ""
+    by_mod = {}
+    for rel in files:
+        mod = rel[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        by_mod[mod] = rel
+    deps = {rel: set() for rel in files}
+
+    def add(rel, name):
+        while name:
+            f = by_mod.get(name)
+            if f and f != rel:
+                deps[rel].add(f)
+            name = name.rpartition(".")[0]
+
+    for rel, text in files.items():
+        mod = rel[:-3].replace("/", ".")
+        is_pkg = mod.endswith(".__init__")
+        if is_pkg:
+            mod = mod[: -len(".__init__")]
+        pkg = mod if is_pkg else mod.rpartition(".")[0]
+        add(rel, pkg)
+        for m in _TEST_IMPORT_RE.finditer(text):
+            src, names, plain = m.groups()
+            if plain is not None:
+                for part in plain.split("#")[0].split(","):
+                    add(rel, part.strip().split(" ")[0])
+                continue
+            if src.startswith("."):
+                dots = len(src) - len(src.lstrip("."))
+                b = pkg
+                for _ in range(dots - 1):
+                    b = b.rpartition(".")[0]
+                rest = src[dots:]
+                src = b + "." + rest if rest else b
+            add(rel, src)
+            for part in re.sub(r"#[^\n]*", "", names).strip("()").split(","):
+                part = part.strip().split(" ")[0]
+                if part:
+                    add(rel, src + "." + part)
+    rev = {rel: {rel} for rel in files}
+    for rel, ds in deps.items():
+        for d in ds:
+            rev[d].add(rel)
+    out = {}
+    for rel in files:
+        seen, todo = {rel}, [rel]
+        while todo:
+            for x in rev[todo.pop()]:
+                if x not in seen:
+                    seen.add(x)
+                    todo.append(x)
+        out[rel] = seen
+    return out
+
+
+def _test_reach(p, repo, M):
+    """Tests whose module is p or imports p."""
+    files = _test_importers(repo).get(p)
+    if files is None:
+        return set(M.tests_in_file(p))
+    out = set()
+    for f in files:
+        out |= M.tests_in_file(f)
+    return out
+
+
 def _analyze_file(fp, repo, M, D):
     old_path = fp.old_path
     new_path = fp.new_path
@@ -135,13 +217,13 @@ def _analyze_file(fp, repo, M, D):
 
     if renamed or fp.is_new or fp.is_deleted:
         # file appears/disappears: anything importing or globbing it
-        _structural(path, old_path, new_path, fp, M, D)
+        _structural(path, old_path, new_path, fp, M, D, repo)
         if fp.is_new and not renamed:
             return
 
     p = old_path or path
     if p.endswith(".py"):
-        _python(p, old_text, new_text, fp, M, D)
+        _python(p, old_text, new_text, fp, M, D, repo)
     elif p.startswith("tests/fixtures/") or p.startswith("tests/"):
         _fixture(p, fp, M, D)
     elif p.startswith("sqlglot/"):
@@ -159,11 +241,31 @@ def _analyze_file(fp, repo, M, D):
         elif p in ("setup.py", "setup.cfg", "pyproject.toml") or p.startswith("sqlglotc/"):
             D.add(M.tests_in_file("tests/test_sqlglotc.py") | M.tests_in_file("tests/test_build.py"), f"build {p}")
             if p in ("setup.cfg", "pyproject.toml"):
-                # pytest config could live there
-                D.import_change = True
-                D.reasons.append(f"config {p}")
+                if _pytest_sections(old_text) != _pytest_sections(new_text):
+                    # pytest reads its options from here: a bad one stops every test
+                    D.all = True
+                    D.reasons.append(f"pytest-config {p}")
+                else:
+                    D.import_change = True
+                    D.reasons.append(f"config {p}")
         else:
             D.reasons.append(f"ignored {p}")
+
+
+def _pytest_sections(text):
+    """The lines of the sections pytest reads in setup.cfg / pyproject.toml."""
+    out, on = [], False
+    for line in (text or "").splitlines():
+        st = line.strip()
+        if st.startswith("["):
+            name = st.strip("[] \t").lower()
+            on = "pytest" in name
+            if on:
+                out.append(st)
+            continue
+        if on and st and not st.startswith("#"):
+            out.append(st)
+    return out
 
 
 def _opened_users(p, M):
@@ -178,17 +280,47 @@ def _opened_users(p, M):
     return s
 
 
-def _structural(path, old_path, new_path, fp, M, D):
+def _structural(path, old_path, new_path, fp, M, D, repo=None):
     for p in (old_path, new_path):
         if not p:
             continue
-        if p.endswith(".py"):
-            if p.startswith("tests/") and (p.endswith(".py") and Path(p).name.startswith("test_")):
-                D.add(M.tests_in_file(p), f"testfile-struct {p}")
+        gone = p == old_path and (fp.is_deleted or old_path != new_path)
+        name = Path(p).name
+        if name == "conftest.py" or name in ("pytest.ini", "tox.ini"):
+            # pytest loads these itself: anything can happen
+            D.all = True
+            D.reasons.append(f"pytest-config {p}")
+        elif p.endswith(".py"):
+            if p.startswith("tests/"):
+                if gone:
+                    # the module is gone: its tests and those of every module importing it
+                    # cannot be imported any more
+                    s = _test_reach(p, repo, M) if repo is not None else None
+                    if s is None:
+                        D.all = True
+                    else:
+                        D.must |= s
+                    D.reasons.append(f"test-module-gone {p}")
+                elif _shadows(p, repo):
+                    D.all = True
+                    D.reasons.append(f"new module shadows {p}")
+                else:
+                    D.reasons.append(f"new test-tree module {p}")
+            elif p.startswith("sqlglot/") and not gone and not _shadows(p, repo):
+                # a module nothing imports yet; tests that list its directory may see it
+                users = set()
+                parent = str(Path(p).parent) + "/"
+                for q, u in M.opened.items():
+                    if q == parent or q == p:
+                        users |= u
+                users |= M.tests_in_file("tests/test_typing.py") | M.tests_in_file("tests/test_dialect_entry_points.py") \
+                    | M.tests_in_file("tests/test_dialect_imports.py")
+                D.add(users, f"new-module {p}")
+                D.import_change = True
             else:
                 D.import_change = True
                 D.add(M.file_users(p) if p in M.lines else set(), f"py-struct {p}")
-                if p.startswith("sqlglot/") or p.startswith("tests/"):
+                if p.startswith("sqlglot/") or p.startswith("tests/") or _shadows(p, repo):
                     D.all = True
                     D.reasons.append(f"module add/remove {p}")
         else:
@@ -198,6 +330,28 @@ def _structural(path, old_path, new_path, fp, M, D):
                 if q == parent:
                     users |= u
             D.add(users, f"file-struct {p}")
+
+
+def _shadows(p, repo):
+    """Whether a new .py file takes the place of something importable today."""
+    if repo is None:
+        return True
+    path = Path(p)
+    stem = path.stem
+    if stem == "__init__":
+        # a new package: shadows a module of the same name beside it
+        return (repo / path.parent.parent / (path.parent.name + ".py")).exists() or "/" not in str(path.parent)
+    sib = repo / path.parent
+    if (sib / stem).is_dir() or (sib / (stem + ".py")).exists():
+        return True
+    if str(path.parent) in (".", ""):
+        # top of the checkout is on sys.path: an installed module of that name is hidden
+        try:
+            import importlib.util
+            return importlib.util.find_spec(stem) is not None
+        except Exception:  # noqa
+            return True
+    return False
 
 
 def _fixture(p, fp, M, D):
@@ -210,10 +364,15 @@ def _fixture(p, fp, M, D):
 
 # Lines of the pinned commit that fill a process-level cache (the generator's dispatch
 # table, built once per generator class and kept in _DISPATCH_CACHE).
-CACHE_FILL = {"sqlglot/generator.py": [(71, 92), (1003, 1009)]}
+# The same goes for the lazy loaders: the dialect registry (a dialect is imported by name
+# the first time anything asks for it) and the packages that resolve attributes on demand.
+CACHE_FILL = {"sqlglot/generator.py": [(71, 92), (1003, 1009)],
+              "sqlglot/dialects/dialect.py": [(214, 305)],
+              "sqlglot/dialects/__init__.py": [(1, 10 ** 6)],
+              "sqlglot/optimizer/__init__.py": [(1, 10 ** 6)]}
 
 
-def _python(p, old_text, new_text, fp, M, D):
+def _python(p, old_text, new_text, fp, M, D, repo=None):
     if new_text is None:
         return
     if old_text is None:
@@ -223,16 +382,28 @@ def _python(p, old_text, new_text, fp, M, D):
         same, changes = ast_changes(old_text, new_text, tree)
         if not same:
             D.parsed[p] = tree
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         # module cannot be imported any more
-        D.import_change = True
         D.reasons.append(f"syntax-error {p}")
+        if p.startswith("tests/") and repo is not None and Path(p).name != "conftest.py":
+            D.must |= _test_reach(p, repo, M)
+            return
+        D.import_change = True
         _import_break(p, M, D)
         return
     if same:
         # comments / formatting only. Line numbers may shift; only tests that
         # inspect source positions could notice.
         D.reasons.append(f"ast-same {p}")
+        return
+    if p.startswith("sqlglotc/"):
+        # run from its path by tests/test_sqlglotc.py, outside what a child can patch
+        D.must |= M.tests_in_file("tests/test_sqlglotc.py")
+        D.reasons.append(f"sqlglotc {p}")
+        return
+    if Path(p).name == "conftest.py":
+        D.all = True
+        D.reasons.append(f"pytest-config {p}")
         return
     imp_lines = M.importlines.get(p, set())
     is_test = p.startswith("tests/")
@@ -256,7 +427,7 @@ def _python(p, old_text, new_text, fp, M, D):
                 continue
             ch.kind = "import"
         if is_test:
-            _test_change(p, ch, M, D)
+            _test_change(p, ch, M, D, repo)
             continue
         D.ch_lines.setdefault(p, set()).update(range(s, e + 1))
         cov = M.covering(p, s, e)
@@ -272,7 +443,7 @@ def _python(p, old_text, new_text, fp, M, D):
             _import_change(p, ch, M, D)
 
 
-def _test_change(p, ch, M, D):
+def _test_change(p, ch, M, D, repo=None):
     s, e = ch.lines
     if p.endswith(".py") and Path(p).name.startswith("test_"):
         if ch.kind == "runtime" and len(ch.scope) >= 1:
@@ -294,15 +465,21 @@ def _test_change(p, ch, M, D):
                         D.cands.add(i)
                         D.precise.add(i)
         else:
-            D.add(M.tests_in_file(p), f"testfile {p}")
+            # class body, module level, imports: the module has to be imported again, and
+            # so do the test modules that import it
+            D.add(_test_reach(p, repo, M) if repo is not None else M.tests_in_file(p), f"testfile {p}")
             D.add(M.covering(p, s, e), f"testfile-cov {p}")
+            D.import_change = True
     else:
         # helpers.py, __init__.py, etc.
         cov = M.covering(p, s, e)
         D.add(cov, f"helper {p}:{s}")
         if ch.kind != "runtime":
             D.import_change = True
-            _import_break(p, M, D)
+            if repo is None:
+                _import_break(p, M, D)
+            else:
+                D.add(_test_reach(p, repo, M), f"helper-import {p}")
 
 
 def _module_importers(p, M):

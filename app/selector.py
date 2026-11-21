@@ -66,6 +66,9 @@ POISON: set = set()       # commits whose analysis killed an earlier attempt: al
 STATIC_ONLY = [False]     # last attempt: no test runs, static candidates only
 _PROGRESS_FD = [None]
 ANALYZE_TIMEOUT = float(os.environ.get("BR_ANALYZE_TIMEOUT", "25"))
+# The batch has 3 minutes (4.5 in the final) and a timeout rejects the entry: whatever
+# the number of commits, answers are printed by this many seconds after the start.
+WALL_MAX = float(os.environ.get("BR_WALL_MAX", "160"))
 
 
 def _progress(msg):
@@ -91,8 +94,10 @@ def supervise():
         main()
         return
     n = len(cids)
-    hard = T_START + max(25.0, SECONDS_PER_COMMIT * n) + 8.0 + 0.2 * n
+    hard = min(T_START + max(25.0, SECONDS_PER_COMMIT * n) + 8.0 + 0.2 * n, T_START + WALL_MAX)
     for attempt in range(8):
+        if time.time() > T_START + WALL_MAX:
+            break
         rd, wr = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -108,6 +113,7 @@ def supervise():
         while True:
             now = time.time()
             limit = last + ANALYZE_TIMEOUT if phase == "A" else hard if phase == "R" else now + 60.0
+            limit = min(limit, T_START + WALL_MAX + 5.0)
             try:
                 r, _, _ = select.select([rd], [], [], max(0.05, min(limit - now, 1.0)))
             except InterruptedError:
@@ -159,7 +165,7 @@ def main():
     ms = [round(t["seconds"] * 1000) for t in tests]
     patches = sorted((DATA / "commits").glob("*.patch"))
     n_commits = len(patches)
-    deadline = T_START + max(25.0, SECONDS_PER_COMMIT * n_commits)
+    deadline = min(T_START + max(25.0, SECONDS_PER_COMMIT * n_commits), T_START + WALL_MAX - 12.0)
     global MAP_OBJ
     M = _pkl(MAP, lambda: Map(MAP))
     MAP_OBJ = M
@@ -186,6 +192,7 @@ def main():
     answers = {}
     jobs = []
     maybe_equiv = {}
+    must = {}       # commit -> tests that fail for certain; added to whatever is decided
     for pf in patches:
         cid = pf.stem
         _progress("A " + cid)
@@ -207,6 +214,8 @@ def main():
                 log(cid, "analyze failed", repr(e))
                 answers[cid] = sorted(all_tests)
                 continue
+            if D.must:
+                must[cid] = set(D.must)
             if not D.all and D.files:
                 # only the cheap screen here; the proof itself runs after the tests
                 try:
@@ -316,7 +325,9 @@ def main():
     # The proof of equivalence parses much of the checkout, so it is kept for the commits
     # that still have tests selected. By now this process has sqlglot imported if any
     # commit was run.
-    pending = {c: f for c, f in maybe_equiv.items() if answers.get(c)}
+    for c, m in must.items():
+        answers[c] = sorted(set(answers.get(c, all_tests)) | {t for t in m if t in all_tests})
+    pending = {c: f for c, f in maybe_equiv.items() if answers.get(c) and c not in must}
     if pending:
         prove_equivalent(pending, answers)
 
@@ -903,7 +914,7 @@ def cpu_of(t, ms):
 
 
 OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
-MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "4.0"))
+MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
@@ -1251,7 +1262,9 @@ def overlay_candidates(j, old_mods, nodeids):
     scope = _diff_scope(old_mods, new_mods, seeds, j.get("files"))
     try:
         delta = statediff.diff_state(old_mods, new_mods, only=scope)
-        delta = [c for c in delta if c not in noise]
+        # entries that differ after any re-import are only noise while their members agree
+        delta = [c for c in delta if c not in noise
+                 or (c[2] != "_abc_impl" and not statediff.reordered_only(old_mods, new_mods, c))]
     except Exception as e:  # noqa
         return {"cands": broad | precise, "note": f"diff-failed {e!r}"}
     cands = set(precise)

@@ -14,7 +14,9 @@ built from the pinned commit.
    - Each changed statement is classified as runtime (inside a function body), import-time, signature, or annotation.
    - Candidate tests come from a per-test line-coverage map of the pinned commit (`app/map.json.gz`). This covers test phases, class setup, pickled pool work and import-time lines.
    - Fixture and data files map to the tests that open them.
-   - Module adds or removes, binary files and unparsable patches select everything.
+   - Removed or renamed sqlglot modules, binary files, unparsable patches, `conftest.py`, `pytest.ini`, `tox.ini` and changed pytest options in `setup.cfg` / `pyproject.toml` select everything. So do edits to the lazy loaders (the dialect registry, the packages that resolve attributes on demand): what they load is cached for the process, so per-test coverage cannot say who depends on it.
+   - *Test tree* (`tests/**.py`). A change inside a test method selects that test. Any other change (class body, module level, imports, shared helpers and base classes) re-imports the file and runs every test whose module imports it, directly or through other test modules. A test module that is deleted, renamed or no longer parses takes its tests, and those of every module importing it, without running them.
+   - A new module that shadows nothing runs only the tests that list its directory. `sqlglotc/` selects the three tests that execute its `setup.py`.
 2. **Running the candidates cheaply** (`app/runner.py`, `app/selector.py`).
    - A zygote process imports sqlglot and all test modules once. Each commit then runs in a forked child.
    - Runtime-only edits are applied by swapping `__code__` on the live functions.
@@ -40,7 +42,7 @@ built from the pinned commit.
    - *Fixture iterations* (`tools/builditer.py`): tests that loop over a fixture file run one case per iteration. Iterations that never reach a changed function body are skipped. A test is only eligible if it still passes at the pinned commit with half its iterations removed.
    - *Shared class fixtures*: `TestExecutor.setUpClass` (over a second of CSV parsing) runs once in the parent process. A commit reuses it only when no test file changed, nothing was re-imported, and no changed line is among the lines that setup ran. DuckDB connections are created lazily in each child from the statements recorded during that setup.
 5. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.
-6. **Staying alive** (`supervise` in `app/selector.py`).
+6. **Staying alive** (answers are always printed within 160 s of the start, whatever the number of commits) (`supervise` in `app/selector.py`).
    - The work runs in a child of a small supervisor. If the worker dies or stalls while analysing one patch, that commit is answered with every test and the work restarts without it. If it dies later, the static answers are printed. An answer line is always printed for every commit.
    - A test that exceeds its time limit under a patch counts as failed, and no further tests are run for that commit: code that hangs once usually hangs everywhere. The same applies to a replayed input that hangs. Each child also has a hard CPU limit.
 
