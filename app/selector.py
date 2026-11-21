@@ -199,6 +199,16 @@ def main():
                 log(cid, "analyze failed", repr(e))
                 answers[cid] = sorted(all_tests)
                 continue
+            if not D.all and D.files:
+                try:
+                    from equiv import proven_equivalent
+                    if proven_equivalent(D.files, REPO):
+                        D.cands.clear()
+                        D.precise.clear()
+                        D.import_change = False
+                        D.reasons.append("equiv")
+                except Exception as e:  # noqa
+                    log(cid, "equiv check failed", repr(e))
             if D.all:
                 answers[cid] = sorted(all_tests)
                 log(cid, "ALL", " ".join(D.reasons)[:200])
@@ -290,6 +300,11 @@ def main():
     CPU_OVR.clear()
     import patchlib
     patchlib._PARSED.clear()
+    try:
+        from equiv import unload
+        unload()
+    except Exception:  # noqa
+        pass
     log(f"analysis done in {time.time() - T_START:.2f}s; {len(jobs)} commits to run")
     _progress("R")
 
@@ -963,6 +978,68 @@ def _import_all():
     return failed
 
 
+def _modname(rel):
+    name = rel[:-3].replace("/", ".")
+    if name.endswith(".__init__"):
+        name = name[: -len(".__init__")]
+    return name
+
+
+def _diff_scope(old_mods, new_mods, seeds):
+    """Modules whose import-time state a change to `seeds` can reach.
+
+    That is the changed modules themselves, anything they import or inherit (their
+    top-level code can write those), and anything that imports them (it can copy a
+    value out at import time). None means the comparison should cover every module.
+    """
+    import types
+    seeds = {s for s in seeds if s in old_mods or s in new_mods}
+    if not seeds:
+        return None
+    scope = set(seeds)
+    known = set(old_mods) | set(new_mods)
+
+    def absorb(mod):
+        if mod is None:
+            return
+        try:
+            vals = list(vars(mod).values())
+        except Exception:  # noqa
+            return
+        for v in vals:
+            if isinstance(v, types.ModuleType) and v.__name__ in known:
+                scope.add(v.__name__)
+            elif isinstance(v, type) and getattr(v, "__module__", None) in known:
+                scope.add(v.__module__)
+        try:
+            import statediff
+            for c in statediff._classes_of(mod):
+                for b in c.__mro__:
+                    m = getattr(b, "__module__", None)
+                    if m in known:
+                        scope.add(m)
+        except Exception:  # noqa
+            pass
+
+    for s in seeds:
+        absorb(new_mods.get(s) or old_mods.get(s))
+    for name, mod in old_mods.items():
+        if name in scope:
+            continue
+        try:
+            vals = vars(mod).values()
+        except Exception:  # noqa
+            continue
+        for v in vals:
+            if isinstance(v, types.ModuleType) and v.__name__ in seeds:
+                scope.add(name)
+                break
+            if isinstance(v, type) and getattr(v, "__module__", None) in seeds:
+                scope.add(name)
+                break
+    return scope
+
+
 def overlay_candidates(j, old_mods, nodeids):
     """After re-importing the changed sqlglot: what changed in import-time state, and
     which tests read it."""
@@ -992,8 +1069,39 @@ def overlay_candidates(j, old_mods, nodeids):
     sets, byattr, untraced, noise = R
     import statediff
     new_mods = {k: v for k, v in sys.modules.items() if k == "sqlglot" or k.startswith("sqlglot.")}
+    seeds = [_modname(r) for r in j.get("files", {}) if r.endswith(".py") and r.startswith("sqlglot/")]
+    scope = _diff_scope(old_mods, new_mods, seeds)
     try:
-        delta = [c for c in statediff.diff_state(old_mods, new_mods) if c not in noise]
+        delta = statediff.diff_state(old_mods, new_mods, only=scope)
+        # a copied value in an importer can be copied again one import further out
+        spilled = set()
+        for c in delta:
+            if c in noise:
+                continue
+            owner = c[1].split(":", 1)[0]
+            if owner not in seeds and owner in (scope or ()):
+                spilled.add(owner)
+        if spilled and scope is not None:
+            extra = set()
+            import types
+            for name, mod in old_mods.items():
+                if name in scope:
+                    continue
+                try:
+                    vals = vars(mod).values()
+                except Exception:  # noqa
+                    continue
+                for v in vals:
+                    if isinstance(v, types.ModuleType) and v.__name__ in spilled:
+                        extra.add(name)
+                        break
+                    if isinstance(v, type) and getattr(v, "__module__", None) in spilled:
+                        extra.add(name)
+                        break
+            if extra:
+                scope |= extra
+                delta = statediff.diff_state(old_mods, new_mods, only=scope)
+        delta = [c for c in delta if c not in noise]
     except Exception as e:  # noqa
         return {"cands": broad | precise, "note": f"diff-failed {e!r}"}
     cands = set(precise)
@@ -1045,7 +1153,7 @@ def overlay_candidates(j, old_mods, nodeids):
                 cands |= refs[1]
                 outside |= refs[1]
                 n_glob += 1
-    note = fail_note + f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]}"
+    note = fail_note + f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]} scope={0 if scope is None else len(scope)}"
     if n_glob:
         note += f" globals={n_glob}"
     if unknown:
