@@ -18,10 +18,15 @@ PY
 # Precompile so imports at run time (read-only disk) are fast.
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
 
+# baseline memo of the optimizer pipeline (its own layer: it only depends on these files)
+COPY app/canon.py app/optmemo.py app/buildopt.py /app/
+RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildopt.py /app/optmemo \
+    || (rm -f /app/optmemo.idx /app/optmemo.bin; echo "optimizer memo build failed: running without it")
 COPY app /app
 # baseline memo for the TPC executor tests, computed from the pinned checkout
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /app/memo.pkl \
     || (rm -f /app/memo.pkl; echo "memo build failed: running without it")
+RUN BR_DATA=/nonexistent python /app/prep.py || echo "map preparation failed: maps are parsed at run time"
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]

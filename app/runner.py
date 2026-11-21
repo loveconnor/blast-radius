@@ -106,38 +106,8 @@ def load_memo(path):
         log("memo unavailable", repr(e))
 
 
-def canon(e, depth=0):
-    import enum
-    if e is None or isinstance(e, (str, int, float, bool)):
-        return e
-    if isinstance(e, enum.Enum):
-        return ("E", e.name)
-    if isinstance(e, (list, tuple)):
-        return [canon(x, depth + 1) for x in e]
-    if isinstance(e, dict):
-        return {str(k): canon(v, depth + 1) for k, v in e.items()}
-    if isinstance(e, (set, frozenset)):
-        # iteration order depends on the process hash seed
-        return ("S", sorted(repr(canon(x, depth + 1)) for x in e))
-    args = getattr(e, "args", None)
-    if isinstance(args, dict) and hasattr(e, "_meta"):
-        # arg insertion order follows set iteration in places, i.e. the process hash seed
-        return (type(e).__qualname__,
-                sorted(((k, canon(v, depth + 1)) for k, v in args.items() if v is not None and v != []),
-                       key=lambda kv: kv[0]),
-                canon(e._type, depth + 1), canon(e.comments, depth + 1), canon(e._meta, depth + 1))
-    r = repr(e)
-    if " at 0x" in r or " object at " in r:
-        r = ""   # default reprs carry an address
-    return ("O", type(e).__qualname__, r)
-
-
-def digest(e):
-    import hashlib
-    try:
-        return hashlib.sha1(repr(canon(e)).encode("utf-8", "replace")).digest()
-    except RecursionError:
-        return None
+from canon import canon, digest  # noqa: E402
+import optmemo  # noqa: E402
 
 
 def _memo_optimize(real):
@@ -246,6 +216,158 @@ class _LazyFuture(_cf.Future):
         self._run()
         return super().exception(timeout)
 SUBMIT_FILTER: dict = {}  # test number -> set of submit indices to really execute
+
+
+# ------------------------------------------------- fixture-iteration filter
+# Tests looping over tests.helpers.load_sql_fixtures / load_sql_fixture_pairs run one
+# fixture case per iteration. ITER_FILTER[test] is the set of iteration numbers (counted
+# over all loader calls of the test, in order) that are really yielded.
+ITER_FILTER: dict = {}
+ITER_HOOK = None          # build time: (switch(ctx), counts)
+_ITER = {"n": 0, "allow": None}
+_ITER_LOADERS = ("load_sql_fixtures", "load_sql_fixture_pairs")
+
+
+def _iter_wrap(orig):
+    def loader(filename):
+        hook = ITER_HOOK
+        allow = _ITER["allow"]
+        for item in orig(filename):
+            n = _ITER["n"]
+            _ITER["n"] = n + 1
+            if allow is not None and (n % 2 if allow == "even" else n not in allow):
+                continue
+            if hook is not None:
+                hook[1][0] = n + 1
+                hook[0](n)
+            yield item
+        if hook is not None:
+            hook[0](None)
+    loader._br_iter = True
+    return loader
+
+
+def install_iter_wrappers():
+    """(Re)wrap the loaders in every imported test module that uses them."""
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not (name == "tests" or name.startswith("tests.")):
+            continue
+        for ln in _ITER_LOADERS:
+            f = mod.__dict__.get(ln)
+            if f is not None and not getattr(f, "_br_iter", False) and callable(f):
+                h = sys.modules.get("tests.helpers")
+                base = getattr(h, "_br_orig_" + ln, None) if h is not None else None
+                if base is None:
+                    base = f
+                    if h is not None:
+                        setattr(h, "_br_orig_" + ln, f)
+                setattr(mod, ln, _iter_wrap(base))
+
+
+# ------------------------------------------------- shared class fixtures
+# TestExecutor.setUpClass parses the TPC csv files into tables (over a second of cpu).
+# It is run once in the zygote; a child reuses the result when its patch cannot have
+# changed it: no test file touched, no re-import, and no changed line among the sqlglot
+# lines the setup ran. DuckDB connections do not survive a fork, so during the shared
+# setup they are stand-ins that record their statements and connect on first real use.
+PRESETS: dict = {}    # class -> (sqlglot lines its setUpClass ran, original setUpClass)
+
+
+class _LazyConn:
+    def __init__(self, connect):
+        self._br_connect = connect
+        self._br_stmts = []
+        self._br_real = None
+        self._br_setup = True
+
+    def execute(self, *a, **k):
+        if self._br_setup:
+            self._br_stmts.append((a, k))
+            return self
+        return self._br_conn().execute(*a, **k)
+
+    def _br_conn(self):
+        if self._br_real is None:
+            real = self._br_connect()
+            for a, k in self._br_stmts:
+                real.execute(*a, **k)
+            self._br_real = real
+        return self._br_real
+
+    def close(self):
+        if self._br_real is not None:
+            self._br_real.close()
+            self._br_real = None
+
+    def __getattr__(self, name):
+        if name.startswith("_br_") or self.__dict__.get("_br_setup", True):
+            raise AttributeError(name)
+        return getattr(self._br_conn(), name)
+
+
+def prebuild_class(modname, clsname):
+    """Run a test class's setUpClass once, here, recording the sqlglot lines it runs."""
+    try:
+        import duckdb
+        C = getattr(sys.modules[modname], clsname)
+        orig = C.__dict__["setUpClass"]
+        real_connect = duckdb.connect
+        conns = []
+
+        def connect(*a, **k):
+            if a or k:
+                raise RuntimeError("unexpected connect arguments")
+            c = _LazyConn(real_connect)
+            conns.append(c)
+            return c
+
+        mon = sys.monitoring
+        TOOL = 4
+        lines = {}
+        prefix = os.path.join(os.path.realpath(REPO), "sqlglot") + os.sep
+        root = os.path.realpath(REPO) + os.sep
+
+        def on_line(code, line):
+            fn = code.co_filename
+            if fn.startswith(prefix):
+                lines.setdefault(fn[len(root):], set()).add(line)
+            return mon.DISABLE
+
+        mon.use_tool_id(TOOL, "brpre")
+        mon.register_callback(TOOL, mon.events.LINE, on_line)
+        mon.set_events(TOOL, mon.events.LINE)
+        duckdb.connect = connect
+        try:
+            C.setUpClass()
+        finally:
+            duckdb.connect = real_connect
+            mon.set_events(TOOL, 0)
+            mon.register_callback(TOOL, mon.events.LINE, None)
+            mon.free_tool_id(TOOL)
+        for c in conns:
+            c._br_setup = False
+        PRESETS[C] = (lines, orig)
+        return True
+    except BaseException as e:  # noqa
+        log("shared class setup failed", clsname, repr(e))
+        PRESETS.clear()
+        return False
+
+
+def apply_presets(ok, lines_by_file):
+    """In a child: keep the shared setup of each class if the patch cannot have changed it."""
+    kept = 0
+    for C, (lines, orig) in PRESETS.items():
+        valid = ok
+        if valid:
+            for f, ls in (lines_by_file or {}).items():
+                if lines.get(f) and lines[f].intersection(ls):
+                    valid = False
+                    break
+        if valid:
+            C.setUpClass = classmethod(lambda cls: None)
+            kept += 1
+    return kept
 
 
 class _AbortTest(Exception):
@@ -471,6 +593,12 @@ def reimport(root, test_modules):
 
 
 # --------------------------------------------------------------- running
+def _trace(test, err):
+    if os.environ.get("BR_TRACE"):
+        import traceback
+        log("FAIL", str(test)[:200], "".join(traceback.format_exception(*err))[-1500:])
+
+
 class Result(unittest.TestResult):
     def __init__(self, on_done=None):
         super().__init__()
@@ -490,6 +618,7 @@ class Result(unittest.TestResult):
         return getattr(test, "_br_id", None)
 
     def addError(self, test, err):
+        _trace(test, err)
         i = self._id(test)
         if i is None:
             # class/module fixture failure (_ErrorHolder): mark whole class
@@ -499,9 +628,11 @@ class Result(unittest.TestResult):
 
     def addFailure(self, test, err):
         self.bad.add(self._id(test))
+        _trace(test, err)
 
     def addSubTest(self, test, subtest, err):
         if err is not None:
+            _trace(subtest, err)
             self.bad.add(self._id(test))
             _SUB["failed"] = True
 
@@ -524,6 +655,12 @@ def _timed(run, seconds, t=None):
         _SUB["lazy"] = t in SUBMIT_LAZY
         _SUB["t"] = t
         _SUB["cur"] = None
+        _ITER["n"] = 0
+        _ITER["allow"] = ITER_FILTER.get(t)
+        if _ITER["allow"] is not None:
+            install_iter_wrappers()
+        if optmemo.ON[0]:
+            optmemo.install()   # before the TPC wrapper, which wraps whatever is bound
         if t in MEMO_IDS and (MEMO_DUCK or MEMO_SKIP or MEMO_REC is not None):
             install_memo()
         _SUB["allow"] = SUBMIT_FILTER.get(t)
@@ -532,6 +669,7 @@ def _timed(run, seconds, t=None):
             return run(*a, **k)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
+            _ITER["allow"] = None   # class fixtures of the next test load everything
     return wrapped
 
 

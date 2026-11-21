@@ -26,13 +26,18 @@ built from the pinned commit.
    - After the light tests, a heavy test that was left unrun is run after all when the schedule time it would free outweighs its CPU.
    - Tests stop early once the rest cannot change the answer's cost.
    - Every child has a deadline. If one does not finish, that commit falls back to the static candidate set.
-3. **Parse-phase replay** (`app/replay.py`, built by `tools/buildreplay.py`).
-   - A *phase* is one outermost `Dialect.parse` / `Dialect.parse_into` call (tokenize + parse). At the pinned commit every test's phase inputs were recorded (about 25,000 unique ones) with a digest of everything a caller can observe: the returned trees, a raised error, and log records. The same trace recorded which lines and class attributes each test touches *outside* phases, and which functions each input enters.
-   - For a patch that leaves import-time state alone, or changes only class attributes with known readers, a candidate test that touches the change only inside phases cannot change its outcome unless one of its recorded inputs now produces a different output. The selector replays those inputs under the patch and keeps only the tests with a changed output.
-   - When only function bodies changed, only the inputs that enter a changed function are replayed.
+3. **Phase replay** (`app/replay.py`, built by `tools/buildreplay.py`).
+   - A *phase* is one outermost `Dialect.parse` / `Dialect.parse_into` call (tokenize + parse) or one outermost `Dialect.generate` call. At the pinned commit every test's phase inputs were recorded (about 52,000 unique ones) with a digest of everything a caller can observe: the returned trees or SQL text, a raised error, and log records. A generate input is either the result of a recorded parse or an exact snapshot of the tree (`app/replay.snap`).
+   - The same trace recorded which lines and class attributes each test touches *outside* phases, which functions each input enters, and which class attributes each input reads.
+   - For a patch that leaves import-time state alone, or changes only class attributes with known readers, a candidate test that touches the change only inside phases cannot change its outcome unless one of its recorded inputs now produces a different output. The selector replays the relevant inputs under the patch and keeps only the tests with a changed output.
+   - Only inputs that enter a changed function, or read a changed attribute, are replayed.
    - Digests ignore hash-seed-dependent ordering; inputs whose output still varies between interpreters are excluded at build time, along with the tests that use them.
    - `test_max_nodes` parses a query of one unit repeated 10,000 times. Its phase is checked with the same unit repeated 100 and 400 times and the node limit scaled by the same ratio. This is a heuristic stand-in, not a proof.
-4. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.
+4. **Cheaper test runs.**
+   - *Optimizer memo* (`app/optmemo.py`, built in the image by `app/buildopt.py`): `optimize()` is a fixed pipeline of pure rules. The build records, for every `optimize()` call of the optimizer and executor tests, a digest and an exact snapshot of the tree before each rule, and which lines each rule ever runs. Under a patch to function bodies, only the rules that can reach a changed line run, on their baseline inputs; if their output matches the baseline the stored final tree is returned.
+   - *Fixture iterations* (`tools/builditer.py`): tests that loop over a fixture file run one case per iteration. Iterations that never reach a changed function body are skipped. A test is only eligible if it still passes at the pinned commit with half its iterations removed.
+   - *Shared class fixtures*: `TestExecutor.setUpClass` (over a second of CSV parsing) runs once in the parent process. A commit reuses it only when no test file changed, nothing was re-imported, and no changed line is among the lines that setup ran. DuckDB connections are created lazily in each child from the statements recorded during that setup.
+5. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.
 
 ## Layout
 
@@ -45,8 +50,10 @@ built from the pinned commit.
   - `percpu.py`: per-test CPU
   - `mknoise.py`: state-diff noise
   - `buildsub.py`: per-query coverage
-  - `buildreplay.py`: parse-phase inputs, digests and out-of-phase coverage
-  - `attrtrace.py` with `BR_PHASE=1`: attribute reads made outside parse phases
+  - `buildreplay.py`: phase inputs, digests, snapshots and out-of-phase coverage
+  - `attrtrace.py` with `BR_PHASE=1`: attribute reads made outside phases, and per-input attribute reads
+  - `builditer.py`: per-iteration coverage of fixture-driven tests
+  - `optfrac.py`: share of each test's time spent in `optimize()`
   - `genmutants.py`, `fastlabel.py` and friends: evaluation on synthetic mutants
 - `make sample` runs the image under the scorer's flags on the sample and scores it.
 

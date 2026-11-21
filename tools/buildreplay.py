@@ -21,6 +21,9 @@ import runner  # noqa: E402
 if sys.argv[1] == "--verify":
     # fresh interpreter (own hash seed): which recorded inputs do not reproduce their digest
     data = json.load(gzip.open(sys.argv[2], "rt"))
+    import replay as _r0
+    _r0.SNAP_INDEX.update({k: tuple(v) for k, v in data.get("snaps", {}).items()})
+    _r0.SNAP_PATH[0] = sys.argv[2].replace(".json.gz", "") + ".snap"
     tests = json.load(open(sys.argv[3]))["tests"]
     runner.zygote_import({runner.module_name_for(t["file"]) for t in tests})
     import replay as _r
@@ -98,7 +101,9 @@ def run_child(t):
     mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START | mon.events.PY_RESUME)
     failed = runner.run_tests([t], nodeids, timeouts=[3000.0])
     mon.set_events(TOOL, 0)
+    import base64
     return {"t": t, "failed": bool(failed), "unrec": replay.UNREC[0], "rec": list(replay.REC), "ftab": ftab,
+            "snaps": {k: base64.b64encode(v).decode() for k, v in replay.SNAPS.items()},
             "lines": {f: sorted(v) for f, v in lines.items()}}
 
 
@@ -149,6 +154,10 @@ for t, r in res.items():
     if "error" in r:
         continue
     ids = []
+    for sha, b in r.get("snaps", {}).items():
+        if sha not in replay.SNAPS:
+            import base64
+            replay.SNAPS[sha] = base64.b64decode(b)
     lf = [gfid.setdefault(tuple(x), len(gfid)) for x in r["ftab"]]
     for k, d, dt, fs in r["rec"]:
         i = keys.get(k)
@@ -227,9 +236,20 @@ funcs = [None] * len(gfid)
 for key, i in gfid.items():
     funcs[i] = list(key)
 print("functions", len(funcs), "bitmap bytes", nb * len(rows), file=sys.stderr)
+SNAP_FILE = OUT.replace(".json.gz", "") + ".snap"
+snap_index, _off = {}, 0
+with open(SNAP_FILE, "wb") as fh:
+    for sha in sorted(replay.SNAPS):
+        b = replay.SNAPS[sha]
+        fh.write(b)
+        snap_index[sha] = [_off, len(b)]
+        _off += len(b)
+print("snapshots", len(snap_index), "bytes", _off, file=sys.stderr)
+
+
 def write():
     with gzip.open(OUT, "wt") as fh:
-        json.dump({"keys": key_list, "dig": dig, "ms": [round(x, 3) for x in ms],
+        json.dump({"snaps": snap_index, "keys": key_list, "dig": dig, "ms": [round(x, 3) for x in ms],
                    "tests": {str(t): v for t, v in per_test.items()}, "bad": sorted(bad), "funcs": funcs,
                    "out": out, "sets": sets}, fh, separators=(",", ":"))
 

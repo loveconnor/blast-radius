@@ -64,7 +64,7 @@ def main():
     n_commits = len(patches)
     deadline = T_START + max(25.0, SECONDS_PER_COMMIT * n_commits)
     global MAP_OBJ
-    M = Map(MAP)
+    M = _pkl(MAP, lambda: Map(MAP))
     MAP_OBJ = M
     if M.tests != nodeids:
         log("WARNING: map test list differs from tests.json; remapping")
@@ -129,6 +129,13 @@ def main():
         # code lines the patch touches; fixture-only .sql edits touch none (a changed
         # query no longer matches its baseline plan, so it is executed for real)
         ch_lines = {f: sorted(v) for f, v in D.ch_lines.items()} if memo_duck else None
+        iterf = {}
+        opt_aff = None
+        if pure_src and not D.import_change:
+            iterf = iter_filter(cands, D.ch_lines)
+            iter_cpu(iterf)
+            opt_aff = opt_affected(D.ch_lines)
+            opt_cpu(opt_aff, cands)
         memo_skip = []
         if memo_duck and any(t in D.cands for t in memo_ids(nodeids)):
             if not D.import_change:
@@ -158,7 +165,7 @@ def main():
                 continue
         jobs.append(dict(
             cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
-            light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR),
+            light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
             memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
             precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
             reasons=" ".join(D.reasons)[:200],
@@ -248,12 +255,127 @@ def sub_cpu(subf):
     return o
 
 
+OPT_PREFIX = os.environ.get("BR_OPT", str(HERE / "optmemo"))
+OPT_ON = os.environ.get("BR_OPT_ON", "1") == "1"
+_OPT_LOADED = [False]
+
+
+def opt_affected(lines):
+    """Optimizer pipeline stages that may run a changed line, or None if the optimizer
+    memo cannot be used. `lines`: {file: lines} of a change to function bodies only."""
+    if not OPT_ON or lines is None:
+        return None
+    import optmemo
+    if not _OPT_LOADED[0]:
+        _OPT_LOADED[0] = True
+        optmemo.load(OPT_PREFIX)
+    return optmemo.affected(lines)
+
+
+OPT_FRAC_PATH = Path(os.environ.get("BR_OPT_FRAC", HERE / "optfrac.json"))
+_OPT_FRAC = None
+
+
+def opt_cpu(aff, cands):
+    """With the optimizer memo on, tests that mostly call optimize() get much cheaper."""
+    global _OPT_FRAC
+    if aff is None or 0 in aff:
+        return
+    if _OPT_FRAC is None:
+        try:
+            _OPT_FRAC = {int(t): f for t, f in json.loads(OPT_FRAC_PATH.read_text()).items()}
+        except Exception:  # noqa
+            _OPT_FRAC = {}
+    save = 0.8 if aff else 0.95
+    for t in cands:
+        f = _OPT_FRAC.get(t)
+        if f:
+            base = CPU_OVR.get(t, CPU["test"].get(str(t)))
+            if base is not None:
+                CPU_OVR[t] = base * (1.0 - f * save)
+
+
+def _pkl(path, build):
+    """Processed form of a map: pickled next to it at image build time (prep.py)."""
+    import pickle
+    pk = str(path) + ".pkl"
+    try:
+        with open(pk, "rb") as fh:
+            return pickle.load(fh)
+    except Exception:  # noqa
+        pass
+    obj = build()
+    if os.environ.get("BR_PREP") == "1":
+        with open(pk, "wb") as fh:
+            pickle.dump(obj, fh, protocol=5)
+    return obj
+
+
+ITER_PATH = Path(os.environ.get("BR_ITER", HERE / "iter.json.gz"))
+ITER_ON = os.environ.get("BR_ITER_ON", "1") == "1"
+ITER_BASE = float(os.environ.get("BR_ITER_BASE", "0.15"))
+ITER_MAXFRAC = float(os.environ.get("BR_ITER_MAXFRAC", "0.8"))
+_ITERMAP = None
+
+
+def _itermap():
+    """Per-iteration line coverage of fixture-driven tests (see builditer.py)."""
+    global _ITERMAP
+    if _ITERMAP is None:
+        import gzip
+
+        def build():
+            with gzip.open(ITER_PATH, "rt") as fh:
+                raw = json.load(fh)
+            return {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
+                             {f: {int(l): ks for l, ks in d.items()} for f, d in v["its"].items()})
+                    for t, v in raw.items()}
+        try:
+            _ITERMAP = _pkl(ITER_PATH, build)
+        except Exception as e:  # noqa
+            log("iteration map unavailable", repr(e))
+            _ITERMAP = {}
+    return _ITERMAP
+
+
+def iter_filter(cands, lines):
+    """For fixture-driven candidates: the iterations that reach a changed line. Only
+    valid when nothing but function bodies changed. Returns {test: set of iterations}."""
+    if not ITER_ON or not lines:
+        return {}
+    out = {}
+    cs = set(cands)
+    for t, (n, main, its) in _itermap().items():
+        if t not in cs:
+            continue
+        allow = set()
+        ok = True
+        for f, ls in lines.items():
+            if main.get(f) and main[f].intersection(ls):
+                ok = False   # reached outside the loop: every iteration stays
+                break
+            d = its.get(f)
+            if d:
+                for l in ls:
+                    allow.update(d.get(l, ()))
+        if ok and allow and len(allow) <= ITER_MAXFRAC * n:
+            out[t] = allow
+    return out
+
+
+def iter_cpu(iterf):
+    for t, allow in iterf.items():
+        base = CPU["test"].get(str(t))
+        if base is not None:
+            CPU_OVR[t] = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, _itermap()[t][0]))
+
+
 REPLAY_PATH = Path(os.environ.get("BR_REPLAY", HERE / "replay.json.gz"))
 REPLAY_ON = os.environ.get("BR_REPLAY_ON", "1") == "1"
-REPLAY_FACTOR = float(os.environ.get("BR_REPLAY_FACTOR", "1.3"))  # recorded seconds -> cpu here
+REPLAY_FACTOR = float(os.environ.get("BR_REPLAY_FACTOR", "0.9"))  # recorded seconds -> cpu here
 REPLAY_FRAC = float(os.environ.get("BR_REPLAY_FRAC", "0.6"))
-REPLAY_BOUND_DIV = float(os.environ.get("BR_REPLAY_BOUND_DIV", "1.5"))
-REPLAY_MAX = float(os.environ.get("BR_REPLAY_MAX", "15"))
+REPLAY_BOUND_DIV = float(os.environ.get("BR_REPLAY_BOUND_DIV", "1.15"))
+REPLAY_MAX = float(os.environ.get("BR_REPLAY_MAX", "18"))
 _REPLAY = None
 
 
@@ -262,13 +384,23 @@ def _replay():
     global _REPLAY
     if _REPLAY is None:
         import gzip
-        try:
+
+        def build():
             with gzip.open(REPLAY_PATH, "rt") as fh:
                 d = json.load(fh)
             d["tests"] = {int(t): v for t, v in d["tests"].items()}
             d["bad"] = set(d["bad"])
             d["sets"] = [frozenset(x) for x in d["sets"]]
             d["out"] = {f: {int(l): i for l, i in m.items()} for f, m in d["out"].items()}
+            return d
+        try:
+            d = _pkl(REPLAY_PATH, build)
+            try:
+                import replay
+                replay.SNAP_INDEX.update({k: tuple(v) for k, v in d.pop("snaps", {}).items()})
+                replay.SNAP_PATH[0] = str(REPLAY_PATH).replace(".json.gz", "") + ".snap"
+            except Exception as e:  # noqa
+                log("snapshots unavailable", repr(e))
             try:
                 with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
                     d["fk"] = fh.read()
@@ -320,7 +452,38 @@ def _key_mask(R, lines_by_file):
     return mask
 
 
-def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False):
+_AK = None
+
+
+def _attr_mask(R, attrs):
+    """Bitmap of the recorded inputs that read any of the given (owner, attribute) pairs."""
+    global _AK
+    base = str(REPLAY_PATH).replace(".json.gz", "")
+    if _AK is None:
+        import gzip
+        try:
+            with gzip.open(base + ".ak.json.gz", "rt") as fh:
+                _AK = json.load(fh)
+            if _AK.get("nkeys") != len(R["dig"]):
+                _AK = False
+        except Exception:  # noqa
+            _AK = False
+    if not _AK:
+        return None
+    import zlib
+    mask = 0
+    fd = os.open(base + ".ak", os.O_RDONLY)
+    try:
+        for owner, attr in attrs:
+            e = _AK["attrs"].get(f"{owner}|{attr}")
+            if e:
+                mask |= int.from_bytes(zlib.decompress(os.pread(fd, e[1], e[0])), "little")
+    finally:
+        os.close(fd)
+    return mask
+
+
+def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False, attrs=None):
     """Replay the recorded phase inputs under the patched code; drop the candidates whose
     inputs all still produce their baseline output. Returns (candidates, note)."""
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
@@ -341,6 +504,24 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             tkeys = {t: [k for k in ks if (mask >> k) & 1] for t, ks in tkeys.items()}
             keys = sorted({k for ks in tkeys.values() for k in ks})
             est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
+    elif attrs is not None and os.environ.get("BR_REPLAY_AK", "1") == "1":
+        # class attributes changed: only the inputs that read one of them (or enter a
+        # changed function) can behave differently. A test with no such input is not
+        # explained by the trace and simply stays a candidate.
+        allines = {f: set(v) for f, v in ch_lines.items()}
+        for f, v in (extra_lines or {}).items():
+            allines.setdefault(f, set()).update(v)
+        m1 = _attr_mask(R, attrs)
+        m2 = _key_mask(R, allines)
+        if m1 is not None and m2 is not None:
+            mask = m1 | m2
+            tkeys = {t: [k for k in ks if (mask >> k) & 1] for t, ks in tkeys.items()}
+            tkeys = {t: ks for t, ks in tkeys.items() if ks}
+            inside = [t for t in inside if t in tkeys]
+            keys = sorted({k for ks in tkeys.values() for k in ks})
+            est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
+            if len(inside) < 2:
+                return cands, ""
     ins0 = set(inside)
     # what replay can buy: cpu of the tests that would otherwise be run, or the
     # schedule time freed if every replayed test turns out unaffected
@@ -507,7 +688,7 @@ def load_outreads():
     global _OUTREADS
     if _OUTREADS is None:
         import gzip
-        try:
+        def build():
             with gzip.open(OUTREADS_PATH, "rt") as fh:
                 R = json.load(fh)
             sets = [frozenset(x) for x in R["sets"]]
@@ -515,7 +696,9 @@ def load_outreads():
             for k, i in R["reads"].items():
                 o, a, key = k.split("|", 2)
                 byattr.setdefault((o, a), []).append((key, i))
-            _OUTREADS = (sets, byattr, set(R["untraced"]))
+            return (sets, byattr, set(R["untraced"]))
+        try:
+            _OUTREADS = _pkl(OUTREADS_PATH, build)
         except Exception as e:  # noqa
             log("out-of-phase reads map unavailable", repr(e))
             _OUTREADS = False
@@ -526,7 +709,7 @@ def load_reads():
     global _READS
     if _READS is None:
         import gzip
-        try:
+        def build():
             with gzip.open(READS_PATH, "rt") as fh:
                 R = json.load(fh)
             sets = [frozenset(x) for x in R["sets"]]
@@ -535,7 +718,9 @@ def load_reads():
                 o, a, key = k.split("|", 2)
                 byattr.setdefault((o, a), []).append((key, i))
             noise = {tuple(x) for x in json.loads(NOISE_PATH.read_text())}
-            _READS = (sets, byattr, set(R["untraced"]), noise)
+            return (sets, byattr, set(R["untraced"]), noise)
+        try:
+            _READS = _pkl(READS_PATH, build)
         except Exception as e:  # noqa
             log("reads map unavailable", repr(e))
             _READS = False
@@ -624,7 +809,8 @@ def overlay_candidates(j, old_mods, nodeids):
         cands |= untraced & (broad | precise)
     return {"cands": cands, "note": note, "unknown": bool(unknown),
             "pure": all(d[0] == "methcode" for d in delta),
-            "replay_ok": bool(OR) and not unknown, "outside": outside, "fn_lines": fn_lines}
+            "replay_ok": bool(OR) and not unknown, "outside": outside, "fn_lines": fn_lines,
+            "attrs": sorted({(d[1], d[2]) for d in delta if d[0] in ("cls", "meth")})}
 
 
 def _function_range(mods, owner, attr):
@@ -674,6 +860,16 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
     if any(j["overlay"] for j in jobs):
         OLD_IMPORT_FAILURES[:] = [f[0] for f in _import_all()]
         load_reads()
+    if os.environ.get("BR_PRESET", "1") == "1":
+        # executor tests wanted by at least two commits: load their class fixtures once
+        want = 0
+        for j in jobs:
+            if not j["overlay"] and j.get("pure_src") and any(
+                    nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"] + j["heavy"]):
+                want += 1
+        if want >= 2:
+            ok = runner.prebuild_class("tests.test_executor", "TestExecutor")
+            log(f"shared executor fixtures for {want} commits: {ok}")
     import gc
     gc.collect()
     gc.freeze()  # children neither scan nor copy the zygote's heap
@@ -776,6 +972,11 @@ def child(j, nodeids, ms, runner, modules):
     runner.SUBMIT_FILTER.clear()
     runner.SUBMIT_FILTER.update(j.get("subf") or {})
     runner.SUBMIT_LAZY.update(_submap())
+    import optmemo
+    optmemo.ON[0] = j.get("opt_aff") is not None and not j["overlay"]
+    optmemo.AFFECTED[:] = j.get("opt_aff") or []
+    runner.ITER_FILTER.clear()
+    runner.ITER_FILTER.update({int(t): set(v) for t, v in (j.get("iterf") or {}).items()})
     runner.MEMO_DUCK = bool(j.get("memo_duck")) and runner.MEMO is not None
     runner.MEMO_SKIP.clear()
     runner.MEMO_SKIP.update(j.get("memo_skip") or [])
@@ -799,7 +1000,13 @@ def child(j, nodeids, ms, runner, modules):
         note = f"reimport({e})"
         prepared = runner.prepare(j, modules)
     unrun = list(j["heavy"])
+    if runner.PRESETS:
+        kept = runner.apply_presets(not j["overlay"] and bool(j.get("pure_src")) and not j.get("was_import"),
+                                    j.get("ch_lines"))
+        if kept:
+            note += " preset"
     if j["overlay"]:
+        optmemo.ON[0] = False   # decided again once the state diff is known
         res = overlay_candidates(j, old_mods, nodeids)
         if res.get("all"):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}
@@ -807,10 +1014,25 @@ def child(j, nodeids, ms, runner, modules):
         j["unknown"] = res.get("unknown", False)
         if res.get("replay_ok") and j.get("pure_src"):
             cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
-                                      light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")))
+                                      light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")),
+                                      attrs=None if res.get("pure") else res.get("attrs"))
             note += rn
             if not cands:
                 return {"failed": [], "unrun": [], "note": note}
+        if res.get("pure") and j.get("pure_src") and j.get("ch_lines") is not None:
+            lines = {f: set(v) for f, v in j["ch_lines"].items()}
+            for f, v in (res.get("fn_lines") or {}).items():
+                lines.setdefault(f, set()).update(v)
+            aff = opt_affected(lines)
+            if aff is not None:
+                optmemo.ON[0] = True
+                optmemo.AFFECTED[:] = aff
+                opt_cpu(aff, cands)
+            itf = iter_filter(cands, lines)
+            iter_cpu(itf)
+            runner.ITER_FILTER.update(itf)
+            if itf:
+                note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
         runner.MEMO_SKIP.clear()
         if runner.MEMO_DUCK:
             if res.get("pure"):
@@ -853,6 +1075,20 @@ def child(j, nodeids, ms, runner, modules):
         return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
 
     skipped = []
+    if os.environ.get("BR_PROFILE"):
+        import cProfile, pstats, io
+        pr = cProfile.Profile()
+        pr.enable()
+        tt0 = time.time()
+        per = []
+        for t in ordered:
+            c0 = time.process_time()
+            runner.run_tests([t], nodeids, timeouts=[600.0])
+            per.append((round(time.process_time() - c0, 2), nodeids[t][-50:]))
+        pr.disable()
+        buf = io.StringIO()
+        pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
+        log("PROFILE", j["cid"], "tests", len(ordered), sorted(per, reverse=True)[:25], buf.getvalue()[:6000])
     failed = set(runner.run_tests(ordered, nodeids, timeouts=[max(10.0, ms[t] / 1000 * 5 + 5) for t in ordered],
                                   should_stop=should_stop, skipped=skipped))
     if skipped:
@@ -897,6 +1133,8 @@ def child(j, nodeids, ms, runner, modules):
             note += f" late-run{late}"
     if any(runner.MEMO_STAT):
         note += f" memo={runner.MEMO_STAT}"
+    if any(optmemo.STAT):
+        note += f" opt={optmemo.STAT}/{optmemo.AFFECTED}"
     return {"failed": sorted(failed), "unrun": unrun, "note": note}
 
 

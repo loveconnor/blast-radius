@@ -38,6 +38,31 @@ _key = _Cmp().key
 PHASE = os.environ.get("BR_PHASE") == "1"   # record only reads made outside parse phases
 import replay  # noqa: E402
 _PH = replay.PH
+_CUR = set()        # attributes read inside the phase call being recorded
+_ATAB, _AIDX = [], {}
+
+
+class _Rec(list):
+    """Attach to every recorded phase call the attributes it read."""
+
+    def _snap(self):
+        out = []
+        for a in _CUR:
+            i = _AIDX.get(a)
+            if i is None:
+                i = _AIDX[a] = len(_ATAB)
+                _ATAB.append(a[0] + "|" + a[1])
+            out.append(i)
+        _CUR.clear()
+        return out
+
+    def append(self, item):
+        list.append(self, (item[0], self._snap()))
+
+    def extend(self, items):
+        snap = self._snap()
+        for it in items:
+            list.append(self, (it[0], snap))
 
 
 def keystr(k):
@@ -52,6 +77,7 @@ class TDict(dict):
 
     def _rec(self, k):
         if PHASE and _PH["depth"]:
+            _CUR.add((self._br_owner[0], self._br_owner[1]))
             return
         try:
             READS.add((self._br_owner[0], self._br_owner[1], keystr(k)))
@@ -60,6 +86,7 @@ class TDict(dict):
 
     def _all(self):
         if PHASE and _PH["depth"]:
+            _CUR.add((self._br_owner[0], self._br_owner[1]))
             return
         READS.add((self._br_owner[0], self._br_owner[1], "*"))
 
@@ -134,6 +161,8 @@ class Tracker:
     def __get__(self, obj, objtype=None):
         if not (PHASE and _PH["depth"]):
             READS.add((self.owner, self.attr, None))
+        else:
+            _CUR.add((self.owner, self.attr))
         if self.getter is not None:
             return self.getter(self.value, obj, objtype)
         return self.value
@@ -191,8 +220,16 @@ for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
 print("instrumented", instrument(), file=sys.stderr, flush=True)
 if PHASE:
     replay.install_recorder()
+    replay.REC = _Rec()
 
 results = {}
+AK, KEYID = {}, None    # attribute -> bitmap of recorded phase inputs that read it
+if PHASE and os.environ.get("BR_AK_OUT"):
+    import gzip
+    _R = json.load(gzip.open(os.environ["BR_REPLAY"], "rt"))
+    KEYID = {json.dumps(k): i for i, k in enumerate(_R["keys"])}
+    NKEYS = len(_R["keys"])
+    del _R
 ONLY = os.environ.get("ONLY")
 todo = [int(x) for x in ONLY.split(",")] if ONLY else list(range(len(tests)))
 if os.environ.get("TRACE_ONLY"):
@@ -218,6 +255,9 @@ while todo or running:
             READS.clear()
             f = runner.run_tests([t], nodeids, timeouts=[3000.0])
             out = {"t": t, "failed": bool(f), "reads": [list(r) for r in READS]}
+            if PHASE:
+                out["atab"] = _ATAB
+                out["krec"] = [[k, a] for k, a in replay.REC]
             data = json.dumps(out).encode()
             while data:
                 k = os.write(wr, data)
@@ -239,8 +279,27 @@ while todo or running:
             results[t] = json.loads(b"".join(buf))
         except Exception:  # noqa
             results[t] = {"t": t, "failed": True, "reads": None}
+        kr = results[t].pop("krec", None)
+        at = results[t].pop("atab", None)
+        if kr and KEYID is not None:
+            for k, a in kr:
+                i = KEYID.get(k)
+                if i is not None:
+                    for x in a:
+                        name = at[x]
+                        AK[name] = AK.get(name, 0) | (1 << i)
         if len(results) % 100 == 0:
             print(len(results), round(time.time() - t0), file=sys.stderr, flush=True)
 json.dump({str(k): v for k, v in results.items()}, open(OUT, "w"))
+if KEYID is not None:
+    import gzip
+    nb = (NKEYS + 7) // 8
+    names = sorted(AK)
+    with gzip.open(os.environ["BR_AK_OUT"] + ".bin.gz", "wb") as fh:
+        for n in names:
+            fh.write(AK[n].to_bytes(nb, "little"))
+    with gzip.open(os.environ["BR_AK_OUT"] + ".json.gz", "wt") as fh:
+        json.dump({"attrs": names, "nkeys": NKEYS}, fh)
+    print("attr-key bitmaps", len(names), file=sys.stderr)
 bad = [nodeids[t] for t, v in results.items() if v["failed"]]
 print("failed under instrumentation:", len(bad), bad[:20], file=sys.stderr)

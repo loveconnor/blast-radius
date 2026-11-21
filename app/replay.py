@@ -20,7 +20,12 @@ import logging
 import sys
 import time
 
+import os
+import pickle
+import zlib
+
 import runner
+from canon import dump_tree, load_tree
 
 PH = {"depth": 0}
 REC: list = []        # (key string, digest, seconds) of the running test
@@ -168,13 +173,74 @@ def observe(fn):
     return dig, res, exc
 
 
-def run_key(key):
-    """Replay one recorded phase call under the current code; returns its digest."""
+_PCACHE: dict = {}   # parse results reused by the generate inputs recorded after them
+
+
+def _parse_key(key):
     d = _dialect(key)
     opts = {k: _dec(v) for k, v in key[7]}
     if key[0] == "p":
-        return observe(lambda: d.parse(key[6], **opts))[0]
-    return observe(lambda: d.parse_into(_dec(key[8]), key[6], **opts))[0]
+        return d.parse(key[6], **opts)
+    return d.parse_into(_dec(key[8]), key[6], **opts)
+
+
+def run_key(key):
+    """Replay one recorded phase call under the current code; returns its digest."""
+    if key[0] == "g":
+        src, idx = key[6]
+        copy = bool(key[8])
+        if src == "s":
+            try:
+                tree = snapshot(idx)
+            except Exception:  # noqa
+                return None
+        else:
+            sk = json.dumps(src)
+            res = _PCACHE.get(sk) if copy else None
+            if res is None:
+                try:
+                    res = _parse_key(src)
+                except Exception:  # noqa
+                    return None        # its input can no longer be produced
+                if copy:
+                    if len(_PCACHE) > 512:
+                        _PCACHE.clear()
+                    _PCACHE[sk] = res
+            try:
+                tree = res[idx]
+            except Exception:  # noqa
+                return None
+        d = _dialect(key)
+        opts = {k: _dec(v) for k, v in key[7]}
+        return observe(lambda: ("G", d.generate(tree, copy=copy, **opts), None if copy else runner.canon(tree)))[0]
+    dig, res, exc = observe(lambda: _parse_key(key))
+    if exc is None:
+        if len(_PCACHE) > 512:
+            _PCACHE.clear()
+        _PCACHE[json.dumps(key)] = res
+    return dig
+
+
+SNAPS: dict = {}     # build time: digest hex -> compressed snapshot of a generate input
+SNAP_INDEX: dict = {}   # run time: digest hex -> (offset, length) in the snapshot file
+SNAP_PATH = [None]
+_SNAP_FD = [None]
+
+
+def snapshot(sha):
+    """Rebuild a recorded generate input (an exact copy of the baseline tree)."""
+    if sha in SNAPS:
+        blob = SNAPS[sha]
+    else:
+        if _SNAP_FD[0] is None:
+            _SNAP_FD[0] = os.open(SNAP_PATH[0], os.O_RDONLY)
+        off, ln = SNAP_INDEX[sha]
+        blob = os.pread(_SNAP_FD[0], ln, off)
+    return load_tree(pickle.loads(zlib.decompress(blob)))
+
+
+TREES: dict = {}     # build time: digest of a parsed tree -> (parse key, index in its result)
+UNREC_G = [0]
 
 
 def install_recorder():
@@ -227,7 +293,49 @@ def install_recorder():
         REC.append((key, dig, time.perf_counter() - t))
         if exc is not None:
             raise exc
+        if type(res) is list:
+            for i, tree in enumerate(res):
+                if tree is not None:
+                    d = runner.digest(tree)
+                    if d is not None:
+                        TREES.setdefault(d, (key, i))
         return res
+
+    orig_generate = Dialect.generate
+
+    def generate(self, expression, copy=True, **opts):
+        if PH["depth"]:
+            return orig_generate(self, expression, copy=copy, **opts)
+        try:
+            d = runner.digest(expression)
+            src = TREES.get(d)
+            k = make_key("g", self, "", opts)
+            if src is not None:
+                k[6] = [json.loads(src[0]), src[1]]
+            else:
+                # not the direct result of a recorded parse: keep an exact snapshot of it
+                sha = d.hex()
+                if sha not in SNAPS:
+                    SNAPS[sha] = zlib.compress(pickle.dumps(dump_tree(expression), protocol=4), 6)
+                k[6] = ["s", sha]
+            k[8] = bool(copy)
+            key = json.dumps(k)
+        except Exception:  # noqa
+            UNREC_G[0] += 1      # not replayable: it simply runs outside any phase
+            return orig_generate(self, expression, copy=copy, **opts)
+        PH["depth"] += 1
+        t = time.perf_counter()
+        try:
+            dig, res, exc = observe(lambda: ("G", orig_generate(self, expression, copy=copy, **opts),
+                                             None if copy else runner.canon(expression)))
+        finally:
+            PH["depth"] -= 1
+        REC.append((key, dig, time.perf_counter() - t))
+        if exc is not None:
+            raise exc
+        return res[1]
+
+    Dialect.generate = generate
 
     def parse(self, sql, **opts):
         big = (self, sql, opts) if isinstance(sql, str) and len(sql) > MAX_SQL else None
