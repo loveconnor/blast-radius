@@ -1158,7 +1158,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
     except Exception as e:  # noqa
         log("preload failed", repr(e))
     import gc
-    gc.collect()
+    gc.collect(1)
     gc.freeze()  # children neither scan nor copy the zygote's heap
     log(f"zygote ready at {time.time() - T_START:.2f}s")
 
@@ -1461,23 +1461,41 @@ def _child(j, nodeids, ms, runner, modules):
     def density(t):
         return ms[t] / 1000.0 / max(cpu_of(t, ms), 0.002)
 
-    tier1 = sorted((t for t in j["light"] if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN), key=lambda t: -density(t))
-    t1 = set(tier1)
-    groups = {}
-    for t in tier1:
-        groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-    ordered = [t for g in groups.values() for t in g]
-    groups = {}
-    for t in j["light"]:
-        if t not in t1:
+    if prepared is True:
+        # Differential probing is active: prioritize fast tests by class so probe
+        # sites are exercised rapidly with minimal CPU, triggering early equivalence stops.
+        groups = {}
+        for t in j["light"]:
             groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-    ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+        for g in groups.values():
+            g.sort(key=lambda t: cpu_of(t, ms))
+        ordered = [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+    else:
+        tier1 = sorted((t for t in j["light"] if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN), key=lambda t: -density(t))
+        t1 = set(tier1)
+        groups = {}
+        for t in tier1:
+            groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+        ordered = [t for g in groups.values() for t in g]
+        groups = {}
+        for t in j["light"]:
+            if t not in t1:
+                groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+        ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
     n_total = len(ordered)
     rp = {"dropped": set(), "n": 0}
 
     def should_stop(cur_failed, rest):
         if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
             return True
+        if prepared is True and not cur_failed and not runner.DIFF_BAD:
+            hits = runner.DIFF_HITS
+            n_sites = j["n_sites"]
+            n_ran = n_total - len(rest) - len(rp["dropped"])
+            if n_ran >= 8 and hits and all(hits.get(k, 0) >= 30 for k in range(n_sites)):
+                return True
+        if not cur_failed:
+            return False
         base = sorted(set(unrun) | set(cur_failed))
         delta = best_schedule(base + rest, ms)[1] - best_schedule(base, ms)[1]
         return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
@@ -1524,7 +1542,7 @@ def _child(j, nodeids, ms, runner, modules):
         pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
         log("PROFILE", j["cid"], "tests", len(ordered), sorted(per, reverse=True)[:25], buf.getvalue()[:6000])
     failed = set(runner.run_tests(ordered, nodeids, timeouts=[test_timeout(t, ms) for t in ordered],
-                                  replan=replan if REPLAN else None, should_stop=None if REPLAN else should_stop,
+                                  replan=replan if REPLAN else None, should_stop=should_stop,
                                   skipped=skipped))
     PROF["marks"].append(("ran", round(time.process_time(), 2)))
     if skipped:
@@ -1541,7 +1559,7 @@ def _child(j, nodeids, ms, runner, modules):
         n_ran = len(ordered) - len(skipped)
         # equivalence is only trusted when most candidates exercised the change
         if unrun and not failed and hits and not bad and all(hits.get(k, 0) > 0 for k in range(n_sites)) \
-                and n_ran >= 0.5 * (n_ran + len(unrun)):
+                and (n_ran >= 0.5 * (n_ran + len(unrun)) or (n_ran >= 8 and all(hits.get(k, 0) >= 30 for k in range(n_sites)))):
             note += " EQUIV->drop heavy"
             unrun = []
     # second phase: the light tests are done; a heavy test left unrun is run after

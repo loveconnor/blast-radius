@@ -852,12 +852,15 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, 
             for b in bad:
                 if not isinstance(b, tuple) and b is not None:
                     cur.add(b)
-            if not cur:
-                return False
             done_here = res.done
             rest = [t for t, _ in _items if t not in done_here] + [t for _, its in segs[_ci + 1:] for t, _ in its]
             if allowed[0] is not None:
                 rest = [t for t in rest if t in allowed[0]]
+            if not cur:
+                if should_stop is not None and should_stop(cur, rest):
+                    stopped[0] = True
+                    return True
+                return False
             if not rest:
                 return False
             if replan is not None:
