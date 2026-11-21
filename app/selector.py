@@ -903,7 +903,7 @@ def cpu_of(t, ms):
 
 
 OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
-MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "4.0"))
+MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
