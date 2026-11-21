@@ -9,6 +9,7 @@ import selector  # noqa: E402
 from selcore import Map  # noqa: E402
 
 selector._pkl(selector.MAP, lambda: Map(selector.MAP))
+selector._submap()
 selector.load_reads()
 selector.load_outreads()
 selector._replay()

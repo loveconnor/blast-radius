@@ -97,12 +97,16 @@ class _Diverged(BaseException):
 
 def load(prefix):
     global IDX
+    import gc
     try:
+        gc.disable()
         with open(prefix + ".idx", "rb") as fh:
             IDX = pickle.load(fh)
         IDX["_bin"] = prefix + ".bin"
     except Exception:  # noqa
         IDX = None
+    finally:
+        gc.enable()
     return IDX
 
 

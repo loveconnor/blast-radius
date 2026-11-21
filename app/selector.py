@@ -331,12 +331,14 @@ def _submap():
     global _SUBMAP
     if _SUBMAP is None:
         import gzip
-        try:
+        def build():
             with gzip.open(SUBMAP_PATH, "rt") as fh:
                 raw = json.load(fh)
-            _SUBMAP = {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
-                                {f: {int(l): s for l, s in d.items()} for f, d in v["subs"].items()})
-                       for t, v in raw.items()}
+            return {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
+                             {f: {int(l): s for l, s in d.items()} for f, d in v["subs"].items()})
+                    for t, v in raw.items()}
+        try:
+            _SUBMAP = _pkl(SUBMAP_PATH, build)
         except Exception:  # noqa
             _SUBMAP = {}
     return _SUBMAP
