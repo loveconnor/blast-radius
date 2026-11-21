@@ -903,7 +903,7 @@ def cpu_of(t, ms):
 
 
 OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
-MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "4.0"))
+MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
@@ -1653,6 +1653,22 @@ _REIMPORT_MARK = b"REIMPORT\n"
 FORCED: set = set()   # tests selected without running (they import a module that no longer imports)
 
 
+# TestExecutor.test_execute_tpcds takes 21 s on the clock and seconds of CPU to run. In
+# 74 labeled source patches that break it, at least two other executor or optimizer
+# tests break as well, every time. So when at least TPCDS_KIN_MIN of those ran under the
+# patch, none failed and none is left unrun, it is taken to pass without being run.
+TPCDS_KIN = os.environ.get("BR_TPCDS_KIN", "1") == "1"
+TPCDS_KIN_MIN = int(os.environ.get("BR_TPCDS_KIN_MIN", "3"))
+
+
+def _is_tpcds(nodeid):
+    return nodeid.endswith("::TestExecutor::test_execute_tpcds")
+
+
+def _is_kin(nodeid):
+    return ("::TestExecutor::" in nodeid or "::TestOptimizer::" in nodeid) and not _is_tpcds(nodeid)
+
+
 def _child(j, nodeids, ms, runner, modules):
     os.environ["TMPDIR"] = j["tmp"]
     try:
@@ -1705,6 +1721,7 @@ def _child(j, nodeids, ms, runner, modules):
     PROF["prep"] = time.process_time() - c0
     PROF["marks"] = [("prep", round(time.process_time(), 2))]
     unrun = list(j["heavy"])
+    tp_planned = []
     if runner.PRESETS:
         kept = runner.apply_presets(not j["overlay"] and bool(j.get("pure_src")) and not j.get("was_import"),
                                     j.get("ch_lines"))
@@ -1760,7 +1777,17 @@ def _child(j, nodeids, ms, runner, modules):
                                                base=sorted(forced))
         budget = j.get("heavy_budget", 1e9)
         est_light = sum(cpu_of(t, ms) for t in light) * OV_MULT
-        if est_light > min(budget, MAX_CHILD_CPU):
+        cap = min(budget, MAX_CHILD_CPU)
+        # The TPC-DS executor test is set aside: the tests run before it can settle it
+        # (see TPCDS_KIN). If they do not, it is run after them when the plan had it.
+        rest = [t for t in light if not _is_tpcds(nodeids[t])] if TPCDS_KIN else light
+        if len(rest) < len(light) and (est_light <= cap or sum(cpu_of(t, ms) for t in rest) * OV_MULT <= cap):
+            aside = [t for t in light if _is_tpcds(nodeids[t])]
+            if est_light <= cap:
+                tp_planned.extend(aside)
+            heavy = list(heavy) + aside
+            light = rest
+        elif est_light > cap:
             light, heavy = [], cands
         note += f" cands={len(cands)} run={len(light)} est={est/1000:.1f}/{static/1000:.1f}"
         note += f" cpu={sum(cpu_of(t, ms) for t in cands):.1f} top={[(t, round(cpu_of(t, ms), 1)) for t in sorted(cands, key=lambda t: -cpu_of(t, ms))[:3]]} skip={sorted(runner.MEMO_SKIP)} bud={budget:.0f}"
@@ -1888,6 +1915,20 @@ def _child(j, nodeids, ms, runner, modules):
                 and (n_ran >= 0.5 * (n_ran + len(unrun)) or (n_ran >= 8 and all(hits.get(k, 0) >= 30 for k in range(n_sites)))):
             note += " EQUIV->drop heavy"
             unrun = []
+    if unrun and TPCDS_KIN and j.get("pure_src") and not runner.TIMEOUTS[0] \
+            and not (j["overlay"] and j.get("unknown")):
+        tp = [t for t in unrun if _is_tpcds(nodeids[t])]
+        ran = set(ordered) - set(skipped)
+        held = (set(unrun) | failed | FORCED) - set(tp)
+        if tp and len([t for t in ran if _is_kin(nodeids[t])]) >= TPCDS_KIN_MIN \
+                and not any(_is_kin(nodeids[t]) for t in held):
+            unrun = [t for t in unrun if t not in tp]
+            note += " tpcds-settled"
+    for t in tp_planned:
+        if t in unrun and not runner.TIMEOUTS[0]:
+            failed |= set(runner.run_tests([t], nodeids, timeouts=[test_timeout(t, ms)]))
+            unrun.remove(t)
+            note += " tpcds-run"
     # second phase: the light tests are done; a heavy test left unrun is run after
     # all when the schedule time it would free outweighs its cpu
     if unrun and not (j["overlay"] and j.get("unknown")):
