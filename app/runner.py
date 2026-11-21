@@ -116,11 +116,20 @@ def canon(e, depth=0):
         return [canon(x, depth + 1) for x in e]
     if isinstance(e, dict):
         return {str(k): canon(v, depth + 1) for k, v in e.items()}
+    if isinstance(e, (set, frozenset)):
+        # iteration order depends on the process hash seed
+        return ("S", sorted(repr(canon(x, depth + 1)) for x in e))
     args = getattr(e, "args", None)
     if isinstance(args, dict) and hasattr(e, "_meta"):
-        return (type(e).__qualname__, [(k, canon(v, depth + 1)) for k, v in args.items() if v is not None and v != []],
+        # arg insertion order follows set iteration in places, i.e. the process hash seed
+        return (type(e).__qualname__,
+                sorted(((k, canon(v, depth + 1)) for k, v in args.items() if v is not None and v != []),
+                       key=lambda kv: kv[0]),
                 canon(e._type, depth + 1), canon(e.comments, depth + 1), canon(e._meta, depth + 1))
-    return ("O", type(e).__qualname__, repr(e))
+    r = repr(e)
+    if " at 0x" in r or " object at " in r:
+        r = ""   # default reprs carry an address
+    return ("O", type(e).__qualname__, r)
 
 
 def digest(e):

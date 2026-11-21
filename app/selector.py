@@ -96,9 +96,14 @@ def main():
         answers[cid] = cands  # static fallback
         hot = [r for r, c in D.files.items() if r.endswith(".py") and c is not None and (REPO / r).exists()]
         olds = {r: (REPO / r).read_text(encoding="utf-8") for r in hot}
-        if not cands:
+        if not cands and not D.import_change:
             log(cid, "none", " ".join(D.reasons)[:200])
             continue
+        if not cands:
+            # import-time state changed in a file no test runs code from (e.g. a module of
+            # class definitions): the readers are only known after the state diff. If the
+            # child cannot finish, everything is selected.
+            answers[cid] = sorted(all_tests)
         instr = {}
         n_sites = 0
         if not D.import_change and len(hot) == 1 and all(r.endswith(".py") for r in D.files):
@@ -143,15 +148,19 @@ def main():
             # only pays when it is cheap next to the chance of dropping it
             if cpu_of(cands[0], ms) + OVERHEAD_HOT > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
                 light, heavy = [], cands
-        if not light and not D.import_change:
+        force = False
+        if pure_src and not D.import_change and not light and len(cands) >= 2:
+            ins, _, est = replay_scope(cands, ch_lines)
+            force = len(ins) >= 2 and est <= REPLAY_MAX and est < static_cost / 1000.0
+        if not light and not D.import_change and not force:
             log(cid, f"static cost={static_cost/1000:.2f}", " ".join(D.reasons)[:150])
             if not D.import_change:
                 continue
         jobs.append(dict(
             cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
             light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR),
-            memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines,
-            precise=sorted(D.precise), broad=sorted(D.cands),
+            memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
+            precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
             reasons=" ".join(D.reasons)[:200],
         ))
     CPU_OVR.clear()
@@ -237,6 +246,131 @@ def sub_cpu(subf):
         v = CPU["test"].get(str(t), 0.0)
         o[t] = v * (SUB_BASE + (1 - SUB_BASE) * len(allow) / max(1, n))
     return o
+
+
+REPLAY_PATH = Path(os.environ.get("BR_REPLAY", HERE / "replay.json.gz"))
+REPLAY_ON = os.environ.get("BR_REPLAY_ON", "1") == "1"
+REPLAY_FACTOR = float(os.environ.get("BR_REPLAY_FACTOR", "1.3"))  # recorded seconds -> cpu here
+REPLAY_FRAC = float(os.environ.get("BR_REPLAY_FRAC", "0.6"))
+REPLAY_BOUND_DIV = float(os.environ.get("BR_REPLAY_BOUND_DIV", "1.5"))
+REPLAY_MAX = float(os.environ.get("BR_REPLAY_MAX", "15"))
+_REPLAY = None
+
+
+def _replay():
+    """Recorded parse-phase calls of every test at the pinned commit (see replay.py)."""
+    global _REPLAY
+    if _REPLAY is None:
+        import gzip
+        try:
+            with gzip.open(REPLAY_PATH, "rt") as fh:
+                d = json.load(fh)
+            d["tests"] = {int(t): v for t, v in d["tests"].items()}
+            d["bad"] = set(d["bad"])
+            d["sets"] = [frozenset(x) for x in d["sets"]]
+            d["out"] = {f: {int(l): i for l, i in m.items()} for f, m in d["out"].items()}
+            try:
+                with gzip.open(str(REPLAY_PATH).replace(".json.gz", "") + ".fk.gz", "rb") as fh:
+                    d["fk"] = fh.read()
+            except Exception:  # noqa
+                d["fk"] = None
+            _REPLAY = d
+        except Exception as e:  # noqa
+            log("replay map unavailable", repr(e))
+            _REPLAY = {}
+    return _REPLAY
+
+
+def replay_scope(cands, ch_lines, outside0=None, extra_lines=None):
+    """Candidates that run the changed lines only inside recorded parse phases.
+    Returns (tests, key ids, estimated cpu seconds)."""
+    R = _replay() if REPLAY_ON else {}
+    if not R or ch_lines is None:
+        return [], [], 0.0
+    outside = set(outside0 or ())
+    allines = {f: set(v) for f, v in ch_lines.items()}
+    for f, v in (extra_lines or {}).items():
+        allines.setdefault(f, set()).update(v)
+    for f, lines in allines.items():
+        m = R["out"].get(f)
+        if m:
+            for l in lines:
+                i = m.get(l)
+                if i is not None:
+                    outside |= R["sets"][i]
+    inside = [t for t in cands if t in R["tests"] and t not in R["bad"] and t not in outside]
+    keys = set()
+    for t in inside:
+        keys.update(R["tests"][t])
+    est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
+    return inside, sorted(keys), est
+
+
+def _key_mask(R, lines_by_file):
+    """Bitmap of the recorded inputs that enter a function containing a changed line."""
+    fk = R.get("fk")
+    if not fk or not R.get("funcs"):
+        return None
+    nb = (len(R["dig"]) + 7) // 8
+    mask = 0
+    for i, (f, lo, hi) in enumerate(R["funcs"]):
+        ls = lines_by_file.get(f)
+        if ls and any(lo <= l <= hi for l in ls):
+            mask |= int.from_bytes(fk[i * nb:(i + 1) * nb], "little")
+    return mask
+
+
+def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False):
+    """Replay the recorded phase inputs under the patched code; drop the candidates whose
+    inputs all still produce their baseline output. Returns (candidates, note)."""
+    inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
+    if len(inside) < 2:
+        return cands, ""
+    R = _replay()
+    tkeys = {t: R["tests"][t] for t in inside}
+    if pure:
+        # only function bodies changed: an input that never enters a changed function
+        # runs exactly the old code, so only the inputs that do are replayed. (The tests
+        # here run the changed lines inside phases only; one with no such input never
+        # runs them at all.)
+        allines = {f: set(v) for f, v in ch_lines.items()}
+        for f, v in (extra_lines or {}).items():
+            allines.setdefault(f, set()).update(v)
+        mask = _key_mask(R, allines) if os.environ.get("BR_REPLAY_FK", "1") == "1" else None
+        if mask is not None:
+            tkeys = {t: [k for k in ks if (mask >> k) & 1] for t, ks in tkeys.items()}
+            keys = sorted({k for ks in tkeys.values() for k in ks})
+            est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
+    ins0 = set(inside)
+    # what replay can buy: cpu of the tests that would otherwise be run, or the
+    # schedule time freed if every replayed test turns out unaffected
+    would_run = ins0 if light0 is None else ins0.intersection(light0)
+    worth = sum(cpu_of(t, ms) for t in would_run)
+    rest = [t for t in cands if t not in ins0]
+    bound = (best_schedule(cands, ms)[1] - (best_schedule(rest, ms)[1] if rest else 0)) / 1000.0
+    if est > REPLAY_MAX or est > max(0.2, REPLAY_FRAC * worth, bound / REPLAY_BOUND_DIV):
+        return cands, f" replay-skip(est={est:.1f} worth={worth:.1f} bound={bound:.1f})"
+    import replay
+    t0 = time.time()
+    changed = set()
+    import runner
+    signal.signal(signal.SIGALRM, runner._alarm)
+    limit = t0 + 3.0 * est + 5.0
+    for k in keys:
+        if time.time() > limit:
+            return cands, " replay-abort(slow)"
+        # a patched parser may loop forever on an input: such an input counts as changed
+        signal.setitimer(signal.ITIMER_REAL, max(4.0, R["ms"][k] / 1000.0 * 40))
+        try:
+            if replay.run_key(R["keys"][k]) != R["dig"][k]:
+                changed.add(k)
+        except BaseException:  # noqa
+            changed.add(k)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    ins = set(inside)
+    out = [t for t in cands if t not in ins or changed.intersection(tkeys[t])]
+    return out, f" replay(tests={len(inside)} keys={len(keys)} changed={len(changed)} kept={len(out)}/{len(cands)} {time.time() - t0:.2f}s est={est:.1f})"
 
 
 MEMO_PATH = Path(os.environ.get("BR_MEMO", HERE / "memo.pkl"))
@@ -364,6 +498,30 @@ NOISE_PATH = Path(os.environ.get("BR_NOISE", HERE / "noise.json"))
 _READS = None
 
 
+OUTREADS_PATH = Path(os.environ.get("BR_OUTREADS", HERE / "outreads.json.gz"))
+_OUTREADS = None
+
+
+def load_outreads():
+    """Like the reads map, but only reads made outside parse phases."""
+    global _OUTREADS
+    if _OUTREADS is None:
+        import gzip
+        try:
+            with gzip.open(OUTREADS_PATH, "rt") as fh:
+                R = json.load(fh)
+            sets = [frozenset(x) for x in R["sets"]]
+            byattr = {}
+            for k, i in R["reads"].items():
+                o, a, key = k.split("|", 2)
+                byattr.setdefault((o, a), []).append((key, i))
+            _OUTREADS = (sets, byattr, set(R["untraced"]))
+        except Exception as e:  # noqa
+            log("out-of-phase reads map unavailable", repr(e))
+            _OUTREADS = False
+    return _OUTREADS
+
+
 def load_reads():
     global _READS
     if _READS is None:
@@ -422,6 +580,9 @@ def overlay_candidates(j, old_mods, nodeids):
     cands = set(precise)
     unknown = []
     M = MAP_OBJ
+    OR = load_outreads() if REPLAY_ON else False
+    outside = set(OR[2]) if OR else set()   # tests that touch a change outside parse phases
+    fn_lines = {}
     for kind, owner, attr, key in delta:
         if kind == "cls":
             if attr in ("*", "__mro__"):
@@ -430,16 +591,27 @@ def overlay_candidates(j, old_mods, nodeids):
             for k2, i in byattr.get((owner, attr), []):
                 if key is None or k2 == key or k2 == "*":
                     cands |= sets[i]
+            if OR:
+                for k2, i in OR[1].get((owner, attr), []):
+                    if key is None or k2 == key or k2 == "*":
+                        outside |= OR[0][i]
         elif kind in ("meth", "methcode"):
             if kind == "meth":
                 for k2, i in byattr.get((owner, attr), []):
                     cands |= sets[i]
+                if OR:
+                    for k2, i in OR[1].get((owner, attr), []):
+                        outside |= OR[0][i]
+            rng = _function_range(old_mods, owner, attr)
+            if rng is not None:
+                fn_lines.setdefault(rng[0], set()).update(range(rng[1], rng[2] + 1))
             if kind == "meth" or not precise:
-                fc = _function_coverage(old_mods, owner, attr, M)
-                if fc is None:
+                if rng is None:
                     unknown.append((kind, owner, attr))
                 else:
-                    cands |= fc
+                    cands |= M.covering(*rng)
+            elif rng is None:
+                OR = False
         else:
             unknown.append((kind, owner, attr))
     note = f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]}"
@@ -451,7 +623,23 @@ def overlay_candidates(j, old_mods, nodeids):
     if delta:
         cands |= untraced & (broad | precise)
     return {"cands": cands, "note": note, "unknown": bool(unknown),
-            "pure": all(d[0] == "methcode" for d in delta)}
+            "pure": all(d[0] == "methcode" for d in delta),
+            "replay_ok": bool(OR) and not unknown, "outside": outside, "fn_lines": fn_lines}
+
+
+def _function_range(mods, owner, attr):
+    modname, _, qual = owner.partition(":")
+    obj = mods.get(modname)
+    try:
+        for part in (p for p in qual.split(".") if p):
+            obj = vars(obj)[part]
+        fn = vars(obj)[attr]
+        fn = getattr(fn, "__func__", fn)
+        code = fn.__code__
+        lines = [l for _, _, l in code.co_lines() if l]
+        return os.path.relpath(code.co_filename, str(REPO)), min(lines), max(lines)
+    except Exception:  # noqa
+        return None
 
 
 def _function_coverage(mods, owner, attr, M):
@@ -617,6 +805,12 @@ def child(j, nodeids, ms, runner, modules):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}
         cands = sorted(res["cands"])
         j["unknown"] = res.get("unknown", False)
+        if res.get("replay_ok") and j.get("pure_src"):
+            cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
+                                      light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")))
+            note += rn
+            if not cands:
+                return {"failed": [], "unrun": [], "note": note}
         runner.MEMO_SKIP.clear()
         if runner.MEMO_DUCK:
             if res.get("pure"):
@@ -635,6 +829,16 @@ def child(j, nodeids, ms, runner, modules):
         note += f" cpu={sum(cpu_of(t, ms) for t in cands):.1f} top={[(t, round(cpu_of(t, ms), 1)) for t in sorted(cands, key=lambda t: -cpu_of(t, ms))[:3]]} skip={sorted(runner.MEMO_SKIP)} bud={budget:.0f}"
         j["light"], j["heavy"] = light, heavy
         unrun = list(heavy)
+    elif j.get("pure_src") and not j.get("was_import"):
+        allc = sorted(set(j["light"]) | set(j["heavy"]))
+        cands, rn = replay_narrow(allc, j.get("ch_lines"), ms, light0=j["light"], pure=True)
+        note += rn
+        if len(cands) != len(allc) or not j["light"]:
+            if not cands:
+                return {"failed": [], "unrun": [], "note": note}
+            light, heavy, est, static = plan_split(cands, ms, CPU, False, prepared is True)
+            j["light"], j["heavy"] = light, heavy
+            unrun = list(heavy)
     # light tests grouped by class (cheapest classes first) so class setup is shared
     groups = {}
     for t in j["light"]:

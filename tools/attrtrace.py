@@ -35,6 +35,9 @@ import sqlglot  # noqa: E402
 
 READS = set()
 _key = _Cmp().key
+PHASE = os.environ.get("BR_PHASE") == "1"   # record only reads made outside parse phases
+import replay  # noqa: E402
+_PH = replay.PH
 
 
 def keystr(k):
@@ -48,12 +51,16 @@ class TDict(dict):
     __slots__ = ("_br_owner",)
 
     def _rec(self, k):
+        if PHASE and _PH["depth"]:
+            return
         try:
             READS.add((self._br_owner[0], self._br_owner[1], keystr(k)))
         except Exception:  # noqa
             READS.add((self._br_owner[0], self._br_owner[1], "*"))
 
     def _all(self):
+        if PHASE and _PH["depth"]:
+            return
         READS.add((self._br_owner[0], self._br_owner[1], "*"))
 
     def __getitem__(self, k):
@@ -125,7 +132,8 @@ class Tracker:
         self.getter = getattr(type(value), "__get__", None)
 
     def __get__(self, obj, objtype=None):
-        READS.add((self.owner, self.attr, None))
+        if not (PHASE and _PH["depth"]):
+            READS.add((self.owner, self.attr, None))
         if self.getter is not None:
             return self.getter(self.value, obj, objtype)
         return self.value
@@ -181,6 +189,8 @@ for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         except Exception:  # noqa
             pass
 print("instrumented", instrument(), file=sys.stderr, flush=True)
+if PHASE:
+    replay.install_recorder()
 
 results = {}
 ONLY = os.environ.get("ONLY")

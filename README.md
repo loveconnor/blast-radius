@@ -26,7 +26,13 @@ built from the pinned commit.
    - After the light tests, a heavy test that was left unrun is run after all when the schedule time it would free outweighs its CPU.
    - Tests stop early once the rest cannot change the answer's cost.
    - Every child has a deadline. If one does not finish, that commit falls back to the static candidate set.
-3. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.
+3. **Parse-phase replay** (`app/replay.py`, built by `tools/buildreplay.py`).
+   - A *phase* is one outermost `Dialect.parse` / `Dialect.parse_into` call (tokenize + parse). At the pinned commit every test's phase inputs were recorded (about 25,000 unique ones) with a digest of everything a caller can observe: the returned trees, a raised error, and log records. The same trace recorded which lines and class attributes each test touches *outside* phases, and which functions each input enters.
+   - For a patch that leaves import-time state alone, or changes only class attributes with known readers, a candidate test that touches the change only inside phases cannot change its outcome unless one of its recorded inputs now produces a different output. The selector replays those inputs under the patch and keeps only the tests with a changed output.
+   - When only function bodies changed, only the inputs that enter a changed function are replayed.
+   - Digests ignore hash-seed-dependent ordering; inputs whose output still varies between interpreters are excluded at build time, along with the tests that use them.
+   - `test_max_nodes` parses a query of one unit repeated 10,000 times. Its phase is checked with the same unit repeated 100 and 400 times and the node limit scaled by the same ratio. This is a heuristic stand-in, not a proof.
+4. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.
 
 ## Layout
 
@@ -39,6 +45,8 @@ built from the pinned commit.
   - `percpu.py`: per-test CPU
   - `mknoise.py`: state-diff noise
   - `buildsub.py`: per-query coverage
+  - `buildreplay.py`: parse-phase inputs, digests and out-of-phase coverage
+  - `attrtrace.py` with `BR_PHASE=1`: attribute reads made outside parse phases
   - `genmutants.py`, `fastlabel.py` and friends: evaluation on synthetic mutants
 - `make sample` runs the image under the scorer's flags on the sample and scores it.
 
