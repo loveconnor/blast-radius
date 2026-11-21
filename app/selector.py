@@ -168,6 +168,9 @@ def main():
         M.n = len(nodeids)
         M.file_of = [t.split("::", 1)[0] for t in nodeids]
         M._file_users = {}
+        M._tests_by_file = {}
+        for i, f in enumerate(M.file_of):
+            M._tests_by_file.setdefault(f, set()).add(i)
     all_tests = set(range(len(tests)))
 
     answers = {}

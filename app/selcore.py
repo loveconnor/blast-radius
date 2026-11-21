@@ -25,6 +25,9 @@ class Map:
         self.opened = {p: set(s) for p, s in d["opened"].items()}
         self.file_of = [t.split("::", 1)[0] for t in self.tests]
         self._file_users = {}
+        self._tests_by_file = {}
+        for i, f in enumerate(self.file_of):
+            self._tests_by_file.setdefault(f, set()).add(i)
 
     def covering(self, f, start, end):
         m = self.lines.get(f)
@@ -52,7 +55,7 @@ class Map:
         return self._file_users[f]
 
     def tests_in_file(self, tf):
-        return {i for i, f in enumerate(self.file_of) if f == tf}
+        return set(self._tests_by_file.get(tf, ()))
 
 
 def dialect_name(path):
