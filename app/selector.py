@@ -919,18 +919,26 @@ def load_imports():
     return _IMPORTS
 
 
+_ALL_MOD_NAMES = None
+
+
+def _all_mod_names():
+    global _ALL_MOD_NAMES
+    if _ALL_MOD_NAMES is None:
+        import pkgutil
+        import sqlglot
+        _ALL_MOD_NAMES = [m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.") if not m.name.endswith("__main__")]
+    return _ALL_MOD_NAMES
+
+
 def _import_all():
     import importlib
-    import pkgutil
-    import sqlglot
     failed = []
-    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-        if m.name.endswith("__main__"):
-            continue
+    for name in _all_mod_names():
         try:
-            importlib.import_module(m.name)
+            importlib.import_module(name)
         except BaseException as e:  # noqa
-            failed.append((m.name, repr(e)[:80]))
+            failed.append((name, repr(e)[:80]))
     return failed
 
 
@@ -1036,6 +1044,13 @@ GLOBAL_REFS = os.environ.get("BR_GLOBAL_REFS", "1") == "1"
 _SRC_TEXT = {}
 
 
+def _preload_src_text():
+    if not _SRC_TEXT:
+        for top in ("sqlglot", "tests"):
+            for path in sorted((REPO / top).rglob("*.py")):
+                _SRC_TEXT[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8", errors="replace")
+
+
 def _global_refs(name, nodeids):
     """Where a module-level name is mentioned at the pinned commit: ({sqlglot file: lines},
     tests of the test files that mention it). None when that cannot be told."""
@@ -1043,10 +1058,7 @@ def _global_refs(name, nodeids):
     try:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not name:
             return None
-        if not _SRC_TEXT:
-            for top in ("sqlglot", "tests"):
-                for path in sorted((REPO / top).rglob("*.py")):
-                    _SRC_TEXT[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8", errors="replace")
+        _preload_src_text()
         pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name))
         src, tests = {}, set()
         by_file = None
@@ -1116,8 +1128,11 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
             modules.add(runner.module_name_for(nodeids[t].split("::")[0]))
     runner.zygote_import(modules)
     if any(j["overlay"] for j in jobs):
+        _all_mod_names()
         OLD_IMPORT_FAILURES[:] = [f[0] for f in _import_all()]
         load_reads()
+        load_imports()
+        _preload_src_text()
     if os.environ.get("BR_PRESET", "1") == "1":
         # executor tests wanted by at least two commits: load their class fixtures once
         want = 0

@@ -27,7 +27,7 @@ class _Cmp:
         if a is b:
             return True
         ta, tb = type(a), type(b)
-        if ta.__qualname__ != tb.__qualname__ or ta.__module__ != tb.__module__:
+        if ta is not tb and (ta.__qualname__ != tb.__qualname__ or ta.__module__ != tb.__module__):
             return False
         key = (id(a), id(b))
         m = self.memo.get(key)
@@ -41,7 +41,10 @@ class _Cmp:
     def _same(self, a, b, depth):
         if depth > _MAX_DEPTH:
             return True
-        if isinstance(a, (str, bytes, int, float, complex, bool, type(None), range)):
+        ta = type(a)
+        if ta is str or ta is int or ta is bool or a is None:
+            return a == b
+        if isinstance(a, (bytes, float, complex, range)):
             return a == b
         if isinstance(a, enum.Enum):
             return a.name == b.name and type(a).__qualname__ == type(b).__qualname__
@@ -52,6 +55,8 @@ class _Cmp:
         if isinstance(a, dict):
             if len(a) != len(b):
                 return False
+            if a.keys() == b.keys():
+                return all(self.same(a[k], b[k], depth + 1) for k in a)
             ka = {self.key(k): v for k, v in a.items()}
             kb = {self.key(k): v for k, v in b.items()}
             if ka.keys() != kb.keys():
@@ -104,17 +109,20 @@ class _Cmp:
             return repr(a) == repr(b)
 
     def key(self, k):
+        tk = type(k)
+        if tk is str or tk is int or tk is bool or k is None:
+            return k
         if isinstance(k, enum.Enum):
-            return ("E", type(k).__qualname__, k.name)
+            return ("E", tk.__qualname__, k.name)
         if isinstance(k, type):
-            return ("T", k.__module__, k.__qualname__)
+            return ("T", k.__module__, tk.__qualname__)
         if isinstance(k, tuple):
             return tuple(self.key(x) for x in k)
         if isinstance(k, frozenset):
             return ("FS", frozenset(self.key(x) for x in k))
-        if isinstance(k, (str, int, float, bytes, bool, type(None))):
+        if isinstance(k, (float, bytes)):
             return k
-        return ("O", type(k).__qualname__, repr(k))
+        return ("O", tk.__qualname__, repr(k))
 
     def same_code(self, a, b):
         if a.co_code != b.co_code or a.co_names != b.co_names or a.co_varnames != b.co_varnames \
