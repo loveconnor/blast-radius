@@ -533,25 +533,47 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
         return cands, f" replay-skip(est={est:.1f} worth={worth:.1f} bound={bound:.1f})"
     import replay
     t0 = time.time()
-    changed = set()
+    c0 = time.process_time()
     import runner
     signal.signal(signal.SIGALRM, runner._alarm)
     limit = t0 + 3.0 * est + 5.0
-    for k in keys:
-        if time.time() > limit:
-            return cands, " replay-abort(slow)"
-        # a patched parser may loop forever on an input: such an input counts as changed
-        signal.setitimer(signal.ITIMER_REAL, max(4.0, R["ms"][k] / 1000.0 * 40))
-        try:
-            if replay.run_key(R["keys"][k]) != R["dig"][k]:
-                changed.add(k)
-        except BaseException:  # noqa
-            changed.add(k)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+    state = {}   # key -> True when its output differs from the baseline
+    n_changed = 0
     ins = set(inside)
-    out = [t for t in cands if t not in ins or changed.intersection(tkeys[t])]
-    return out, f" replay(tests={len(inside)} keys={len(keys)} changed={len(changed)} kept={len(out)}/{len(cands)} {time.time() - t0:.2f}s est={est:.1f})"
+    kept = set()
+    kms = R["ms"]
+    # a test is affected as soon as one of its inputs differs, so its other inputs are
+    # not replayed; tests with few inputs go first (their results are shared)
+    for t in sorted(inside, key=lambda t: len(tkeys[t])):
+        hit = False
+        ks = tkeys[t]
+        for k in ks:
+            if state.get(k):
+                hit = True
+                break
+        if not hit:
+            for k in sorted((k for k in ks if k not in state), key=kms.__getitem__):
+                if time.time() > limit:
+                    return cands, " replay-abort(slow)"
+                # a patched parser may loop forever on an input: such an input counts as changed
+                signal.setitimer(signal.ITIMER_REAL, max(4.0, kms[k] / 1000.0 * 40))
+                try:
+                    ch = replay.run_key(R["keys"][k]) != R["dig"][k]
+                except BaseException:  # noqa
+                    ch = True
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                state[k] = ch
+                if ch:
+                    n_changed += 1
+                    hit = True
+                    break
+        if hit:
+            kept.add(t)
+    out = [t for t in cands if t not in ins or t in kept]
+    PROF["replay"] = PROF.get("replay", 0.0) + time.process_time() - c0
+    return out, (f" replay(tests={len(inside)} keys={len(state)}/{len(keys)} changed={n_changed} "
+                 f"kept={len(out)}/{len(cands)} {time.time() - t0:.2f}s est={est:.1f})")
 
 
 MEMO_PATH = Path(os.environ.get("BR_MEMO", HERE / "memo.pkl"))
@@ -624,6 +646,13 @@ P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.6"))
 LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.2"))
 P2_PASS = float(os.environ.get("BR_P2_PASS", "0.7"))
 P2_PASS_FAILED = float(os.environ.get("BR_P2_PASS_F", "0.3"))
+REPLAN = os.environ.get("BR_REPLAN", "1") == "1"
+PRESET_MIN = int(os.environ.get("BR_PRESET_MIN", "1"))
+DENSE_MS = float(os.environ.get("BR_DENSE_MS", "500"))
+DENSE_MIN = float(os.environ.get("BR_DENSE_MIN", "2.0"))
+Q_MAX = float(os.environ.get("BR_Q_MAX", "0.7"))
+Q_PRIOR = float(os.environ.get("BR_Q_PRIOR", "1.0"))
+RP_MARGIN = float(os.environ.get("BR_RP_MARGIN", "1.1"))
 
 
 def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0):
@@ -867,9 +896,23 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
             if not j["overlay"] and j.get("pure_src") and any(
                     nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"] + j["heavy"]):
                 want += 1
-        if want >= 2:
+        if want >= PRESET_MIN:
             ok = runner.prebuild_class("tests.test_executor", "TestExecutor")
             log(f"shared executor fixtures for {want} commits: {ok}")
+    # maps every child would otherwise load for itself
+    try:
+        _submap()
+        if REPLAY_ON and len(jobs) >= 2 and any(j.get("pure_src") for j in jobs):
+            R = _replay()
+            if R:
+                _attr_mask(R, ())
+            if any(j["overlay"] for j in jobs):
+                load_outreads()
+        if len(jobs) >= 2 and any(j["overlay"] and j.get("pure_src") for j in jobs):
+            _itermap()
+            opt_affected({})
+    except Exception as e:  # noqa
+        log("preload failed", repr(e))
     import gc
     gc.collect()
     gc.freeze()  # children neither scan nor copy the zygote's heap
@@ -965,7 +1008,58 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
             pending = []
 
 
+def _sampler():
+    """Debug: cpu-time stack sampling of a child (BR_SAMPLE=1)."""
+    import collections
+    self_c, incl_c = collections.Counter(), collections.Counter()
+
+    def h(sig, frame):
+        seen = set()
+        f = frame
+        first = True
+        while f is not None:
+            co = f.f_code
+            k = f"{co.co_filename.rsplit('/', 2)[-2]}/{co.co_filename.rsplit('/', 1)[-1]}:{co.co_name}"
+            if first:
+                self_c[k + f":{f.f_lineno}"] += 1
+                first = False
+            if k not in seen:
+                seen.add(k)
+                incl_c[k] += 1
+            f = f.f_back
+    signal.signal(signal.SIGPROF, h)
+    signal.setitimer(signal.ITIMER_PROF, 0.004, 0.004)
+
+    def done(cid):
+        signal.setitimer(signal.ITIMER_PROF, 0, 0)
+        n = sum(self_c.values())
+        log("SAMPLE", cid, n, "samples\nINCL", "\n".join(f"{v:6d} {k}" for k, v in incl_c.most_common(70)),
+            "\nSELF", "\n".join(f"{v:6d} {k}" for k, v in self_c.most_common(40)))
+    return done
+
+
 def child(j, nodeids, ms, runner, modules):
+    c_start = time.process_time()
+    smp = _sampler() if os.environ.get("BR_SAMPLE") else None
+    out = _child(j, nodeids, ms, runner, modules)
+    if smp:
+        smp(j["cid"])
+    try:
+        tc = runner.TEST_CPU
+        slow = {t: round(v, 2) for t, v in sorted(tc.items(), key=lambda kv: -kv[1])[:5] if v >= 0.25}
+        out["note"] = (f" prof(cpu={time.process_time() - c_start:.2f} prep={PROF.get('prep', 0):.2f} "
+                       f"ovc={PROF.get('ovc', 0):.2f} replay={PROF.get('replay', 0):.2f} tests={sum(tc.values()):.2f} slow={slow} "
+                       f"start={c_start:.2f} marks={PROF.get('marks')})"
+                       + out.get("note", ""))
+    except Exception:  # noqa
+        pass
+    return out
+
+
+PROF = {}
+
+
+def _child(j, nodeids, ms, runner, modules):
     os.environ["TMPDIR"] = j["tmp"]
     CPU_OVR.clear()
     CPU_OVR.update(j.get("cpu_ovr") or {})
@@ -993,12 +1087,15 @@ def child(j, nodeids, ms, runner, modules):
                     pass
     note = ""
     old_mods = {k: v for k, v in sys.modules.items() if k == "sqlglot" or k.startswith("sqlglot.")}
+    c0 = time.process_time()
     try:
         prepared = runner.prepare(j, modules)
     except runner.NeedReimport as e:
         j["overlay"] = True
         note = f"reimport({e})"
         prepared = runner.prepare(j, modules)
+    PROF["prep"] = time.process_time() - c0
+    PROF["marks"] = [("prep", round(time.process_time(), 2))]
     unrun = list(j["heavy"])
     if runner.PRESETS:
         kept = runner.apply_presets(not j["overlay"] and bool(j.get("pure_src")) and not j.get("was_import"),
@@ -1007,7 +1104,9 @@ def child(j, nodeids, ms, runner, modules):
             note += " preset"
     if j["overlay"]:
         optmemo.ON[0] = False   # decided again once the state diff is known
+        c0 = time.process_time()
         res = overlay_candidates(j, old_mods, nodeids)
+        PROF["ovc"] = time.process_time() - c0
         if res.get("all"):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}
         cands = sorted(res["cands"])
@@ -1061,11 +1160,25 @@ def child(j, nodeids, ms, runner, modules):
             light, heavy, est, static = plan_split(cands, ms, CPU, False, prepared is True)
             j["light"], j["heavy"] = light, heavy
             unrun = list(heavy)
-    # light tests grouped by class (cheapest classes first) so class setup is shared
+    PROF["marks"].append(("plan", round(time.process_time(), 2)))
+    # tests that clear much schedule time per cpu second go first; then the rest grouped
+    # by class (cheapest classes first) so class setup is shared
+    def density(t):
+        return ms[t] / 1000.0 / max(cpu_of(t, ms), 0.002)
+
+    tier1 = sorted((t for t in j["light"] if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN), key=lambda t: -density(t))
+    t1 = set(tier1)
+    groups = {}
+    for t in tier1:
+        groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+    ordered = [t for g in groups.values() for t in g]
     groups = {}
     for t in j["light"]:
-        groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-    ordered = [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+        if t not in t1:
+            groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+    ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+    n_total = len(ordered)
+    rp = {"dropped": set(), "n": 0}
 
     def should_stop(cur_failed, rest):
         if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
@@ -1073,6 +1186,32 @@ def child(j, nodeids, ms, runner, modules):
         base = sorted(set(unrun) | set(cur_failed))
         delta = best_schedule(base + rest, ms)[1] - best_schedule(base, ms)[1]
         return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
+
+    def replan(cur_failed, rest):
+        """Another test failed: which of the remaining tests are still worth their cpu?"""
+        if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
+            return []
+        rp["n"] += 1
+        base = sorted(set(unrun) | set(cur_failed) | rp["dropped"])
+        n_run = max(1, n_total - len(rest) - len(rp["dropped"]))
+        q = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + 2.0 * Q_PRIOR))
+        order = sorted(rest, key=lambda t: -density(t))
+        full = best_schedule(base + order, ms)[1]
+        n = len(order)
+        ks = sorted(set(list(range(0, min(n, 12) + 1)) + [int(n * f) for f in (0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0)]))
+        best_k, best_net = 0, 0.0
+        cpu_pref = [0.0]
+        for t in order:
+            cpu_pref.append(cpu_pref[-1] + cpu_of(t, ms))
+        for k in ks:
+            if k == 0:
+                continue
+            saved = (full - best_schedule(base + order[k:], ms)[1]) / 1000.0
+            net = saved * (1.0 - q) - RP_MARGIN * cpu_pref[k] - 0.1
+            if net > best_net:
+                best_k, best_net = k, net
+        rp["dropped"].update(order[best_k:])
+        return order[:best_k]
 
     skipped = []
     if os.environ.get("BR_PROFILE"):
@@ -1090,10 +1229,12 @@ def child(j, nodeids, ms, runner, modules):
         pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
         log("PROFILE", j["cid"], "tests", len(ordered), sorted(per, reverse=True)[:25], buf.getvalue()[:6000])
     failed = set(runner.run_tests(ordered, nodeids, timeouts=[max(10.0, ms[t] / 1000 * 5 + 5) for t in ordered],
-                                  should_stop=should_stop, skipped=skipped))
+                                  replan=replan if REPLAN else None, should_stop=None if REPLAN else should_stop,
+                                  skipped=skipped))
+    PROF["marks"].append(("ran", round(time.process_time(), 2)))
     if skipped:
         unrun.extend(skipped)
-        note += f" early-stop({len(skipped)})"
+        note += f" early-stop({len(skipped)}/{rp['n']})"
     if j["overlay"] and j.get("unknown") and len(failed) >= BROAD_FAILS:
         # an import-time change that breaks many tests: its reach is beyond what
         # the coverage map can tell, so run nothing more and select everything
@@ -1134,7 +1275,7 @@ def child(j, nodeids, ms, runner, modules):
     if any(runner.MEMO_STAT):
         note += f" memo={runner.MEMO_STAT}"
     if any(optmemo.STAT):
-        note += f" opt={optmemo.STAT}/{optmemo.AFFECTED}"
+        note += f" opt={optmemo.STAT}/{optmemo.AFFECTED} optT={[round(x, 2) for x in optmemo.TIMES]}"
     return {"failed": sorted(failed), "unrun": unrun, "note": note}
 
 

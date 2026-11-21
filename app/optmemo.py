@@ -81,6 +81,10 @@ AFFECTED: list = []     # contexts (0 = preamble, i + 1 = rule i) that may run a
 STAT = [0, 0, 0, 0]     # served from memo, short-circuited, diverged, passed through
 
 
+TIMES = [0.0] * 6      # key, tree loads, digests (inside rules span), affected rules span, pass-through, after divergence
+_pt = __import__("time").process_time
+
+
 class _Final(BaseException):
     pass
 
@@ -135,36 +139,68 @@ def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules
     if not ON[0] or IDX is None or rules is not RULES or not copy or 0 in AFFECTED:
         STAT[3] += 1
         return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+    t0 = _pt()
     try:
         st = IDX["keys"].get(call_key(expression, schema, db, catalog, dialect, sql, kwargs))
     except Unkeyable:
         st = None
+    TIMES[0] += _pt() - t0
     if st is None or len(RULES) + 1 != len(st):
         STAT[3] += 1
-        return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+        t0 = _pt()
+        try:
+            return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+        finally:
+            TIMES[4] += _pt() - t0
     aff = [c - 1 for c in AFFECTED]
     if not aff:
         STAT[0] += 1
-        return _tree(st[-1])
+        t0 = _pt()
+        try:
+            return _tree(st[-1])
+        finally:
+            TIMES[1] += _pt() - t0
     seq = []
     for n, i in enumerate(aff):
         nxt = aff[n + 1] if n + 1 < len(aff) else None
 
         def chk(expression, i=i, nxt=nxt):
-            if digest(expression) != st[i + 1]:
-                raise _Diverged(i, expression)
+            t0 = _pt()
+            try:
+                if digest(expression) != st[i + 1]:
+                    raise _Diverged(i, expression)
+            finally:
+                TIMES[2] += _pt() - t0
             if nxt is None:
                 raise _Final()
-            return _tree(st[nxt])
+            t0 = _pt()
+            try:
+                return _tree(st[nxt])
+            finally:
+                TIMES[1] += _pt() - t0
         seq += [RULES[i], chk]
+    t0 = _pt()
+    first = _tree(st[aff[0]])
+    TIMES[1] += _pt() - t0
+    t0 = _pt()
     try:
-        return orig(_tree(st[aff[0]]), schema, db, catalog, dialect, tuple(seq), sql, False, **kwargs)
+        return orig(first, schema, db, catalog, dialect, tuple(seq), sql, False, **kwargs)
     except _Final:
         STAT[1] += 1
-        return _tree(st[-1])
+        TIMES[3] += _pt() - t0
+        t0 = _pt()
+        try:
+            return _tree(st[-1])
+        finally:
+            TIMES[1] += _pt() - t0
     except _Diverged as e:
         STAT[2] += 1
-        return orig(e.tree, schema, db, catalog, dialect, tuple(RULES[e.i + 1:]), sql, False, **kwargs)
+        TIMES[3] += _pt() - t0
+        t0 = _pt()
+        try:
+            return orig(e.tree, schema, db, catalog, dialect, tuple(RULES[e.i + 1:]), sql, False, **kwargs)
+        finally:
+            TIMES[5] += _pt() - t0
 
 
 def install():

@@ -644,12 +644,17 @@ class Timeout(BaseException):
     pass
 
 
+TEST_CPU = {}
+
+
 def _alarm(signum, frame):
     raise Timeout()
 
 
-def _timed(run, seconds, t=None):
+def _timed(run, seconds, t=None, gate=None):
     def wrapped(*a, **k):
+        if gate is not None and not gate(t):
+            return None     # dropped by a re-plan: stays selected, unrun
         _SUB["n"] = 0
         _SUB["failed"] = False
         _SUB["lazy"] = t in SUBMIT_LAZY
@@ -665,34 +670,74 @@ def _timed(run, seconds, t=None):
             install_memo()
         _SUB["allow"] = SUBMIT_FILTER.get(t)
         signal.setitimer(signal.ITIMER_REAL, seconds)
+        c0 = time.process_time()
         try:
             return run(*a, **k)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             _ITER["allow"] = None   # class fixtures of the next test load everything
+            TEST_CPU[t] = TEST_CPU.get(t, 0.0) + time.process_time() - c0
     return wrapped
 
 
-def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None):
+def _once_fixtures(C):
+    """Class fixtures are set up once per process even when the class's tests run in
+    several stretches (as they are in one ordinary run of the class)."""
+    if C.__dict__.get("_br_once"):
+        return
+    try:
+        setup = C.setUpClass
+        state = [False]
+
+        def setUpClass(cls):
+            if not state[0]:
+                state[0] = True
+                setup()
+        C.setUpClass = classmethod(setUpClass)
+        C.tearDownClass = classmethod(lambda cls: None)
+        C._br_once = True
+    except Exception:  # noqa
+        pass
+
+
+def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, replan=None):
     """test_ids: list of numbers; nodeids: number -> 'tests/x.py::Class::method'.
     Returns set of failing numbers. should_stop(failed_so_far, remaining) -> bool stops
-    early; tests not run are added to `skipped`."""
+    early. replan(failed_so_far, remaining) -> the remaining tests still worth running
+    (None: all), asked whenever another test has failed. Tests not run are added to
+    `skipped`."""
     failed = set()
-    remaining = list(test_ids)
     stopped = [False]
-    by_class = {}
+    allowed = [None]
+    seen_fail = [0]
+    segs = []
     tmo = {}
     for k, t in enumerate(test_ids):
         tmo[t] = timeouts[k] if timeouts else 60.0
         parts = nodeids[t].split("::")
         mod = module_name_for(parts[0])
         if len(parts) == 3:
-            by_class.setdefault((mod, parts[1]), []).append((t, parts[2]))
+            key = (mod, parts[1])
+            if segs and segs[-1][0] == key:
+                segs[-1][1].append((t, parts[2]))
+            else:
+                segs.append((key, [(t, parts[2])]))
         else:
             failed.add(t)  # unknown layout, treat as failing to be safe
     signal.signal(signal.SIGALRM, _alarm)
-    order_classes = list(by_class.items())
-    for ci, ((mod, cls), items) in enumerate(order_classes):
+
+    def gate(t):
+        return allowed[0] is None or t in allowed[0]
+
+    for ci, ((mod, cls), items) in enumerate(segs):
+        if allowed[0] is not None and not stopped[0]:
+            drop = [t for t, _ in items if t not in allowed[0]]
+            if drop:
+                if skipped is not None:
+                    skipped.extend(drop)
+                items = [(t, m) for t, m in items if t in allowed[0]]
+                if not items:
+                    continue
         if stopped[0]:
             if skipped is not None:
                 skipped.extend(t for t, _ in items)
@@ -703,6 +748,7 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None):
         except BaseException:  # noqa
             failed.update(t for t, _ in items)
             continue
+        _once_fixtures(C)
         suite = unittest.TestSuite()
         for t, meth in items:
             try:
@@ -711,10 +757,11 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None):
                 failed.add(t)
                 continue
             case._br_id = t
-            case.run = _timed(case.run, tmo[t], t)
+            case.run = _timed(case.run, tmo[t], t, gate)
             suite.addTest(case)
+
         def on_done(i, bad, _items=items, _ci=ci):
-            if should_stop is None:
+            if should_stop is None and replan is None:
                 return False
             cur = set(failed)
             for b in bad:
@@ -723,8 +770,24 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None):
             if not cur:
                 return False
             done_here = res.done
-            rest = [t for t, _ in _items if t not in done_here] + [t for _, its in order_classes[_ci + 1:] for t, _ in its]
-            if rest and should_stop(cur, rest):
+            rest = [t for t, _ in _items if t not in done_here] + [t for _, its in segs[_ci + 1:] for t, _ in its]
+            if allowed[0] is not None:
+                rest = [t for t in rest if t in allowed[0]]
+            if not rest:
+                return False
+            if replan is not None:
+                if len(cur) == seen_fail[0]:
+                    return False
+                seen_fail[0] = len(cur)
+                keep = replan(cur, rest)
+                if keep is None:
+                    return False
+                allowed[0] = set(keep)
+                if not allowed[0]:
+                    stopped[0] = True
+                    return True
+                return False
+            if should_stop(cur, rest):
                 stopped[0] = True
                 return True
             return False
@@ -741,7 +804,7 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None):
                 failed.update(t for t, _ in items)
             else:
                 failed.add(b)
-        if stopped[0] and skipped is not None:
+        if skipped is not None:
             skipped.extend(t for t, _ in items if t not in res.done and t not in failed)
     return failed
 

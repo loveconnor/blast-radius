@@ -201,6 +201,14 @@ def diff_state(old_mods: dict, new_mods: dict, only=None):
                     kind = "methcode" if not cmp.same_code(a.__code__, b.__code__) else "meth"
                     changes.add((kind, name, k, None))
                 continue
+            if isinstance(a, types.FunctionType) and isinstance(b, types.FunctionType) \
+                    and a.__module__ == b.__module__ and a.__module__ != name \
+                    and a.__qualname__ == b.__qualname__ and "." not in a.__qualname__ \
+                    and vars(old_mods.get(a.__module__) or types).get(a.__qualname__) is a \
+                    and vars(new_mods.get(b.__module__) or types).get(b.__qualname__) is b:
+                # a re-export of a function another sqlglot module defines at top level:
+                # that module's own entry reports the change
+                continue
             if not cmp.same(a, b):
                 _record(cmp, changes, ("mod", name, k), a, b)
         # classes defined in the module
