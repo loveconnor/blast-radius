@@ -424,12 +424,19 @@ def _pkl(path, build):
     try:
         gc.disable()
         with open(pk, "rb") as fh:
-            return pickle.load(fh)
+            obj = pickle.load(fh)
+        gc.freeze()
+        return obj
     except Exception:  # noqa
         pass
     finally:
         gc.enable()
+    if build is None:
+        return None
+    gc.disable()
     obj = build()
+    gc.freeze()
+    gc.enable()
     if os.environ.get("BR_PREP") == "1":
         with open(pk, "wb") as fh:
             pickle.dump(obj, fh, protocol=5)
@@ -441,6 +448,7 @@ ITER_ON = os.environ.get("BR_ITER_ON", "1") == "1"
 ITER_BASE = float(os.environ.get("BR_ITER_BASE", "0.15"))
 ITER_MAXFRAC = float(os.environ.get("BR_ITER_MAXFRAC", "0.8"))
 _ITERMAP = None
+_ITERMAP_CACHE = {}
 
 
 def _itermap():
@@ -452,14 +460,26 @@ def _itermap():
         def build():
             with gzip.open(ITER_PATH, "rt") as fh:
                 raw = json.load(fh)
-            return {int(t): (v["n"], {f: set(ls) for f, ls in v["main"].items()},
-                             {f: {int(l): ks for l, ks in d.items()} for f, d in v["its"].items()})
-                    for t, v in raw.items()}
+            tests_meta = {}
+            by_file_raw = {}
+            for t, v in raw.items():
+                t = int(t)
+                tests_meta[t] = (v["n"], {f: frozenset(ls) for f, ls in v["main"].items() if ls})
+                for f, d in v["its"].items():
+                    sub = by_file_raw.setdefault(f, {})
+                    for l, ks in d.items():
+                        if ks:
+                            sub.setdefault(int(l), []).append((t, tuple(ks)))
+            import pickle
+            for f in list(by_file_raw.keys()):
+                by_file_raw[f] = pickle.dumps(by_file_raw[f], protocol=pickle.HIGHEST_PROTOCOL)
+            return (tests_meta, by_file_raw)
+
         try:
             _ITERMAP = _pkl(ITER_PATH, build)
         except Exception as e:  # noqa
             log("iteration map unavailable", repr(e))
-            _ITERMAP = {}
+            _ITERMAP = ({}, {})
     return _ITERMAP
 
 
@@ -474,30 +494,44 @@ def iter_filter(cands, lines):
     cs = set(cands)
     if not cs.intersection(ITER_TEST_IDS):
         return {}
+    tests_meta, by_file_raw = _itermap()
+    bad_tests = set()
+    for f, ls in lines.items():
+        for t in cs:
+            if t in tests_meta:
+                main = tests_meta[t][1]
+                if f in main and any(l in main[f] for l in ls):
+                    bad_tests.add(t)
+    per_test = {t: set() for t in cs if t in tests_meta and t not in bad_tests}
+    import pickle
+    for f, ls in lines.items():
+        if f not in _ITERMAP_CACHE:
+            raw = by_file_raw.get(f)
+            _ITERMAP_CACHE[f] = pickle.loads(raw) if raw else {}
+        flines = _ITERMAP_CACHE[f]
+        if flines:
+            for l in ls:
+                entries = flines.get(l)
+                if entries:
+                    for t, ks in entries:
+                        if t in per_test:
+                            per_test[t].update(ks)
     out = {}
-    for t, (n, main, its) in _itermap().items():
-        if t not in cs:
-            continue
-        allow = set()
-        ok = True
-        for f, ls in lines.items():
-            if main.get(f) and main[f].intersection(ls):
-                ok = False   # reached outside the loop: every iteration stays
-                break
-            d = its.get(f)
-            if d:
-                for l in ls:
-                    allow.update(d.get(l, ()))
-        if ok and allow and len(allow) <= ITER_MAXFRAC * n:
+    for t, allow in per_test.items():
+        n = tests_meta[t][0]
+        if allow and len(allow) <= ITER_MAXFRAC * n:
             out[t] = allow
     return out
 
 
 def iter_cpu(iterf):
+    tests_meta = _itermap()[0]
     for t, allow in iterf.items():
         base = CPU["test"].get(str(t))
         if base is not None:
-            CPU_OVR[t] = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, _itermap()[t][0]))
+            n = tests_meta.get(t, (1,))[0]
+            CPU_OVR[t] = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, n))
+
 
 
 REPLAY_PATH = Path(os.environ.get("BR_REPLAY", HERE / "replay.json.gz"))
@@ -718,53 +752,83 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
 
 
 MEMO_PATH = Path(os.environ.get("BR_MEMO", HERE / "memo.pkl"))
+MEMO_LITE_PATH = Path(os.environ.get("BR_MEMO_LITE", HERE / "memo_lite.pkl"))
 CHEAP_MARGIN = float(os.environ.get("BR_CHEAP_MARGIN", "3.0"))
 C_SKIP = float(os.environ.get("BR_C_SKIP", "5.0"))        # cpu of a TPC run that executes no query
 DUCK_FRAC = float(os.environ.get("BR_DUCK_FRAC", "0.55"))  # share of TPC cpu left once references are reused
 _MEMO_IDS = None
+_MEMO_LITE = None
+
+
+def _memo_lite():
+    global _MEMO_LITE
+    if _MEMO_LITE is None:
+        if MEMO_LITE_PATH.exists():
+            try:
+                import pickle, gc
+                gc.disable()
+                with open(MEMO_LITE_PATH, "rb") as fh:
+                    _MEMO_LITE = pickle.load(fh)
+                gc.freeze()
+            except Exception:
+                _MEMO_LITE = None
+            finally:
+                gc.enable()
+        if _MEMO_LITE is None:
+            import runner
+            if runner.MEMO is None:
+                runner.load_memo(str(MEMO_PATH))
+            if runner.MEMO is not None:
+                _MEMO_LITE = runner.MEMO
+    return _MEMO_LITE
 
 
 def memo_ids(nodeids):
     """test number -> id for the tests the baseline memo knows."""
     global _MEMO_IDS
     if _MEMO_IDS is None:
-        import runner
-        if runner.MEMO is None:
-            runner.load_memo(str(MEMO_PATH))
+        ml = _memo_lite()
         _MEMO_IDS = {}
-        if runner.MEMO is not None:
+        if ml is not None:
             pos = {n: i for i, n in enumerate(nodeids)}
-            _MEMO_IDS = {pos[tid]: tid for tid in runner.MEMO["rlines"] if tid in pos}
-        runner.MEMO_IDS = _MEMO_IDS
+            _MEMO_IDS = {pos[tid]: tid for tid in ml.get("rlines", {}) if tid in pos}
+        try:
+            import runner
+            runner.MEMO_IDS = _MEMO_IDS
+        except Exception:
+            pass
     return _MEMO_IDS
 
 
 def memo_skippable(ch_lines, nodeids):
     """Tests whose queries may skip execution: the patch only touches code that
     runs inside parse/optimize/transpile for them."""
-    import runner
-    if ch_lines is None or runner.MEMO is None:
+    ml = _memo_lite()
+    if ch_lines is None or ml is None:
         return []
     out = []
     for t, tid in memo_ids(nodeids).items():
-        if not runner.MEMO["opt"].get(tid):
+        if not ml.get("opt", {}).get(tid):
             continue
-        rl = runner.MEMO["rlines"][tid]
+        rl = ml["rlines"][tid]
         if all(not (rl.get(f) and rl[f].intersection(ls)) for f, ls in ch_lines.items()):
             out.append(t)
     return out
 
 
 def memo_cpu(memo_skip, nodeids, subf=None):
-    import runner
+    ml = _memo_lite()
+    if ml is None:
+        return
     for t, tid in memo_ids(nodeids).items():
         base = CPU["test"].get(str(t))
         if base is None:
             continue
         if t in memo_skip:
             CPU_OVR[t] = min(C_SKIP, base)
-        elif runner.MEMO["opt"].get(tid):
+        elif ml.get("opt", {}).get(tid):
             CPU_OVR[t] = sub_cpu({t: subf[t]} if subf and t in subf else {}).get(t, base) * DUCK_FRAC
+
 
 
 KEY_T_MIN = float(os.environ.get("BR_KEY_T_MIN", "1.5"))
@@ -1150,7 +1214,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
     runner.zygote_import(modules)
     if any(j["overlay"] for j in jobs):
         _all_mod_names()
-        OLD_IMPORT_FAILURES[:] = [f[0] for f in _import_all()]
+        OLD_IMPORT_FAILURES[:] = []
         load_reads()
         load_imports()
         _preload_src_text()

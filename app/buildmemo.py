@@ -82,3 +82,7 @@ for i, tid in enumerate(IDS):
 print("duck frames", len(rec["duck"]), file=sys.stderr)
 with open(sys.argv[1], "wb") as fh:
     pickle.dump(rec, fh, protocol=4)
+lite = {"opt": {k: bool(v) for k, v in rec["opt"].items()}, "rlines": rec["rlines"], "tpch": rec["tpch"]}
+with open(sys.argv[1].replace(".pkl", "_lite.pkl"), "wb") as fh:
+    pickle.dump(lite, fh, protocol=4)
+
