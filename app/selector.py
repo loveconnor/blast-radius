@@ -57,6 +57,7 @@ def emit(lines):
 
 
 _TEST = dict(kv.split("=", 1) for kv in os.environ.get("BR_SELFTEST", "").split(",") if "=" in kv)
+UNKNOWN_TESTS: set = set()
 POISON: set = set()       # commits whose analysis killed an earlier attempt: all their tests
 STATIC_ONLY = [False]     # last attempt: no test runs, static candidates only
 _PROGRESS_FD = [None]
@@ -159,7 +160,12 @@ def main():
     M = _pkl(MAP, lambda: Map(MAP))
     MAP_OBJ = M
     if M.tests != nodeids:
-        log("WARNING: map test list differs from tests.json; remapping")
+        # every other map is indexed by the test numbers of the pinned test list: with a
+        # different list only the (remapped) coverage map can be trusted
+        log("WARNING: map test list differs from tests.json; remapping, static candidates only")
+        STATIC_ONLY[0] = True
+        known = set(M.tests)
+        UNKNOWN_TESTS.update(i for i, t in enumerate(nodeids) if t not in known)
         idx = {t: i for i, t in enumerate(nodeids)}
         remap = [idx.get(t) for t in M.tests]
         M.sets = [frozenset(remap[x] for x in s if remap[x] is not None) for s in M.sets]
@@ -296,6 +302,8 @@ def main():
     for pf in patches:
         cid = pf.stem
         sel = answers.get(cid, sorted(all_tests))
+        if UNKNOWN_TESTS:
+            sel = sorted(set(sel) | UNKNOWN_TESTS)   # tests no map knows are always selected
         workers, cost = best_schedule(sel, ms)
         lines.append({"commit": cid, "workers": workers})
     _progress("E")
@@ -569,6 +577,7 @@ def _key_mask(R, lines_by_file):
 
 
 _AK = None
+GEN_INIT_LINE = 1005    # sqlglot/generator.py at the pinned commit: inside Generator.__init__
 
 
 def _attr_mask(R, attrs):
@@ -599,7 +608,8 @@ def _attr_mask(R, attrs):
     return mask
 
 
-def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False, attrs=None):
+def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False, attrs=None,
+                  disp=False):
     """Replay the recorded phase inputs under the patched code; drop the candidates whose
     inputs all still produce their baseline output. Returns (candidates, note)."""
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
@@ -629,8 +639,13 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             allines.setdefault(f, set()).update(v)
         m1 = _attr_mask(R, attrs)
         m2 = _key_mask(R, allines)
+        # inputs that create a generator (they enter Generator.__init__, where the dispatch
+        # table is looked up)
+        m3 = _key_mask(R, {"sqlglot/generator.py": {GEN_INIT_LINE}}) if disp else 0
+        if disp and not m3:
+            m1 = None       # cannot tell: replay every input of the tests in scope
         if m1 is not None and m2 is not None:
-            mask = m1 | m2
+            mask = m1 | m2 | m3
             tkeys = {t: [k for k in ks if (mask >> k) & 1] for t, ks in tkeys.items()}
             tkeys = {t: ks for t, ks in tkeys.items() if ks}
             inside = [t for t in inside if t in tkeys]
@@ -651,6 +666,20 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     t0 = time.time()
     c0 = time.process_time()
     import runner
+    if os.environ.get("BR_REPLAY_DEBUG"):
+        for dt in [int(x) for x in os.environ["BR_REPLAY_DEBUG"].split(",")]:
+            allk = R["tests"].get(dt, [])
+            mk = tkeys.get(dt)
+            res = []
+            for k in allk:
+                try:
+                    ch = replay.run_key(R["keys"][k]) != R["dig"][k]
+                except BaseException as e:  # noqa
+                    ch = repr(e)[:40]
+                if ch:
+                    res.append((k, ch, k in (mk or ()), str(R["keys"][k])[:300]))
+            log("REPLAYDEBUG", dt, "in_cands", dt in cands, "inside", dt in inside, "bad", dt in R["bad"], "keys", len(allk),
+                "masked", None if mk is None else len(mk), "changed(all keys)", res[:6])
     signal.signal(signal.SIGALRM, runner._alarm)
     limit = t0 + 3.0 * est + 5.0
     state = {}   # key -> True when its output differs from the baseline
@@ -1026,7 +1055,30 @@ def overlay_candidates(j, old_mods, nodeids):
             return {"all": True, "note": note + " broad"}
     if delta:
         cands |= untraced & (broad | precise)
-    return {"cands": cands, "note": note, "unknown": bool(unknown), "forced": forced,
+    # A generator class's dispatch table is built once per process from TRANSFORMS and the
+    # *_sql methods and then reused: the per-input attribute trace only saw those reads
+    # for the first input that built it. For such a change every input that creates a
+    # generator counts as a reader.
+    disp = False
+    try:
+        gen_base = old_mods["sqlglot.generator"].Generator
+        for d in delta:
+            if d[0] not in ("cls", "meth"):
+                continue
+            modname, _, qual = d[1].partition(":")
+            obj = old_mods.get(modname)
+            try:
+                for part in (x for x in qual.split(".") if x):
+                    obj = vars(obj)[part]
+                if isinstance(obj, type) and not issubclass(obj, gen_base):
+                    continue
+            except Exception:  # noqa
+                pass
+            disp = True
+            break
+    except Exception:  # noqa
+        disp = True
+    return {"cands": cands, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
             "pure": all(d[0] == "methcode" for d in delta) and not forced,
             "replay_ok": bool(OR) and not unknown, "outside": outside, "fn_lines": fn_lines,
             "attrs": sorted({(d[1], d[2]) for d in delta if d[0] in ("cls", "meth")})}
@@ -1385,7 +1437,8 @@ def _child(j, nodeids, ms, runner, modules):
         if res.get("replay_ok") and j.get("pure_src"):
             cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
                                       light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")),
-                                      attrs=None if res.get("pure") else res.get("attrs"))
+                                      attrs=None if res.get("pure") else res.get("attrs"),
+                                      disp=bool(res.get("disp", True)))
             note += rn
             if HANG[0]:
                 return {"failed": [], "unrun": sorted(cands), "note": note + " " + res["note"]}
