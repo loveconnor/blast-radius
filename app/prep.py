@@ -14,4 +14,11 @@ selector.load_outreads()
 selector._replay()
 selector._itermap()
 selector.load_imports()
+try:
+    import runner  # noqa: E402
+    runner.zygote_import({"tests.test_executor"})
+    ok = runner.prebuild_class("tests.test_executor", "TestExecutor", cache=str(selector.PRESET_CACHE))
+    print("executor fixtures cached:", ok)
+except Exception as e:  # noqa
+    print("executor fixtures not cached:", repr(e))
 print("maps prepared", sorted(f for f in os.listdir(HERE) if f.endswith(".pkl")))

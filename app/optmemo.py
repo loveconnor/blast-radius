@@ -127,23 +127,57 @@ def _tree(d):
 
 
 _ORIG = [None, None]    # the real optimize and its module
+CH_MASK = [None]        # changed lines as a bit set over IDX["lineid"] (None: per-call filter off)
+WANT = [False]          # the caller only needs to know whether the result is the baseline one
+
+
+class Base:
+    """Returned instead of a tree when WANT is set and the result is the recorded one."""
+    __slots__ = ("digest",)
+
+    def __init__(self, d):
+        self.digest = d
+
+
+def set_changed(lines_by_file):
+    """Tell the stand-in which lines the patch changed (function bodies only)."""
+    if IDX is None or not IDX.get("lineid") or lines_by_file is None:
+        CH_MASK[0] = None
+        return
+    m = 0
+    for f, ls in lines_by_file.items():
+        d = IDX["lineid"].get(f)
+        if d:
+            for l in ls:
+                i = d.get(l)
+                if i is not None:
+                    m |= 1 << i
+    # a changed line that fills a process-level cache or depends on the hash seed is not
+    # tied to the calls that happened to run it: no per-call judgement then
+    CH_MASK[0] = None if (m & IDX.get("cold", 0)) or not IDX.get("kcov") else m
 
 
 def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules=None, sql=None,
              copy=True, **kwargs):
     """Stand-in for sqlglot.optimizer.optimizer.optimize (module level: tests pickle it)."""
+    want, WANT[0] = WANT[0], False
     orig, mod = _ORIG
     RULES = mod.RULES
     if rules is None:
         rules = RULES
-    if not ON[0] or IDX is None or rules is not RULES or not copy or 0 in AFFECTED:
+    if not ON[0] or IDX is None or rules is not RULES or not copy:
+        STAT[3] += 1
+        return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+    mask = CH_MASK[0]
+    if mask is None and 0 in AFFECTED:
         STAT[3] += 1
         return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
     t0 = _pt()
     try:
-        st = IDX["keys"].get(call_key(expression, schema, db, catalog, dialect, sql, kwargs))
+        key = call_key(expression, schema, db, catalog, dialect, sql, kwargs)
+        st = IDX["keys"].get(key)
     except Unkeyable:
-        st = None
+        key = st = None
     TIMES[0] += _pt() - t0
     if st is None or len(RULES) + 1 != len(st):
         STAT[3] += 1
@@ -152,9 +186,23 @@ def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules
             return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
         finally:
             TIMES[4] += _pt() - t0
-    aff = [c - 1 for c in AFFECTED]
+    kc = IDX["kcov"].get(key) if mask is not None and "kcov" in IDX else None
+    if kc is not None:
+        # this very call, at the pinned commit: which stages ran a changed line?
+        sets = IDX["ksets"]
+        if sets[kc[0]] & mask:
+            STAT[3] += 1
+            return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+        aff = [i for i in range(len(RULES)) if sets[kc[i + 1]] & mask]
+    elif 0 in AFFECTED:
+        STAT[3] += 1
+        return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+    else:
+        aff = [c - 1 for c in AFFECTED]
     if not aff:
         STAT[0] += 1
+        if want:
+            return Base(st[-1])
         t0 = _pt()
         try:
             return _tree(st[-1])
@@ -188,6 +236,8 @@ def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules
     except _Final:
         STAT[1] += 1
         TIMES[3] += _pt() - t0
+        if want:
+            return Base(st[-1])
         t0 = _pt()
         try:
             return _tree(st[-1])

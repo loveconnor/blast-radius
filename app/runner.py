@@ -129,15 +129,26 @@ import optmemo  # noqa: E402
 
 def _memo_optimize(real):
     def optimize(*a, **k):
-        r = real(*a, **k)
         cur, t = _SUB["cur"], _SUB["t"]
-        if cur is not None:
+        base = None
+        if cur is not None and MEMO_REC is None and t in MEMO_SKIP and MEMO is not None:
+            base = MEMO["opt"].get(MEMO_IDS.get(t), {}).get(cur)
+        t0 = time.process_time()
+        optmemo.WANT[0] = base is not None      # a digest is enough when it is the baseline's
+        try:
+            r = real(*a, **k)
+        finally:
+            optmemo.WANT[0] = False
+            MEMO_T[2] += time.process_time() - t0
+        if isinstance(r, optmemo.Base):
+            if r.digest == base:
+                raise _SkipExec()
+            r = optmemo._tree(r.digest)
+        elif cur is not None:
             if MEMO_REC is not None:
                 MEMO_REC["opt"].setdefault(MEMO_IDS.get(t), {})[cur] = digest(r)
-            elif t in MEMO_SKIP and MEMO is not None:
-                base = MEMO["opt"].get(MEMO_IDS.get(t), {}).get(cur)
-                if base is not None and base == digest(r):
-                    raise _SkipExec()
+            elif base is not None and base == digest(r):
+                raise _SkipExec()
         return r
     optimize._br_memo = True
     return optimize
@@ -165,8 +176,19 @@ def _memo_cached_execute(self, sql, tpch=True):
 _memo_cached_execute._br_memo = True
 
 
+MEMO_T = [0.0, 0.0, 0.0]    # seconds: reference-query check, submitted calls, of which optimize
+
+
 def _memo_duck_same(n):
     """The reference query of submit n is the baseline one (so its dataframe is too)."""
+    t0 = time.process_time()
+    try:
+        return _memo_duck_same0(n)
+    finally:
+        MEMO_T[0] += time.process_time() - t0
+
+
+def _memo_duck_same0(n):
     try:
         tid = MEMO_IDS[_SUB["t"]]
         T = sys.modules["tests.test_executor"]
@@ -210,6 +232,7 @@ class _LazyFuture(_cf.Future):
         fn, a, k = job
         _SUB["cur"] = self._n
         _rearm()
+        t0 = time.process_time()
         try:
             try:
                 self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
@@ -225,6 +248,7 @@ class _LazyFuture(_cf.Future):
             self.set_exception(e)
         finally:
             _SUB["cur"] = None
+            MEMO_T[1] += time.process_time() - t0
             _rearm(done=True)
 
     def result(self, timeout=None):
@@ -318,18 +342,42 @@ class _LazyConn:
             self._br_real.close()
             self._br_real = None
 
+    def __reduce__(self):
+        return (_lazyconn_restore, (list(self._br_stmts),))
+
     def __getattr__(self, name):
         if name.startswith("_br_") or self.__dict__.get("_br_setup", True):
             raise AttributeError(name)
         return getattr(self._br_conn(), name)
 
 
-def prebuild_class(modname, clsname):
-    """Run a test class's setUpClass once, here, recording the sqlglot lines it runs."""
+def _lazyconn_restore(stmts):
+    import duckdb
+    c = _LazyConn(duckdb.connect)
+    c._br_stmts = list(stmts)
+    c._br_setup = False
+    return c
+
+
+def prebuild_class(modname, clsname, cache=None):
+    """Run a test class's setUpClass once, here, recording the sqlglot lines it runs.
+    `cache`: a pickle of the resulting class attributes made at image build time from
+    the same pinned checkout (prep.py); loading it replaces the run."""
     try:
         import duckdb
         C = getattr(sys.modules[modname], clsname)
         orig = C.__dict__["setUpClass"]
+        if cache and os.environ.get("BR_PREP") != "1":
+            try:
+                with _orig_open(cache, "rb") as fh:
+                    saved = pickle.load(fh)
+                for k, v in saved["attrs"].items():
+                    setattr(C, k, v)
+                PRESETS[C] = (saved["lines"], orig)
+                return True
+            except Exception:  # noqa
+                pass
+        before = dict(vars(C))
         real_connect = duckdb.connect
         conns = []
 
@@ -366,6 +414,10 @@ def prebuild_class(modname, clsname):
         for c in conns:
             c._br_setup = False
         PRESETS[C] = (lines, orig)
+        if cache and os.environ.get("BR_PREP") == "1":
+            attrs = {k: v for k, v in vars(C).items() if k not in before or before[k] is not v}
+            with _orig_open(cache, "wb") as fh:
+                pickle.dump({"attrs": attrs, "lines": lines}, fh, protocol=5)
         return True
     except BaseException as e:  # noqa
         log("shared class setup failed", clsname, repr(e))

@@ -372,6 +372,7 @@ def sub_cpu(subf):
 
 OPT_PREFIX = os.environ.get("BR_OPT", str(HERE / "optmemo"))
 OPT_ON = os.environ.get("BR_OPT_ON", "1") == "1"
+OPT_PER_CALL = os.environ.get("BR_OPT_PER_CALL", "0") == "1"   # needs per-call line sets in the memo (not built)
 _OPT_LOADED = [False]
 
 
@@ -780,6 +781,7 @@ P2_PASS = float(os.environ.get("BR_P2_PASS", "0.7"))
 P2_PASS_FAILED = float(os.environ.get("BR_P2_PASS_F", "0.3"))
 REPLAN = os.environ.get("BR_REPLAN", "1") == "1"
 PRESET_MIN = int(os.environ.get("BR_PRESET_MIN", "1"))
+PRESET_CACHE = Path(os.environ.get("BR_PRESET_CACHE", HERE / "preset_executor.pkl"))
 DENSE_MS = float(os.environ.get("BR_DENSE_MS", "500"))
 DENSE_MIN = float(os.environ.get("BR_DENSE_MIN", "2.0"))
 Q_MAX = float(os.environ.get("BR_Q_MAX", "0.7"))
@@ -1124,7 +1126,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
                     nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"] + j["heavy"]):
                 want += 1
         if want >= PRESET_MIN:
-            ok = runner.prebuild_class("tests.test_executor", "TestExecutor")
+            ok = runner.prebuild_class("tests.test_executor", "TestExecutor", cache=str(PRESET_CACHE))
             log(f"shared executor fixtures for {want} commits: {ok}")
     # maps every child would otherwise load for itself
     try:
@@ -1330,6 +1332,7 @@ def _child(j, nodeids, ms, runner, modules):
     import optmemo
     optmemo.ON[0] = j.get("opt_aff") is not None and not j["overlay"]
     optmemo.AFFECTED[:] = j.get("opt_aff") or []
+    optmemo.set_changed(j.get("ch_lines") if (optmemo.ON[0] and OPT_PER_CALL) else None)
     runner.ITER_FILTER.clear()
     runner.ITER_FILTER.update({int(t): set(v) for t, v in (j.get("iterf") or {}).items()})
     runner.MEMO_DUCK = bool(j.get("memo_duck")) and runner.MEMO is not None
@@ -1369,6 +1372,7 @@ def _child(j, nodeids, ms, runner, modules):
             note += " preset"
     if j["overlay"]:
         optmemo.ON[0] = False   # decided again once the state diff is known
+        optmemo.set_changed(None)
         c0 = time.process_time()
         res = overlay_candidates(j, old_mods, nodeids)
         PROF["ovc"] = time.process_time() - c0
@@ -1395,6 +1399,7 @@ def _child(j, nodeids, ms, runner, modules):
             if aff is not None:
                 optmemo.ON[0] = True
                 optmemo.AFFECTED[:] = aff
+                optmemo.set_changed(lines if OPT_PER_CALL else None)
                 opt_cpu(aff, cands)
             itf = iter_filter(cands, lines)
             iter_cpu(itf)
@@ -1550,7 +1555,7 @@ def _child(j, nodeids, ms, runner, modules):
         if late:
             note += f" late-run{late}"
     if any(runner.MEMO_STAT):
-        note += f" memo={runner.MEMO_STAT}"
+        note += f" memo={runner.MEMO_STAT} memoT={[round(x, 2) for x in runner.MEMO_T]}"
     if any(optmemo.STAT):
         note += f" opt={optmemo.STAT}/{optmemo.AFFECTED} optT={[round(x, 2) for x in optmemo.TIMES]}"
     return {"failed": sorted(failed), "unrun": unrun, "note": note}
