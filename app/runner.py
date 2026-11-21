@@ -37,7 +37,7 @@ class InlineExecutor:
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer:
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            initializer(*initargs)
 
     def submit(self, fn, *a, **k):
         n = _SUB["n"]
@@ -55,8 +55,7 @@ class InlineExecutor:
             f = _cf.Future()
             _rearm()
             try:
-                fn, a, k = pickle.loads(pickle.dumps((fn, a, k)))
-                f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                f.set_result(fn(*a, **k))
             except BaseException as e:  # noqa
                 f.set_exception(e)
             finally:
@@ -64,10 +63,7 @@ class InlineExecutor:
             return f
         f = _LazyFuture()
         f._n = n
-        try:
-            f._job = pickle.loads(pickle.dumps((fn, a, k)))
-        except BaseException as e:  # noqa
-            f.set_exception(e)
+        f._job = (fn, a, k)
         return f
 
     def map(self, fn, *its, **kw):
@@ -235,7 +231,7 @@ class _LazyFuture(_cf.Future):
         t0 = time.process_time()
         try:
             try:
-                self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                self.set_result(fn(*a, **k))
             except _SkipExec:
                 if _memo_duck_same(self._n):
                     MEMO_STAT[0] += 1
@@ -243,7 +239,7 @@ class _LazyFuture(_cf.Future):
                 else:
                     MEMO_STAT[1] += 1
                     _SUB["cur"] = None
-                    self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                    self.set_result(fn(*a, **k))
         except BaseException as e:  # noqa
             self.set_exception(e)
         finally:

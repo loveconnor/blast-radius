@@ -414,12 +414,16 @@ def opt_cpu(aff, cands):
 def _pkl(path, build):
     """Processed form of a map: pickled next to it at image build time (prep.py)."""
     import pickle
+    import gc
     pk = str(path) + ".pkl"
     try:
+        gc.disable()
         with open(pk, "rb") as fh:
             return pickle.load(fh)
     except Exception:  # noqa
         pass
+    finally:
+        gc.enable()
     obj = build()
     if os.environ.get("BR_PREP") == "1":
         with open(pk, "wb") as fh:
