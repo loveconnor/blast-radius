@@ -56,6 +56,7 @@ class InlineExecutor:
                 f.set_exception(e)
             return f
         f = _LazyFuture()
+        f._n = n
         try:
             f._job = pickle.loads(pickle.dumps((fn, a, k)))
         except BaseException as e:  # noqa
@@ -75,7 +76,126 @@ class InlineExecutor:
         pass
 
 
-_SUB = {"n": 0, "allow": None, "failed": False, "lazy": False}
+_SUB = {"n": 0, "allow": None, "failed": False, "lazy": False, "cur": None, "t": None}
+
+
+# ------------------------------------------------- baseline memo (TPC executor tests)
+# Built from the pinned commit at image build time (buildmemo.py):
+#   duck: (tpch, duckdb sql) -> reference dataframe     dsql: (tpch, sql) -> duckdb sql
+#   opt:  test id -> {query index -> digest of the optimized expression}
+#   rlines: test id -> {file: lines run outside parse/optimize/transpile}
+MEMO = None
+MEMO_IDS: dict = {}     # test number -> test id
+MEMO_DUCK = False       # reuse reference dataframes when the duckdb sql is unchanged
+MEMO_SKIP: set = set()  # tests whose queries may skip execution when their plan is unchanged
+MEMO_STAT = [0, 0]      # queries skipped, queries re-run after a reference mismatch
+MEMO_REC = None         # build time: record instead of use
+
+
+class _SkipExec(BaseException):
+    pass
+
+
+def load_memo(path):
+    global MEMO
+    try:
+        with _orig_open(path, "rb") as fh:
+            MEMO = pickle.load(fh)
+    except Exception as e:  # noqa
+        MEMO = None
+        log("memo unavailable", repr(e))
+
+
+def canon(e, depth=0):
+    import enum
+    if e is None or isinstance(e, (str, int, float, bool)):
+        return e
+    if isinstance(e, enum.Enum):
+        return ("E", e.name)
+    if isinstance(e, (list, tuple)):
+        return [canon(x, depth + 1) for x in e]
+    if isinstance(e, dict):
+        return {str(k): canon(v, depth + 1) for k, v in e.items()}
+    args = getattr(e, "args", None)
+    if isinstance(args, dict) and hasattr(e, "_meta"):
+        return (type(e).__qualname__, [(k, canon(v, depth + 1)) for k, v in args.items() if v is not None and v != []],
+                canon(e._type, depth + 1), canon(e.comments, depth + 1), canon(e._meta, depth + 1))
+    return ("O", type(e).__qualname__, repr(e))
+
+
+def digest(e):
+    import hashlib
+    try:
+        return hashlib.sha1(repr(canon(e)).encode("utf-8", "replace")).digest()
+    except RecursionError:
+        return None
+
+
+def _memo_optimize(real):
+    def optimize(*a, **k):
+        r = real(*a, **k)
+        cur, t = _SUB["cur"], _SUB["t"]
+        if cur is not None:
+            if MEMO_REC is not None:
+                MEMO_REC["opt"].setdefault(MEMO_IDS.get(t), {})[cur] = digest(r)
+            elif t in MEMO_SKIP and MEMO is not None:
+                base = MEMO["opt"].get(MEMO_IDS.get(t), {}).get(cur)
+                if base is not None and base == digest(r):
+                    raise _SkipExec()
+        return r
+    optimize._br_memo = True
+    return optimize
+
+
+def _memo_cached_execute(self, sql, tpch=True):
+    if sql not in self.cache:
+        T = sys.modules[type(self).__module__]
+        q = T.transpile(sql, write="duckdb")[0]
+        df = None
+        if MEMO_REC is None and MEMO_DUCK and MEMO is not None:
+            df = MEMO["duck"].get((bool(tpch), q))
+            if df is not None:
+                df = df.copy()
+        if df is None:
+            conn = self.tpch_conn if tpch else self.tpcds_conn
+            df = conn.execute(q).fetchdf()
+            if MEMO_REC is not None:
+                MEMO_REC["duck"][(bool(tpch), q)] = df.copy()
+                MEMO_REC["dsql"][(bool(tpch), sql)] = q
+        self.cache[sql] = df
+    return self.cache[sql]
+
+
+_memo_cached_execute._br_memo = True
+
+
+def _memo_duck_same(n):
+    """The reference query of submit n is the baseline one (so its dataframe is too)."""
+    try:
+        tid = MEMO_IDS[_SUB["t"]]
+        T = sys.modules["tests.test_executor"]
+        tpch = MEMO["tpch"][tid]
+        sqls = T.TestExecutor.tpch_sqls if tpch else T.TestExecutor.tpcds_sqls
+        sql = sqls[n][1]
+        q = T.transpile(sql, write="duckdb")[0]
+        return MEMO["dsql"].get((tpch, sql)) == q
+    except Exception:  # noqa
+        return False
+
+
+def install_memo():
+    """(Re)install the wrappers on the currently imported modules."""
+    try:
+        T = sys.modules.get("tests.test_executor")
+        E = sys.modules.get("sqlglot.executor")
+        if T is None or E is None:
+            return
+        if not getattr(T.TestExecutor.__dict__.get("cached_execute"), "_br_memo", False):
+            T.TestExecutor.cached_execute = _memo_cached_execute
+        if not getattr(E.optimize, "_br_memo", False):
+            E.optimize = _memo_optimize(E.optimize)
+    except Exception as e:  # noqa
+        log("memo install failed", repr(e))
 SUBMIT_LAZY: set = set()  # tests that only read futures one by one via .result()
 
 
@@ -92,10 +212,22 @@ class _LazyFuture(_cf.Future):
             self.set_result(None)
             return
         fn, a, k = job
+        _SUB["cur"] = self._n
         try:
-            self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+            try:
+                self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+            except _SkipExec:
+                if _memo_duck_same(self._n):
+                    MEMO_STAT[0] += 1
+                    self.set_result(None)  # same plan and same reference query as the baseline
+                else:
+                    MEMO_STAT[1] += 1
+                    _SUB["cur"] = None
+                    self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
         except BaseException as e:  # noqa
             self.set_exception(e)
+        finally:
+            _SUB["cur"] = None
 
     def result(self, timeout=None):
         self._run()
@@ -365,6 +497,10 @@ def _timed(run, seconds, t=None):
         _SUB["n"] = 0
         _SUB["failed"] = False
         _SUB["lazy"] = t in SUBMIT_LAZY
+        _SUB["t"] = t
+        _SUB["cur"] = None
+        if t in MEMO_IDS and (MEMO_DUCK or MEMO_SKIP or MEMO_REC is not None):
+            install_memo()
         _SUB["allow"] = SUBMIT_FILTER.get(t)
         signal.setitimer(signal.ITIMER_REAL, seconds)
         try:

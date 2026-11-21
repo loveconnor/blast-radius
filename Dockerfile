@@ -19,6 +19,9 @@ PY
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
 
 COPY app /app
+# baseline memo for the TPC executor tests, computed from the pinned checkout
+RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /app/memo.pkl \
+    || (rm -f /app/memo.pkl; echo "memo build failed: running without it")
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]

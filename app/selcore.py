@@ -71,7 +71,7 @@ class Decision:
         self.import_change = False   # something changed at import time
         self.files: dict[str, str] = {}  # path -> new content (None = deleted)
         self.rt_lines: dict[str, set] = {}  # runtime-changed old lines per sqlglot file
-        self.other = False  # anything besides runtime changes in sqlglot/*.py
+        self.ch_lines: dict[str, set] = {}  # every changed old line per non-test python file
 
     def add(self, s, why, broad=False):
         self.cands |= s
@@ -228,6 +228,7 @@ def _python(p, old_text, new_text, fp, M, D):
         if is_test:
             _test_change(p, ch, M, D)
             continue
+        D.ch_lines.setdefault(p, set()).update(range(s, e + 1))
         cov = M.covering(p, s, e)
         if ch.kind == "runtime":
             D.rt_lines.setdefault(p, set()).update(range(s, e + 1))

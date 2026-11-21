@@ -118,6 +118,17 @@ def main():
             subf = submit_filter(D, cands)
         CPU_OVR.clear()
         CPU_OVR.update(sub_cpu(subf))
+        memo_duck = all((f.startswith("sqlglot/") and f.endswith(".py")) or
+                        (f.startswith("tests/fixtures/") and f.endswith(".sql")) for f in D.files)
+        pure_src = all(f.startswith("sqlglot/") and f.endswith(".py") for f in D.files)
+        # code lines the patch touches; fixture-only .sql edits touch none (a changed
+        # query no longer matches its baseline plan, so it is executed for real)
+        ch_lines = {f: sorted(v) for f, v in D.ch_lines.items()} if memo_duck else None
+        memo_skip = []
+        if memo_duck and any(t in D.cands for t in memo_ids(nodeids)):
+            if not D.import_change:
+                memo_skip = memo_skippable(ch_lines, nodeids)
+            memo_cpu(memo_skip, nodeids, subf)
         if D.import_change:
             # decided in the child once the import-time state diff is known
             if len(cands) > BROAD_CANDS:
@@ -125,6 +136,13 @@ def main():
             light, heavy = [], []
         else:
             light, heavy, est_run, static_cost = plan_split(cands, ms, CPU, False, bool(instr))
+        if light and not D.import_change and len(cands) == 1 and \
+                all(r.split(" ", 1)[0] in ("fixture", "ast-same", "annotation", "ignored", "fixture-unused")
+                    for r in D.reasons):
+            # a lone test reading an edited fixture nearly always fails: running it
+            # only pays when it is cheap next to the chance of dropping it
+            if cpu_of(cands[0], ms) + OVERHEAD_HOT > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
+                light, heavy = [], cands
         if not light and not D.import_change:
             log(cid, f"static cost={static_cost/1000:.2f}", " ".join(D.reasons)[:150])
             if not D.import_change:
@@ -132,10 +150,13 @@ def main():
         jobs.append(dict(
             cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
             light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR),
+            memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines,
             precise=sorted(D.precise), broad=sorted(D.cands),
             reasons=" ".join(D.reasons)[:200],
         ))
     CPU_OVR.clear()
+    import patchlib
+    patchlib._PARSED.clear()
     log(f"analysis done in {time.time() - T_START:.2f}s; {len(jobs)} commits to run")
 
     if jobs:
@@ -151,6 +172,8 @@ def main():
     ru = resource.getrusage(resource.RUSAGE_SELF)
     rc = resource.getrusage(resource.RUSAGE_CHILDREN)
     log(f"done in {time.time() - T_START:.1f}s cpu self={ru.ru_utime + ru.ru_stime:.1f} children={rc.ru_utime + rc.ru_stime:.1f}")
+    sys.stderr.flush()
+    os._exit(0)  # answers are flushed; skip interpreter teardown
 
 
 CPU_PATH = Path(os.environ.get("BR_CPU", HERE / "cpu.json"))
@@ -216,6 +239,56 @@ def sub_cpu(subf):
     return o
 
 
+MEMO_PATH = Path(os.environ.get("BR_MEMO", HERE / "memo.pkl"))
+CHEAP_MARGIN = float(os.environ.get("BR_CHEAP_MARGIN", "3.0"))
+C_SKIP = float(os.environ.get("BR_C_SKIP", "5.0"))        # cpu of a TPC run that executes no query
+DUCK_FRAC = float(os.environ.get("BR_DUCK_FRAC", "0.55"))  # share of TPC cpu left once references are reused
+_MEMO_IDS = None
+
+
+def memo_ids(nodeids):
+    """test number -> id for the tests the baseline memo knows."""
+    global _MEMO_IDS
+    if _MEMO_IDS is None:
+        import runner
+        if runner.MEMO is None:
+            runner.load_memo(str(MEMO_PATH))
+        _MEMO_IDS = {}
+        if runner.MEMO is not None:
+            pos = {n: i for i, n in enumerate(nodeids)}
+            _MEMO_IDS = {pos[tid]: tid for tid in runner.MEMO["rlines"] if tid in pos}
+        runner.MEMO_IDS = _MEMO_IDS
+    return _MEMO_IDS
+
+
+def memo_skippable(ch_lines, nodeids):
+    """Tests whose queries may skip execution: the patch only touches code that
+    runs inside parse/optimize/transpile for them."""
+    import runner
+    if ch_lines is None or runner.MEMO is None:
+        return []
+    out = []
+    for t, tid in memo_ids(nodeids).items():
+        if not runner.MEMO["opt"].get(tid):
+            continue
+        rl = runner.MEMO["rlines"][tid]
+        if all(not (rl.get(f) and rl[f].intersection(ls)) for f, ls in ch_lines.items()):
+            out.append(t)
+    return out
+
+
+def memo_cpu(memo_skip, nodeids, subf=None):
+    import runner
+    for t, tid in memo_ids(nodeids).items():
+        base = CPU["test"].get(str(t))
+        if base is None:
+            continue
+        if t in memo_skip:
+            CPU_OVR[t] = min(C_SKIP, base)
+        elif runner.MEMO["opt"].get(tid):
+            CPU_OVR[t] = sub_cpu({t: subf[t]} if subf and t in subf else {}).get(t, base) * DUCK_FRAC
+
+
 def cpu_of(t, ms):
     v = CPU_OVR.get(t)
     if v is not None:
@@ -231,35 +304,58 @@ MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
-P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.35"))
+FIX_PFAIL = float(os.environ.get("BR_FIX_PFAIL", "0.9"))
+P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.6"))
+LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.2"))
+P2_PASS = float(os.environ.get("BR_P2_PASS", "0.7"))
+P2_PASS_FAILED = float(os.environ.get("BR_P2_PASS_F", "0.3"))
 
 
 def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0):
     """Choose which candidates to run (R) and which to select blindly (U).
 
+    U is a prefix of the heavy tests, taken either by cpu or by cpu per recorded
+    second (tests that are cheap to run but long on the clock are worth running).
     Returns (run_list, unrun_list, est_cost_ms, static_cost_ms)."""
     static_cost = best_schedule(cands, ms)[1]
-    order = sorted(cands, key=lambda t: -cpu_of(t, ms))
-    n_heavy = sum(1 for t in order if cpu_of(t, ms) >= HEAVY_CPU or ms[t] >= HEAVY_CPU * 1000)
     ovh = (OVERHEAD_OVERLAY if overlay else OVERHEAD_HOT) if overhead is None else overhead
-    best = (static_cost, len(order))
-    suffix = [0.0] * (len(order) + 1)
-    for i in range(len(order) - 1, -1, -1):
-        suffix[i] = suffix[i + 1] + cpu_of(order[i], ms) * mult
-    for k in range(0, n_heavy + 1):
-        if k == len(order):
+    total = sum(cpu_of(t, ms) for t in cands) * mult
+    heavy = [t for t in cands if cpu_of(t, ms) >= HEAVY_CPU or ms[t] >= HEAVY_CPU * 1000]
+    best = (static_cost, None)
+    orders = [sorted(heavy, key=lambda t: -cpu_of(t, ms)),
+              sorted(heavy, key=lambda t: -cpu_of(t, ms) / max(ms[t], 1.0))]
+    for order in orders:
+        run_cpu = total
+        for k in range(0, len(order) + 1):
+            if k:
+                run_cpu -= cpu_of(order[k - 1], ms) * mult
+            if k == len(cands):
+                break
+            U = order[:k]
+            u_cost = best_schedule(U, ms)[1] if U else 0
+            if can_diff and U:
+                u_cost *= (1.0 - P_EQUIV)
+            pen = FAIL_PENALTY * 1000 if not U else 500
+            cost = u_cost + (run_cpu + ovh) * 1000 + pen
+            if cost < best[0]:
+                best = (cost, U)
+    # run only a few tests that are cheap for their clock time, select the rest unrun
+    cheap = sorted((t for t in heavy if cpu_of(t, ms) * mult < ms[t] / 1000.0),
+                   key=lambda t: cpu_of(t, ms) / max(ms[t], 1.0))[:6]
+    for j in range(1, len(cheap) + 1):
+        rs = set(cheap[:j])
+        U = [t for t in cands if t not in rs]
+        if not U:
             break
-        U = order[:k]
-        u_cost = best_schedule(U, ms)[1] if U else 0
-        if can_diff and U:
-            u_cost *= (1.0 - P_EQUIV)
-        pen = FAIL_PENALTY * 1000 if not U else 500
-        cost = u_cost + (suffix[k] + ovh) * 1000 + pen
-        if cost < best[0]:
-            best = (cost, k)
-    k = best[1]
-    U = order[:k]
-    R = sorted(order[k:], key=lambda t: cpu_of(t, ms))
+        u_cost = best_schedule(U, ms)[1]
+        cost = u_cost + (sum(cpu_of(t, ms) for t in rs) * mult + ovh) * 1000 + 500
+        if cost + CHEAP_MARGIN * 1000 < best[0]:
+            best = (cost, U)
+    if best[1] is None:
+        return [], sorted(cands, key=lambda t: -cpu_of(t, ms)), static_cost, static_cost
+    U = list(best[1])
+    us = set(U)
+    R = sorted((t for t in cands if t not in us), key=lambda t: cpu_of(t, ms))
     return R, U, best[0], static_cost
 
 
@@ -350,7 +446,8 @@ def overlay_candidates(j, old_mods, nodeids):
             return {"all": True, "note": note + " broad"}
     if delta:
         cands |= untraced & (broad | precise)
-    return {"cands": cands, "note": note, "unknown": bool(unknown)}
+    return {"cands": cands, "note": note, "unknown": bool(unknown),
+            "pure": all(d[0] == "methcode" for d in delta)}
 
 
 def _function_coverage(mods, owner, attr, M):
@@ -385,6 +482,9 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
     if any(j["overlay"] for j in jobs):
         OLD_IMPORT_FAILURES[:] = [f[0] for f in _import_all()]
         load_reads()
+    import gc
+    gc.collect()
+    gc.freeze()  # children neither scan nor copy the zygote's heap
     log(f"zygote ready at {time.time() - T_START:.2f}s")
 
     # cheapest jobs first so that a tight budget hurts the fewest commits
@@ -482,6 +582,9 @@ def child(j, nodeids, ms, runner, modules):
     runner.SUBMIT_FILTER.clear()
     runner.SUBMIT_FILTER.update(j.get("subf") or {})
     runner.SUBMIT_LAZY.update(_submap())
+    runner.MEMO_DUCK = bool(j.get("memo_duck")) and runner.MEMO is not None
+    runner.MEMO_SKIP.clear()
+    runner.MEMO_SKIP.update(j.get("memo_skip") or [])
     tempfile.tempdir = j["tmp"]
     if not j["overlay"]:
         for r in j["hot"]:
@@ -508,6 +611,12 @@ def child(j, nodeids, ms, runner, modules):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}
         cands = sorted(res["cands"])
         j["unknown"] = res.get("unknown", False)
+        runner.MEMO_SKIP.clear()
+        if runner.MEMO_DUCK:
+            if res.get("pure"):
+                # import-time state is unchanged: only function bodies differ
+                runner.MEMO_SKIP.update(memo_skippable(j.get("ch_lines"), nodeids))
+            memo_cpu(runner.MEMO_SKIP, nodeids, j.get("subf"))
         note += " " + res["note"]
         if not cands:
             return {"failed": [], "unrun": [], "note": note}
@@ -517,6 +626,7 @@ def child(j, nodeids, ms, runner, modules):
         if est_light > min(budget, MAX_CHILD_CPU):
             light, heavy = [], cands
         note += f" cands={len(cands)} run={len(light)} est={est/1000:.1f}/{static/1000:.1f}"
+        note += f" cpu={sum(cpu_of(t, ms) for t in cands):.1f} top={[(t, round(cpu_of(t, ms), 1)) for t in sorted(cands, key=lambda t: -cpu_of(t, ms))[:3]]} skip={sorted(runner.MEMO_SKIP)} bud={budget:.0f}"
         j["light"], j["heavy"] = light, heavy
         unrun = list(heavy)
     # light tests grouped by class (cheapest classes first) so class setup is shared
@@ -546,9 +656,37 @@ def child(j, nodeids, ms, runner, modules):
         hits, bad = dict(runner.DIFF_HITS), set(runner.DIFF_BAD)
         n_sites = j["n_sites"]
         note += f" diff hits={hits} bad={sorted(bad)}"
-        if unrun and not failed and hits and not bad and all(hits.get(k, 0) > 0 for k in range(n_sites)):
+        n_ran = len(ordered) - len(skipped)
+        # equivalence is only trusted when most candidates exercised the change
+        if unrun and not failed and hits and not bad and all(hits.get(k, 0) > 0 for k in range(n_sites)) \
+                and n_ran >= 0.5 * (n_ran + len(unrun)):
             note += " EQUIV->drop heavy"
             unrun = []
+    # second phase: the light tests are done; a heavy test left unrun is run after
+    # all when the schedule time it would free outweighs its cpu
+    if unrun and not (j["overlay"] and j.get("unknown")):
+        budget = min(j.get("heavy_budget", 1e9), MAX_CHILD_CPU)
+        mult = OV_MULT if j["overlay"] else 1.0
+        p_pass = P2_PASS if not failed else P2_PASS_FAILED
+        late = []
+        big = [t for t in unrun if ms[t] >= HEAVY_CPU * 1000]
+        for t in sorted(big, key=lambda t: cpu_of(t, ms) / max(ms[t], 1.0))[:8]:
+            c = cpu_of(t, ms) * mult
+            if c > budget or (ms[t] / 1000.0 + 2.0) * p_pass <= LATE_MARGIN * c + 0.1:
+                continue
+            cur = sorted(set(unrun) | failed)
+            gain = (best_schedule(cur, ms)[1] - best_schedule([x for x in cur if x != t], ms)[1]) / 1000.0
+            if gain * p_pass <= LATE_MARGIN * c + 0.1:
+                continue
+            f = runner.run_tests([t], nodeids, timeouts=[max(10.0, ms[t] / 1000 * 5 + 5)])
+            budget -= c
+            unrun.remove(t)
+            failed |= set(f)
+            late.append(t)
+        if late:
+            note += f" late-run{late}"
+    if any(runner.MEMO_STAT):
+        note += f" memo={runner.MEMO_STAT}"
     return {"failed": sorted(failed), "unrun": unrun, "note": note}
 
 

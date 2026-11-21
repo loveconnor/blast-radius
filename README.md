@@ -22,6 +22,8 @@ built from the pinned commit.
    - A cost model (`plan_split`) weighs running a test (container CPU) against selecting it unrun (scheduled seconds plus 2 s per worker). The expensive tail is selected without being run.
    - Runtime edits are instrumented with old/new differential probes. If the light tests pass and every probe saw identical values, the heavy tail is dropped.
    - TPC-H and TPC-DS execute only the queries whose coverage reaches the edited lines, and stop at the first failing query.
+   - The image build runs the TPC executor tests once on the pinned checkout (`app/buildmemo.py`) and keeps the DuckDB reference results and a digest of every optimized query. At run time a reference result is reused when the DuckDB SQL text is unchanged. A query skips execution when its optimized expression is unchanged and the patch touches no code that runs after optimization.
+   - After the light tests, a heavy test that was left unrun is run after all when the schedule time it would free outweighs its CPU.
    - Tests stop early once the rest cannot change the answer's cost.
    - Every child has a deadline. If one does not finish, that commit falls back to the static candidate set.
 3. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.

@@ -283,7 +283,8 @@ class Differ:
     def diff_list(self, parent, field, la, lb, ctx, scope, stmt):
         if len(la) == len(lb):
             for x, y in zip(la, lb):
-                self.diff(x, y, ctx, scope, stmt)
+                if not _same_text(x, y):
+                    self.diff(x, y, ctx, scope, stmt)
             return
         da = [_dump(x) for x in la]
         db = [_dump(y) for y in lb]
@@ -324,11 +325,62 @@ class Differ:
                     self.changes.append(Change(ctx, (1, 10**9), scope))
 
 
+_LA: list = []   # source lines of the old / new file being compared
+_LB: list = []
+_PARSED: dict = {}
+
+
+def _parse_old(src):
+    """Parsed tree of an unpatched file; the same file is diffed for many commits."""
+    t = _PARSED.get(src)
+    if t is None:
+        if len(_PARSED) > 6:
+            _PARSED.clear()
+        t = _PARSED[src] = ast.parse(src)
+    return t
+
+
+def _start(n):
+    d = getattr(n, "decorator_list", None)
+    return min([n.lineno] + [x.lineno for x in d]) if d else n.lineno
+
+
+def _same_text(x, y):
+    """Two statements whose source lines are identical have identical trees."""
+    if not (isinstance(x, ast.stmt) and isinstance(y, ast.stmt)) or type(x) is not type(y):
+        return False
+    sa, sb = _start(x), _start(y)
+    ea, eb = x.end_lineno, y.end_lineno
+    if ea is None or eb is None or ea - sa != eb - sb or x.col_offset != y.col_offset:
+        return False
+    return _LA[sa - 1:ea] == _LB[sb - 1:eb]
+
+
+def _same_ast(a, b):
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            if not (_same_text(x, y) or _same_ast(x, y)):
+                return False
+        return True
+    if not isinstance(a, ast.AST):
+        return a == b
+    for f in a._fields:
+        if not _same_ast(getattr(a, f, None), getattr(b, f, None)):
+            return False
+    return True
+
+
 def ast_changes(old_src: str, new_src: str):
     """Returns (identical: bool, changes: list[Change]) or raises SyntaxError for new."""
-    a = ast.parse(old_src)
+    global _LA, _LB
+    a = _parse_old(old_src)
     b = ast.parse(new_src)
-    if ast.dump(a) == ast.dump(b):
+    _LA, _LB = old_src.splitlines(), new_src.splitlines()
+    if _same_ast(a, b):
         return True, []
     d = Differ()
     d.diff(a, b, "import", (), None)
@@ -366,6 +418,8 @@ class _PairDiffer:
     def __init__(self):
         self.pairs = []
         self.ok = True
+        self.stack = []   # enclosing new-side function definitions
+        self.roots = []   # outermost function of every pair
 
     def fail(self):
         self.ok = False
@@ -387,6 +441,16 @@ class _PairDiffer:
             expr_pair = (a, b)
         elif isinstance(a, ast.stmt):
             expr_pair = None
+        is_fn = isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if is_fn:
+            self.stack.append(b)
+        try:
+            self._fields(a, b, in_func, expr_pair)
+        finally:
+            if is_fn:
+                self.stack.pop()
+
+    def _fields(self, a, b, in_func, expr_pair):
         for field in a._fields:
             va, vb = getattr(a, field, None), getattr(b, field, None)
             f_in = in_func
@@ -403,7 +467,8 @@ class _PairDiffer:
                         self.fail()
                     continue
                 for x, y in zip(va, vb):
-                    self.diff(x, y, f_in, expr_pair, a)
+                    if not _same_text(x, y):
+                        self.diff(x, y, f_in, expr_pair, a)
             elif isinstance(va, ast.AST) and isinstance(vb, ast.AST):
                 self.diff(va, vb, f_in, expr_pair, a)
             elif va != vb:
@@ -425,18 +490,25 @@ class _PairDiffer:
         for p in self.pairs:
             if p[1] is b:
                 return
+        if not self.stack:
+            self.fail()
+            return
         self.pairs.append(pair)
+        self.roots.append(self.stack[0])
 
 
 def instrument(old_src, new_src):
     """Return (instrumented new source, number of sites) or None if the change is not
     confined to side-effect-free expressions inside function bodies."""
-    a = ast.parse(old_src)
+    global _LA, _LB
+    a = _parse_old(old_src)
     b = ast.parse(new_src)
+    _LA, _LB = old_src.splitlines(), new_src.splitlines()
     d = _PairDiffer()
     d.diff(a, b, False, None, None)
     if not d.ok or not d.pairs:
         return None
+    roots = list({id(r): r for r in d.roots}.values())
     # collapse nested pairs: keep outermost
     news = [p[1] for p in d.pairs]
     inner = set()
@@ -447,7 +519,7 @@ def instrument(old_src, new_src):
     pairs = [p for p in d.pairs if id(p[1]) not in inner]
     targets = {id(nb): (k, na) for k, (na, nb) in enumerate(pairs)}
     bool_ctx = set()
-    for n in ast.walk(b):
+    for n in (n for r in roots for n in ast.walk(r)):
         if isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)):
             bool_ctx.add(id(n.test))
         elif isinstance(n, ast.comprehension):
@@ -471,6 +543,8 @@ def instrument(old_src, new_src):
             return super().generic_visit(node)
 
     # bool context for BoolOp children must be computed before transforming
-    tb = T().visit(b)
-    ast.fix_missing_locations(tb)
-    return ast.unparse(tb) if False else tb, len(pairs)
+    tr = T()
+    for r in roots:
+        tr.visit(r)   # a function definition is never a target: transformed in place
+        ast.fix_missing_locations(r)
+    return b, len(pairs)
