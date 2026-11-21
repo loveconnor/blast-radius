@@ -17,7 +17,7 @@ RUN_FLAGS := --rm --platform $(PLATFORM) --network none --cpus 2 \
 build:
 	docker build --platform $(PLATFORM) --tag $(IMAGE) .
 
-# Score three fresh containers, including all descendant CPU reported by wait4.
+# Score three fresh containers, including CPU consumed by selector workers.
 sample: build
 	python3 tools/benchmark.py "$(SAMPLE)" "$(OUTPUT)" $(RUN_FLAGS) $(IMAGE)
 

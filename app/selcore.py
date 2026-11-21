@@ -1,6 +1,7 @@
 """Static candidate selection: which tests could a patch possibly break."""
 from __future__ import annotations
 
+import ast
 import gzip
 import json
 import os
@@ -70,6 +71,7 @@ class Decision:
         self.cands: set[int] = set()
         self.precise: set[int] = set()   # candidates not coming from broad import-time guesses
         self.all = False
+        self.parsed = {}  # patched trees reused when instrumenting this change
         self.reasons: list[str] = []
         self.import_change = False   # something changed at import time
         self.files: dict[str, str] = {}  # path -> new content (None = deleted)
@@ -206,7 +208,10 @@ def _python(p, old_text, new_text, fp, M, D):
     if old_text is None:
         return
     try:
-        same, changes = ast_changes(old_text, new_text)
+        tree = ast.parse(new_text)
+        same, changes = ast_changes(old_text, new_text, tree)
+        if not same:
+            D.parsed[p] = tree
     except SyntaxError:
         # module cannot be imported any more
         D.import_change = True

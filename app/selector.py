@@ -221,7 +221,7 @@ def main():
                 from patchlib import instrument
                 for r in hot:
                     try:
-                        res = instrument(olds[r], D.files[r])
+                        res = instrument(olds[r], D.files[r], D.parsed.pop(r, None))
                     except Exception:  # noqa
                         res = None
                     if res is None:

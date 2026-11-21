@@ -376,11 +376,11 @@ def _same_ast(a, b):
     return True
 
 
-def ast_changes(old_src: str, new_src: str):
+def ast_changes(old_src: str, new_src: str, new_tree=None):
     """Returns (identical: bool, changes: list[Change]) or raises SyntaxError for new."""
     global _LA, _LB
     a = _parse_old(old_src)
-    b = ast.parse(new_src)
+    b = new_tree if new_tree is not None else ast.parse(new_src)
     _LA, _LB = old_src.splitlines(), new_src.splitlines()
     if _same_ast(a, b):
         return True, []
@@ -499,12 +499,12 @@ class _PairDiffer:
         self.roots.append(self.stack[0])
 
 
-def instrument(old_src, new_src):
+def instrument(old_src, new_src, new_tree=None):
     """Return (instrumented new source, number of sites) or None if the change is not
     confined to side-effect-free expressions inside function bodies."""
     global _LA, _LB
     a = _parse_old(old_src)
-    b = ast.parse(new_src)
+    b = new_tree if new_tree is not None else ast.parse(new_src)
     _LA, _LB = old_src.splitlines(), new_src.splitlines()
     d = _PairDiffer()
     d.diff(a, b, False, None, None)

@@ -5,12 +5,33 @@ import sys
 from pathlib import Path
 
 sample, output, *docker_args = sys.argv[1:]
-# wait4 accounts for the selector and descendants reaped by its supervisor.
+# Prefer the container CPU controller, which also counts orphaned workers.
 measure = """
 import os, sys
+from pathlib import Path
+
+def container_usage():
+    root = Path("/sys/fs/cgroup")
+    for line in Path("/proc/self/cgroup").read_text().splitlines():
+        if line.startswith("0::"):
+            directory = root / line[3:].lstrip("/")
+            try:
+                if os.getpid() not in map(int, (directory / "cgroup.procs").read_text().split()):
+                    return None
+                stats = dict(row.split() for row in (directory / "cpu.stat").read_text().splitlines())
+                return int(stats["usage_usec"])
+            except (OSError, KeyError, ValueError):
+                return None
+    return None
+
+before = container_usage()
 pid = os.posix_spawnp("timeout", ["timeout", "-s", "KILL", "180", "python", "/app/selector.py"], os.environ)
 _, status, usage = os.wait4(pid, 0)
-print("selector_cpu", usage.ru_utime + usage.ru_stime, file=sys.stderr)
+after = container_usage()
+cpu = usage.ru_utime + usage.ru_stime
+if before is not None and after is not None:
+    cpu = (after - before) / 1_000_000
+print("selector_cpu", cpu, file=sys.stderr)
 sys.exit(os.waitstatus_to_exitcode(status))
 """
 totals = []
