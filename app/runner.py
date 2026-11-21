@@ -42,6 +42,10 @@ class InlineExecutor:
     def submit(self, fn, *a, **k):
         n = _SUB["n"]
         _SUB["n"] = n + 1
+        if _SUB.get("abort"):
+            f = _cf.Future()
+            f.set_exception(RuntimeError("test timed out"))   # nothing more is run for it
+            return f
         allow = _SUB["allow"]
         if allow is not None and n not in allow:
             f = _cf.Future()
@@ -49,11 +53,14 @@ class InlineExecutor:
             return f
         if not _SUB["lazy"]:
             f = _cf.Future()
+            _rearm()
             try:
                 fn, a, k = pickle.loads(pickle.dumps((fn, a, k)))
                 f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
             except BaseException as e:  # noqa
                 f.set_exception(e)
+            finally:
+                _rearm(done=True)
             return f
         f = _LazyFuture()
         f._n = n
@@ -76,7 +83,17 @@ class InlineExecutor:
         pass
 
 
-_SUB = {"n": 0, "allow": None, "failed": False, "lazy": False, "cur": None, "t": None}
+_SUB = {"n": 0, "allow": None, "failed": False, "lazy": False, "cur": None, "t": None, "deadline": None}
+SUBMIT_MAX = float(os.environ.get("BR_SUBMIT_MAX", "6"))
+
+
+def _rearm(done=False):
+    """One submitted call (a single query of a TPC test) gets a few seconds at most;
+    once it returns, the test's own limit applies again."""
+    d = _SUB.get("deadline")
+    if d is not None:
+        left = d - time.time()
+        signal.setitimer(signal.ITIMER_REAL, max(0.05, left if done else min(left, SUBMIT_MAX)), 1.0)
 
 
 # ------------------------------------------------- baseline memo (TPC executor tests)
@@ -192,6 +209,7 @@ class _LazyFuture(_cf.Future):
             return
         fn, a, k = job
         _SUB["cur"] = self._n
+        _rearm()
         try:
             try:
                 self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
@@ -207,6 +225,7 @@ class _LazyFuture(_cf.Future):
             self.set_exception(e)
         finally:
             _SUB["cur"] = None
+            _rearm(done=True)
 
     def result(self, timeout=None):
         self._run()
@@ -647,7 +666,13 @@ class Timeout(BaseException):
 TEST_CPU = {}
 
 
+TIMEOUTS = [0]      # alarms raised in this process: the patched code hangs somewhere
+
+
 def _alarm(signum, frame):
+    TIMEOUTS[0] += 1
+    _SUB["failed"] = True   # the running test has failed: no further subtests or submits
+    _SUB["abort"] = True
     raise Timeout()
 
 
@@ -657,6 +682,7 @@ def _timed(run, seconds, t=None, gate=None):
             return None     # dropped by a re-plan: stays selected, unrun
         _SUB["n"] = 0
         _SUB["failed"] = False
+        _SUB["abort"] = False
         _SUB["lazy"] = t in SUBMIT_LAZY
         _SUB["t"] = t
         _SUB["cur"] = None
@@ -669,12 +695,16 @@ def _timed(run, seconds, t=None, gate=None):
         if t in MEMO_IDS and (MEMO_DUCK or MEMO_SKIP or MEMO_REC is not None):
             install_memo()
         _SUB["allow"] = SUBMIT_FILTER.get(t)
-        signal.setitimer(signal.ITIMER_REAL, seconds)
+        # re-armed every second after it first fires: code that swallows the exception
+        # is interrupted again
+        signal.setitimer(signal.ITIMER_REAL, seconds, 1.0)
+        _SUB["deadline"] = time.time() + seconds
         c0 = time.process_time()
         try:
             return run(*a, **k)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
+            _SUB["deadline"] = None
             _ITER["allow"] = None   # class fixtures of the next test load everything
             TEST_CPU[t] = TEST_CPU.get(t, 0.0) + time.process_time() - c0
     return wrapped
@@ -700,7 +730,7 @@ def _once_fixtures(C):
         pass
 
 
-def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, replan=None):
+def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, replan=None, stop_on_timeout=True):
     """test_ids: list of numbers; nodeids: number -> 'tests/x.py::Class::method'.
     Returns set of failing numbers. should_stop(failed_so_far, remaining) -> bool stops
     early. replan(failed_so_far, remaining) -> the remaining tests still worth running
@@ -761,6 +791,9 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, 
             suite.addTest(case)
 
         def on_done(i, bad, _items=items, _ci=ci):
+            if TIMEOUTS[0] and stop_on_timeout:
+                stopped[0] = True   # the patched code hangs: every further test would cost its timeout
+                return True
             if should_stop is None and replan is None:
                 return False
             cur = set(failed)

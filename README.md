@@ -14,7 +14,7 @@ built from the pinned commit.
    - Each changed statement is classified as runtime (inside a function body), import-time, signature, or annotation.
    - Candidate tests come from a per-test line-coverage map of the pinned commit (`app/map.json.gz`). This covers test phases, class setup, pickled pool work and import-time lines.
    - Fixture and data files map to the tests that open them.
-   - Module adds or removes, binary files, unparsable patches and import breakage select everything.
+   - Module adds or removes, binary files and unparsable patches select everything.
 2. **Running the candidates cheaply** (`app/runner.py`, `app/selector.py`).
    - A zygote process imports sqlglot and all test modules once. Each commit then runs in a forked child.
    - Runtime-only edits are applied by swapping `__code__` on the live functions.
@@ -23,9 +23,11 @@ built from the pinned commit.
    - Runtime edits are instrumented with old/new differential probes. If the light tests pass and every probe saw identical values, the heavy tail is dropped.
    - TPC-H and TPC-DS execute only the queries whose coverage reaches the edited lines, and stop at the first failing query.
    - The image build runs the TPC executor tests once on the pinned checkout (`app/buildmemo.py`) and keeps the DuckDB reference results and a digest of every optimized query. At run time a reference result is reused when the DuckDB SQL text is unchanged. A query skips execution when its optimized expression is unchanged and the patch touches no code that runs after optimization.
+   - A module global that changed is mapped to the tests that run a line naming it, or that live in a test file naming it.
+   - *Modules that stop importing* (`app/imports.json.gz`, built by `tools/buildimports.py`): the map records which sqlglot modules each test imports, directly or lazily. Every test that imports a module the patch broke is selected without being run; the other tests are judged against the remaining state as usual.
+   - Tests that clear a lot of schedule time per CPU second run first. After each new failure the remaining tests are re-planned, and only those that still clear more schedule time than they cost in CPU are run.
    - After the light tests, a heavy test that was left unrun is run after all when the schedule time it would free outweighs its CPU.
-   - Tests stop early once the rest cannot change the answer's cost.
-   - Every child has a deadline. If one does not finish, that commit falls back to the static candidate set.
+   - Every child has a deadline. If one does not finish, that commit falls back to the static candidate set, or to every test if the patch changes import-time state.
 3. **Phase replay** (`app/replay.py`, built by `tools/buildreplay.py`).
    - A *phase* is one outermost `Dialect.parse` / `Dialect.parse_into` call (tokenize + parse) or one outermost `Dialect.generate` call. At the pinned commit every test's phase inputs were recorded (about 52,000 unique ones) with a digest of everything a caller can observe: the returned trees or SQL text, a raised error, and log records. A generate input is either the result of a recorded parse or an exact snapshot of the tree (`app/replay.snap`).
    - The same trace recorded which lines and class attributes each test touches *outside* phases, which functions each input enters, and which class attributes each input reads.
@@ -38,6 +40,9 @@ built from the pinned commit.
    - *Fixture iterations* (`tools/builditer.py`): tests that loop over a fixture file run one case per iteration. Iterations that never reach a changed function body are skipped. A test is only eligible if it still passes at the pinned commit with half its iterations removed.
    - *Shared class fixtures*: `TestExecutor.setUpClass` (over a second of CSV parsing) runs once in the parent process. A commit reuses it only when no test file changed, nothing was re-imported, and no changed line is among the lines that setup ran. DuckDB connections are created lazily in each child from the statements recorded during that setup.
 5. **Schedule** (`app/sched.py`). LPT packing over 1–8 workers, picking the count that minimises the busiest worker plus 2 s per worker.
+6. **Staying alive** (`supervise` in `app/selector.py`).
+   - The work runs in a child of a small supervisor. If the worker dies or stalls while analysing one patch, that commit is answered with every test and the work restarts without it. If it dies later, the static answers are printed. An answer line is always printed for every commit.
+   - A test that exceeds its time limit under a patch counts as failed, and no further tests are run for that commit: code that hangs once usually hangs everywhere. The same applies to a replayed input that hangs. Each child also has a hard CPU limit.
 
 ## Layout
 
@@ -53,6 +58,7 @@ built from the pinned commit.
   - `buildreplay.py`: phase inputs, digests, snapshots and out-of-phase coverage
   - `attrtrace.py` with `BR_PHASE=1`: attribute reads made outside phases, and per-input attribute reads
   - `builditer.py`: per-iteration coverage of fixture-driven tests
+  - `buildimports.py`: the sqlglot modules each test imports
   - `optfrac.py`: share of each test's time spent in `optimize()`
   - `genmutants.py`, `fastlabel.py` and friends: evaluation on synthetic mutants
 - `make sample` runs the image under the scorer's flags on the sample and scores it.

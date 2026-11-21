@@ -217,8 +217,11 @@ def _python(p, old_text, new_text, fp, M, D):
         return
     imp_lines = M.importlines.get(p, set())
     is_test = p.startswith("tests/")
+    n_lines = old_text.count("\n") + 1
     for ch in changes:
         s, e = ch.lines
+        e = min(e, n_lines)     # "to the end of the file" is recorded as a huge line number
+        s = min(s, e)
         if ch.kind == "annotation":
             # with "from __future__ import annotations" these are never evaluated
             if "from __future__ import annotations" in old_text:

@@ -56,6 +56,98 @@ def emit(lines):
         data = data[n:]
 
 
+_TEST = dict(kv.split("=", 1) for kv in os.environ.get("BR_SELFTEST", "").split(",") if "=" in kv)
+POISON: set = set()       # commits whose analysis killed an earlier attempt: all their tests
+STATIC_ONLY = [False]     # last attempt: no test runs, static candidates only
+_PROGRESS_FD = [None]
+ANALYZE_TIMEOUT = float(os.environ.get("BR_ANALYZE_TIMEOUT", "25"))
+
+
+def _progress(msg):
+    fd = _PROGRESS_FD[0]
+    if fd is not None:
+        try:
+            os.write(fd, (msg + "\n").encode())
+        except OSError:
+            pass
+
+
+def supervise():
+    """Run main() in a child and make sure every commit gets an answer line.
+
+    If the child dies or hangs while analysing a patch, that commit is answered with
+    every test and the work starts over without it. If it dies or overruns later, the
+    static candidates are printed. If nothing works, every test of every commit is."""
+    try:
+        cids = [pf.stem for pf in sorted((DATA / "commits").glob("*.patch"))]
+        n_tests = len(json.loads((DATA / "tests.json").read_text())["tests"])
+    except Exception as e:  # noqa
+        log("supervisor cannot read the inputs", repr(e))
+        main()
+        return
+    n = len(cids)
+    hard = T_START + max(25.0, SECONDS_PER_COMMIT * n) + 8.0 + 0.2 * n
+    for attempt in range(8):
+        rd, wr = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(rd)
+            _PROGRESS_FD[0] = wr
+            try:
+                main()
+            except BaseException as e:  # noqa
+                log("main failed", repr(e))
+            os._exit(1)     # main() leaves with os._exit(0) itself
+        os.close(wr)
+        cur, phase, last, buf = None, "A", time.time(), b""
+        while True:
+            now = time.time()
+            limit = last + ANALYZE_TIMEOUT if phase == "A" else hard if phase == "R" else now + 60.0
+            try:
+                r, _, _ = select.select([rd], [], [], max(0.05, min(limit - now, 1.0)))
+            except InterruptedError:
+                continue
+            if r:
+                ch = os.read(rd, 4096)
+                if not ch:
+                    break
+                buf += ch
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.decode("utf-8", "replace")
+                    last = time.time()
+                    if line.startswith("A "):
+                        cur = line[2:]
+                    elif line in ("R", "E"):
+                        phase = line
+                continue
+            if time.time() > limit and phase != "E":
+                log(f"supervisor: no progress in phase {phase} (commit {cur}); stopping the worker")
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
+        try:
+            _, st = os.waitpid(pid, 0)
+        except OSError:
+            st = -1
+        os.close(rd)
+        if phase == "E":
+            return
+        if phase == "A" and cur is not None and cur not in POISON:
+            log(f"supervisor: worker lost while analysing {cur} (status {st}); answering it with every test")
+            POISON.add(cur)
+        elif STATIC_ONLY[0]:
+            break
+        else:
+            log(f"supervisor: worker lost in phase {phase} (status {st}); falling back to static candidates")
+            STATIC_ONLY[0] = True
+    log("supervisor: last resort, every test for every commit")
+    workers = [list(range(i, n_tests, 8)) for i in range(8)] if n_tests >= 8 else [list(range(n_tests))]
+    emit([{"commit": c, "workers": [w for w in workers if w]} for c in cids])
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     nodeids = [t["id"] for t in tests]
@@ -82,100 +174,122 @@ def main():
     jobs = []
     for pf in patches:
         cid = pf.stem
+        _progress("A " + cid)
+        if cid in POISON:
+            answers[cid] = sorted(all_tests)
+            log(cid, "ALL (its analysis did not survive an earlier attempt)")
+            continue
+        n_jobs = len(jobs)
         try:
-            D = analyze(pf.read_text(encoding="utf-8", errors="replace"), REPO, M)
-        except Exception as e:  # noqa
-            log(cid, "analyze failed", repr(e))
-            answers[cid] = sorted(all_tests)
-            continue
-        if D.all:
-            answers[cid] = sorted(all_tests)
-            log(cid, "ALL", " ".join(D.reasons)[:200])
-            continue
-        cands = sorted(t for t in D.cands if t is not None)
-        answers[cid] = cands  # static fallback
-        hot = [r for r, c in D.files.items() if r.endswith(".py") and c is not None and (REPO / r).exists()]
-        olds = {r: (REPO / r).read_text(encoding="utf-8") for r in hot}
-        if not cands and not D.import_change:
-            log(cid, "none", " ".join(D.reasons)[:200])
-            continue
-        if not cands:
-            # import-time state changed in a file no test runs code from (e.g. a module of
-            # class definitions): the readers are only known after the state diff. If the
-            # child cannot finish, everything is selected.
-            answers[cid] = sorted(all_tests)
-        instr = {}
-        n_sites = 0
-        if not D.import_change and len(hot) == 1 and all(r.endswith(".py") for r in D.files):
-            from patchlib import instrument
-            for r in hot:
-                try:
-                    res = instrument(olds[r], D.files[r])
-                except Exception:  # noqa
-                    res = None
-                if res is None:
-                    instr = {}
-                    break
-                instr[r] = res[0]
-                n_sites = res[1]
-        subf = {}
-        if not D.import_change and all(r.split(" ", 1)[0] in ("rt", "ast-same", "annotation") for r in D.reasons):
-            subf = submit_filter(D, cands)
-        CPU_OVR.clear()
-        CPU_OVR.update(sub_cpu(subf))
-        memo_duck = all((f.startswith("sqlglot/") and f.endswith(".py")) or
-                        (f.startswith("tests/fixtures/") and f.endswith(".sql")) for f in D.files)
-        pure_src = all(f.startswith("sqlglot/") and f.endswith(".py") for f in D.files)
-        # code lines the patch touches; fixture-only .sql edits touch none (a changed
-        # query no longer matches its baseline plan, so it is executed for real)
-        ch_lines = {f: sorted(v) for f, v in D.ch_lines.items()} if memo_duck else None
-        iterf = {}
-        opt_aff = None
-        if pure_src and not D.import_change:
-            iterf = iter_filter(cands, D.ch_lines)
-            iter_cpu(iterf)
-            opt_aff = opt_affected(D.ch_lines)
-            opt_cpu(opt_aff, cands)
-        memo_skip = []
-        if memo_duck and any(t in D.cands for t in memo_ids(nodeids)):
-            if not D.import_change:
-                memo_skip = memo_skippable(ch_lines, nodeids)
-            memo_cpu(memo_skip, nodeids, subf)
-        if D.import_change:
-            # decided in the child once the import-time state diff is known
-            if len(cands) > BROAD_CANDS:
-                answers[cid] = sorted(all_tests)  # fallback if the child cannot finish
-            light, heavy = [], []
-        else:
-            light, heavy, est_run, static_cost = plan_split(cands, ms, CPU, False, bool(instr))
-        if light and not D.import_change and len(cands) == 1 and \
-                all(r.split(" ", 1)[0] in ("fixture", "ast-same", "annotation", "ignored", "fixture-unused")
-                    for r in D.reasons):
-            # a lone test reading an edited fixture nearly always fails: running it
-            # only pays when it is cheap next to the chance of dropping it
-            if cpu_of(cands[0], ms) + OVERHEAD_HOT > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
-                light, heavy = [], cands
-        force = False
-        if pure_src and not D.import_change and not light and len(cands) >= 2:
-            ins, _, est = replay_scope(cands, ch_lines)
-            force = len(ins) >= 2 and est <= REPLAY_MAX and est < static_cost / 1000.0
-        if not light and not D.import_change and not force:
-            log(cid, f"static cost={static_cost/1000:.2f}", " ".join(D.reasons)[:150])
-            if not D.import_change:
+            if _TEST.get("crash") == cid:      # self-test of the supervisor
+                os.kill(os.getpid(), signal.SIGKILL)
+            if _TEST.get("hang") == cid:
+                time.sleep(10 ** 6)
+            if _TEST.get("raise") == cid:
+                raise RuntimeError("self-test")
+            try:
+                D = analyze(pf.read_text(encoding="utf-8", errors="replace"), REPO, M)
+            except Exception as e:  # noqa
+                log(cid, "analyze failed", repr(e))
+                answers[cid] = sorted(all_tests)
                 continue
-        jobs.append(dict(
-            cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
-            light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
-            memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
-            precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
-            reasons=" ".join(D.reasons)[:200],
-        ))
+            if D.all:
+                answers[cid] = sorted(all_tests)
+                log(cid, "ALL", " ".join(D.reasons)[:200])
+                continue
+            cands = sorted(t for t in D.cands if t is not None)
+            answers[cid] = cands  # static fallback
+            hot = [r for r, c in D.files.items() if r.endswith(".py") and c is not None and (REPO / r).exists()]
+            olds = {r: (REPO / r).read_text(encoding="utf-8") for r in hot}
+            if not cands and not D.import_change:
+                log(cid, "none", " ".join(D.reasons)[:200])
+                continue
+            if not cands:
+                # import-time state changed in a file no test runs code from (e.g. a module of
+                # class definitions): the readers are only known after the state diff. If the
+                # child cannot finish, everything is selected.
+                answers[cid] = sorted(all_tests)
+            instr = {}
+            n_sites = 0
+            if not D.import_change and len(hot) == 1 and all(r.endswith(".py") for r in D.files):
+                from patchlib import instrument
+                for r in hot:
+                    try:
+                        res = instrument(olds[r], D.files[r])
+                    except Exception:  # noqa
+                        res = None
+                    if res is None:
+                        instr = {}
+                        break
+                    instr[r] = res[0]
+                    n_sites = res[1]
+            subf = {}
+            if not D.import_change and all(r.split(" ", 1)[0] in ("rt", "ast-same", "annotation") for r in D.reasons):
+                subf = submit_filter(D, cands)
+            CPU_OVR.clear()
+            CPU_OVR.update(sub_cpu(subf))
+            memo_duck = all((f.startswith("sqlglot/") and f.endswith(".py")) or
+                            (f.startswith("tests/fixtures/") and f.endswith(".sql")) for f in D.files)
+            pure_src = all(f.startswith("sqlglot/") and f.endswith(".py") for f in D.files)
+            # code lines the patch touches; fixture-only .sql edits touch none (a changed
+            # query no longer matches its baseline plan, so it is executed for real)
+            ch_lines = {f: sorted(v) for f, v in D.ch_lines.items()} if memo_duck else None
+            iterf = {}
+            opt_aff = None
+            if pure_src and not D.import_change:
+                iterf = iter_filter(cands, D.ch_lines)
+                iter_cpu(iterf)
+                opt_aff = opt_affected(D.ch_lines)
+                opt_cpu(opt_aff, cands)
+            memo_skip = []
+            if memo_duck and any(t in D.cands for t in memo_ids(nodeids)):
+                if not D.import_change:
+                    memo_skip = memo_skippable(ch_lines, nodeids)
+                memo_cpu(memo_skip, nodeids, subf)
+            if D.import_change:
+                # decided in the child once the import-time state diff is known; the static
+                # candidates are no safe answer for such a change, so if the child cannot
+                # finish everything is selected
+                answers[cid] = sorted(all_tests)
+                light, heavy = [], []
+            else:
+                light, heavy, est_run, static_cost = plan_split(cands, ms, CPU, False, bool(instr))
+            if light and not D.import_change and len(cands) == 1 and \
+                    all(r.split(" ", 1)[0] in ("fixture", "ast-same", "annotation", "ignored", "fixture-unused")
+                        for r in D.reasons):
+                # a lone test reading an edited fixture nearly always fails: running it
+                # only pays when it is cheap next to the chance of dropping it
+                if cpu_of(cands[0], ms) + OVERHEAD_HOT > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
+                    light, heavy = [], cands
+            force = False
+            if pure_src and not D.import_change and not light and len(cands) >= 2:
+                ins, _, est = replay_scope(cands, ch_lines)
+                force = len(ins) >= 2 and est <= REPLAY_MAX and est < static_cost / 1000.0
+            if not light and not D.import_change and not force:
+                log(cid, f"static cost={static_cost/1000:.2f}", " ".join(D.reasons)[:150])
+                if not D.import_change:
+                    continue
+            jobs.append(dict(
+                cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
+                light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
+                memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
+                precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
+                reasons=" ".join(D.reasons)[:200],
+            ))
+        except Exception as e:  # noqa
+            log(cid, "planning failed", repr(e), "-> all tests")
+            del jobs[n_jobs:]
+            answers[cid] = sorted(all_tests)
+
     CPU_OVR.clear()
     import patchlib
     patchlib._PARSED.clear()
     log(f"analysis done in {time.time() - T_START:.2f}s; {len(jobs)} commits to run")
+    _progress("R")
 
-    if jobs:
+    if jobs and not STATIC_ONLY[0]:
+        if _TEST.get("runcrash"):
+            os.kill(os.getpid(), signal.SIGKILL)
         run_jobs(jobs, answers, nodeids, ms, deadline)
 
     lines = []
@@ -184,6 +298,7 @@ def main():
         sel = answers.get(cid, sorted(all_tests))
         workers, cost = best_schedule(sel, ms)
         lines.append({"commit": cid, "workers": workers})
+    _progress("E")
     emit(lines)
     ru = resource.getrusage(resource.RUSAGE_SELF)
     rc = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -555,10 +670,14 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             for k in sorted((k for k in ks if k not in state), key=kms.__getitem__):
                 if time.time() > limit:
                     return cands, " replay-abort(slow)"
-                # a patched parser may loop forever on an input: such an input counts as changed
-                signal.setitimer(signal.ITIMER_REAL, max(4.0, kms[k] / 1000.0 * 40))
+                # a patched parser may loop forever on an input: the tests would hang the
+                # same way, so nothing more is replayed or run and every candidate stays
+                signal.setitimer(signal.ITIMER_REAL, max(KEY_T_MIN, kms[k] / 1000.0 * 30))
                 try:
                     ch = replay.run_key(R["keys"][k]) != R["dig"][k]
+                except runner.Timeout:
+                    HANG[0] = True
+                    return cands, " replay-abort(hang)"
                 except BaseException:  # noqa
                     ch = True
                 finally:
@@ -626,6 +745,19 @@ def memo_cpu(memo_skip, nodeids, subf=None):
             CPU_OVR[t] = sub_cpu({t: subf[t]} if subf and t in subf else {}).get(t, base) * DUCK_FRAC
 
 
+KEY_T_MIN = float(os.environ.get("BR_KEY_T_MIN", "1.5"))
+HANG = [False]     # the patched code was seen to hang: run nothing, keep every candidate
+T_MIN = float(os.environ.get("BR_T_MIN", "3"))
+T_MAX = float(os.environ.get("BR_T_MAX", "30"))
+CHILD_CPU_MAX = int(os.environ.get("BR_CHILD_CPU_MAX", "60"))
+SETUP_TIMEOUT = float(os.environ.get("BR_SETUP_TIMEOUT", "25"))
+
+
+def test_timeout(t, ms):
+    """Wall seconds a test may take under a patch before it counts as hanging (failed)."""
+    return min(T_MAX, max(T_MIN, 3.0 * max(cpu_of(t, ms), ms[t] / 1000.0) + 2.0))
+
+
 def cpu_of(t, ms):
     v = CPU_OVR.get(t)
     if v is not None:
@@ -655,13 +787,15 @@ Q_PRIOR = float(os.environ.get("BR_Q_PRIOR", "1.0"))
 RP_MARGIN = float(os.environ.get("BR_RP_MARGIN", "1.1"))
 
 
-def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0):
+def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0, base=()):
     """Choose which candidates to run (R) and which to select blindly (U).
 
     U is a prefix of the heavy tests, taken either by cpu or by cpu per recorded
     second (tests that are cheap to run but long on the clock are worth running).
     Returns (run_list, unrun_list, est_cost_ms, static_cost_ms)."""
-    static_cost = best_schedule(cands, ms)[1]
+    base = list(base)
+    floor = best_schedule(base, ms)[1] if base else 0   # tests selected whatever happens
+    static_cost = best_schedule(list(cands) + base, ms)[1] - floor
     ovh = (OVERHEAD_OVERLAY if overlay else OVERHEAD_HOT) if overhead is None else overhead
     total = sum(cpu_of(t, ms) for t in cands) * mult
     heavy = [t for t in cands if cpu_of(t, ms) >= HEAVY_CPU or ms[t] >= HEAVY_CPU * 1000]
@@ -676,7 +810,7 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0)
             if k == len(cands):
                 break
             U = order[:k]
-            u_cost = best_schedule(U, ms)[1] if U else 0
+            u_cost = (best_schedule(list(U) + base, ms)[1] - floor) if U else 0
             if can_diff and U:
                 u_cost *= (1.0 - P_EQUIV)
             pen = FAIL_PENALTY * 1000 if not U else 500
@@ -691,7 +825,7 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0)
         U = [t for t in cands if t not in rs]
         if not U:
             break
-        u_cost = best_schedule(U, ms)[1]
+        u_cost = best_schedule(U + base, ms)[1] - floor
         cost = u_cost + (sum(cpu_of(t, ms) for t in rs) * mult + ovh) * 1000 + 500
         if cost + CHEAP_MARGIN * 1000 < best[0]:
             best = (cost, U)
@@ -756,6 +890,33 @@ def load_reads():
     return _READS
 
 
+IMPORTS_PATH = Path(os.environ.get("BR_IMPORTS", HERE / "imports.json.gz"))
+IMPFAIL_ON = os.environ.get("BR_IMPFAIL", "1") == "1"
+_IMPORTS = None
+
+
+def load_imports():
+    """test -> the sqlglot modules it imports, directly or lazily (buildimports.py)."""
+    global _IMPORTS
+    if _IMPORTS is None:
+        import gzip
+
+        def build():
+            with gzip.open(IMPORTS_PATH, "rt") as fh:
+                d = json.load(fh)
+            by_mod = {}
+            for t, si in d["tests"].items():
+                for m in d["sets"][si]:
+                    by_mod.setdefault(d["mods"][m], set()).add(int(t))
+            return {"by_mod": by_mod, "known": {int(t) for t in d["tests"]}}
+        try:
+            _IMPORTS = _pkl(IMPORTS_PATH, build)
+        except Exception as e:  # noqa
+            log("imports map unavailable", repr(e))
+            _IMPORTS = False
+    return _IMPORTS
+
+
 def _import_all():
     import importlib
     import pkgutil
@@ -780,8 +941,21 @@ def overlay_candidates(j, old_mods, nodeids):
     failed_imports = _import_all()
     old_failed = set(OLD_IMPORT_FAILURES)
     newly = [f for f in failed_imports if f[0] not in old_failed]
+    forced = set()
+    fail_note = ""
     if newly:
-        return {"all": True, "note": f"import-fail {newly[0]}"}
+        # modules that no longer import: every test that imports one of them (even
+        # lazily) is selected unrun; the other tests see the remaining state as usual
+        IM = load_imports() if IMPFAIL_ON else False
+        if not IM or not R:
+            return {"all": True, "note": f"import-fail {newly[0]}"}
+        n_tests = len(nodeids)
+        forced = {t for t in range(n_tests) if t not in IM["known"]}
+        for name, _ in newly:
+            forced |= IM["by_mod"].get(name, set())
+        fail_note = f"import-fail {len(newly)} {newly[0]} forced={len(forced)} "
+        if len(forced) >= n_tests:
+            return {"all": True, "note": fail_note}
     if not R:
         return {"cands": broad | precise, "note": "no-reads-map"}
     sets, byattr, untraced, noise = R
@@ -797,6 +971,7 @@ def overlay_candidates(j, old_mods, nodeids):
     OR = load_outreads() if REPLAY_ON else False
     outside = set(OR[2]) if OR else set()   # tests that touch a change outside parse phases
     fn_lines = {}
+    n_glob = 0
     for kind, owner, attr, key in delta:
         if kind == "cls":
             if attr in ("*", "__mro__"):
@@ -827,8 +1002,21 @@ def overlay_candidates(j, old_mods, nodeids):
             elif rng is None:
                 OR = False
         else:
-            unknown.append((kind, owner, attr))
-    note = f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]}"
+            refs = _global_refs(attr, nodeids) if (kind == "mod" and GLOBAL_REFS) else None
+            if refs is None:
+                unknown.append((kind, owner, attr))
+            else:
+                # a module global: its readers are the lines that name it
+                for f, ls in refs[0].items():
+                    fn_lines.setdefault(f, set()).update(ls)
+                    for l in ls:
+                        cands |= M.covering(f, l, l)
+                cands |= refs[1]
+                outside |= refs[1]
+                n_glob += 1
+    note = fail_note + f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]}"
+    if n_glob:
+        note += f" globals={n_glob}"
     if unknown:
         cands |= broad
         note += f" unknown={unknown[:2]}"
@@ -836,10 +1024,49 @@ def overlay_candidates(j, old_mods, nodeids):
             return {"all": True, "note": note + " broad"}
     if delta:
         cands |= untraced & (broad | precise)
-    return {"cands": cands, "note": note, "unknown": bool(unknown),
-            "pure": all(d[0] == "methcode" for d in delta),
+    return {"cands": cands, "note": note, "unknown": bool(unknown), "forced": forced,
+            "pure": all(d[0] == "methcode" for d in delta) and not forced,
             "replay_ok": bool(OR) and not unknown, "outside": outside, "fn_lines": fn_lines,
             "attrs": sorted({(d[1], d[2]) for d in delta if d[0] in ("cls", "meth")})}
+
+
+GLOBAL_REFS = os.environ.get("BR_GLOBAL_REFS", "1") == "1"
+_SRC_TEXT = {}
+
+
+def _global_refs(name, nodeids):
+    """Where a module-level name is mentioned at the pinned commit: ({sqlglot file: lines},
+    tests of the test files that mention it). None when that cannot be told."""
+    import re
+    try:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not name:
+            return None
+        if not _SRC_TEXT:
+            for top in ("sqlglot", "tests"):
+                for path in sorted((REPO / top).rglob("*.py")):
+                    _SRC_TEXT[str(path.relative_to(REPO))] = path.read_text(encoding="utf-8", errors="replace")
+        pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name))
+        src, tests = {}, set()
+        by_file = None
+        for rel, text in _SRC_TEXT.items():
+            if name not in text:
+                continue
+            lines = {i for i, line in enumerate(text.split("\n"), 1) if pat.search(line)}
+            if not lines:
+                continue
+            if rel.startswith("sqlglot/"):
+                src[rel] = lines
+            else:
+                if by_file is None:
+                    by_file = {}
+                    for t, nid in enumerate(nodeids):
+                        by_file.setdefault(nid.split("::", 1)[0], set()).add(t)
+                if rel not in by_file:
+                    return None     # a shared test helper: its users are not known
+                tests |= by_file[rel]
+        return src, tests
+    except Exception:  # noqa
+        return None
 
 
 def _function_range(mods, owner, attr):
@@ -948,6 +1175,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
             if pid == 0:
                 os.close(rd)
                 code = 0
+                _CHILD_FD[0] = wr
                 try:
                     out = child(j, nodeids, ms, runner, modules)
                 except BaseException as e:  # noqa
@@ -977,12 +1205,21 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
             os.close(fd)
             os.waitpid(pid, 0)
             del running[pid]
+            raw = b"".join(buf)
+            reimported = raw.startswith(_REIMPORT_MARK)
+            if reimported:
+                raw = raw[len(_REIMPORT_MARK):]
             try:
-                out = json.loads(b"".join(buf) or b"{}")
+                out = json.loads(raw or b"{}")
             except Exception:  # noqa
                 out = {"error": "bad json"}
             if "error" in out or "failed" not in out:
-                log(j["cid"], "child error", out.get("error"), "-> static")
+                if reimported or j["overlay"] or j.get("was_import"):
+                    # the patched package was re-imported: nothing static bounds its effect
+                    answers[j["cid"]] = list(range(len(nodeids)))
+                    log(j["cid"], "child error", out.get("error"), "-> all tests")
+                else:
+                    log(j["cid"], "child error", out.get("error"), "-> static")
                 continue
             if out.get("all"):
                 sel = list(range(len(nodeids)))
@@ -995,13 +1232,25 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
                 f"unrun={len(out.get('unrun', []))} {time.time() - started:.2f}s ov={int(j['overlay'])} {out.get('note', '')} | {j['reasons'][:80]}")
         if time.time() > deadline:
             for pid, (j, fd, started, buf) in list(running.items()):
-                log(j["cid"], "killed at deadline -> static")
                 try:
                     os.kill(pid, signal.SIGKILL)
                     os.waitpid(pid, 0)
                 except Exception:  # noqa
                     pass
+                try:
+                    while True:     # what it wrote before it was stopped
+                        chunk = os.read(fd, 65536)
+                        if not chunk:
+                            break
+                        buf.append(chunk)
+                except Exception:  # noqa
+                    pass
                 os.close(fd)
+                if b"".join(buf).startswith(_REIMPORT_MARK) or j["overlay"] or j.get("was_import"):
+                    answers[j["cid"]] = list(range(len(nodeids)))
+                    log(j["cid"], "killed at deadline -> all tests")
+                else:
+                    log(j["cid"], "killed at deadline -> static")
             running.clear()
             for j in pending:
                 log(j["cid"], "not started -> static")
@@ -1044,6 +1293,8 @@ def child(j, nodeids, ms, runner, modules):
     out = _child(j, nodeids, ms, runner, modules)
     if smp:
         smp(j["cid"])
+    if FORCED and "failed" in out and not out.get("all"):
+        out["failed"] = sorted(set(out["failed"]) | FORCED)
     try:
         tc = runner.TEST_CPU
         slow = {t: round(v, 2) for t, v in sorted(tc.items(), key=lambda kv: -kv[1])[:5] if v >= 0.25}
@@ -1057,10 +1308,20 @@ def child(j, nodeids, ms, runner, modules):
 
 
 PROF = {}
+_CHILD_FD = [None]
+_REIMPORT_MARK = b"REIMPORT\n"
+FORCED: set = set()   # tests selected without running (they import a module that no longer imports)
 
 
 def _child(j, nodeids, ms, runner, modules):
     os.environ["TMPDIR"] = j["tmp"]
+    try:
+        # backstop against patched code that never returns (import loops and the like)
+        resource.setrlimit(resource.RLIMIT_CPU, (CHILD_CPU_MAX, CHILD_CPU_MAX + 5))
+    except Exception:  # noqa
+        pass
+    signal.signal(signal.SIGALRM, runner._alarm)
+    signal.setitimer(signal.ITIMER_REAL, SETUP_TIMEOUT)     # applying the patch must not hang
     CPU_OVR.clear()
     CPU_OVR.update(j.get("cpu_ovr") or {})
     runner.SUBMIT_FILTER.clear()
@@ -1091,6 +1352,10 @@ def _child(j, nodeids, ms, runner, modules):
     try:
         prepared = runner.prepare(j, modules)
     except runner.NeedReimport as e:
+        try:
+            os.write(_CHILD_FD[0], _REIMPORT_MARK)   # the parent must not fall back to static
+        except Exception:  # noqa
+            pass
         j["overlay"] = True
         note = f"reimport({e})"
         prepared = runner.prepare(j, modules)
@@ -1109,13 +1374,17 @@ def _child(j, nodeids, ms, runner, modules):
         PROF["ovc"] = time.process_time() - c0
         if res.get("all"):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}
-        cands = sorted(res["cands"])
+        forced = set(res.get("forced") or ())
+        FORCED.update(forced)
+        cands = sorted(set(res["cands"]) - forced)
         j["unknown"] = res.get("unknown", False)
         if res.get("replay_ok") and j.get("pure_src"):
             cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
                                       light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")),
                                       attrs=None if res.get("pure") else res.get("attrs"))
             note += rn
+            if HANG[0]:
+                return {"failed": [], "unrun": sorted(cands), "note": note + " " + res["note"]}
             if not cands:
                 return {"failed": [], "unrun": [], "note": note}
         if res.get("pure") and j.get("pure_src") and j.get("ch_lines") is not None:
@@ -1141,7 +1410,8 @@ def _child(j, nodeids, ms, runner, modules):
         note += " " + res["note"]
         if not cands:
             return {"failed": [], "unrun": [], "note": note}
-        light, heavy, est, static = plan_split(cands, ms, CPU, True, False, overhead=0.0, mult=OV_MULT)
+        light, heavy, est, static = plan_split(cands, ms, CPU, True, False, overhead=0.0, mult=OV_MULT,
+                                               base=sorted(forced))
         budget = j.get("heavy_budget", 1e9)
         est_light = sum(cpu_of(t, ms) for t in light) * OV_MULT
         if est_light > min(budget, MAX_CHILD_CPU):
@@ -1154,13 +1424,18 @@ def _child(j, nodeids, ms, runner, modules):
         allc = sorted(set(j["light"]) | set(j["heavy"]))
         cands, rn = replay_narrow(allc, j.get("ch_lines"), ms, light0=j["light"], pure=True)
         note += rn
+        if HANG[0]:
+            return {"failed": [], "unrun": allc, "note": note}
         if len(cands) != len(allc) or not j["light"]:
             if not cands:
                 return {"failed": [], "unrun": [], "note": note}
             light, heavy, est, static = plan_split(cands, ms, CPU, False, prepared is True)
             j["light"], j["heavy"] = light, heavy
             unrun = list(heavy)
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    runner.TIMEOUTS[0] = 0
     PROF["marks"].append(("plan", round(time.process_time(), 2)))
+
     # tests that clear much schedule time per cpu second go first; then the rest grouped
     # by class (cheapest classes first) so class setup is shared
     def density(t):
@@ -1192,7 +1467,7 @@ def _child(j, nodeids, ms, runner, modules):
         if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
             return []
         rp["n"] += 1
-        base = sorted(set(unrun) | set(cur_failed) | rp["dropped"])
+        base = sorted(set(unrun) | set(cur_failed) | rp["dropped"] | FORCED)
         n_run = max(1, n_total - len(rest) - len(rp["dropped"]))
         q = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + 2.0 * Q_PRIOR))
         order = sorted(rest, key=lambda t: -density(t))
@@ -1228,7 +1503,7 @@ def _child(j, nodeids, ms, runner, modules):
         buf = io.StringIO()
         pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
         log("PROFILE", j["cid"], "tests", len(ordered), sorted(per, reverse=True)[:25], buf.getvalue()[:6000])
-    failed = set(runner.run_tests(ordered, nodeids, timeouts=[max(10.0, ms[t] / 1000 * 5 + 5) for t in ordered],
+    failed = set(runner.run_tests(ordered, nodeids, timeouts=[test_timeout(t, ms) for t in ordered],
                                   replan=replan if REPLAN else None, should_stop=None if REPLAN else should_stop,
                                   skipped=skipped))
     PROF["marks"].append(("ran", round(time.process_time(), 2)))
@@ -1261,11 +1536,13 @@ def _child(j, nodeids, ms, runner, modules):
             c = cpu_of(t, ms) * mult
             if c > budget or (ms[t] / 1000.0 + 2.0) * p_pass <= LATE_MARGIN * c + 0.1:
                 continue
-            cur = sorted(set(unrun) | failed)
+            cur = sorted(set(unrun) | failed | FORCED)
             gain = (best_schedule(cur, ms)[1] - best_schedule([x for x in cur if x != t], ms)[1]) / 1000.0
             if gain * p_pass <= LATE_MARGIN * c + 0.1:
                 continue
-            f = runner.run_tests([t], nodeids, timeouts=[max(10.0, ms[t] / 1000 * 5 + 5)])
+            if runner.TIMEOUTS[0]:
+                break       # the patched code hangs: no more runs
+            f = runner.run_tests([t], nodeids, timeouts=[test_timeout(t, ms)])
             budget -= c
             unrun.remove(t)
             failed |= set(f)
@@ -1280,4 +1557,7 @@ def _child(j, nodeids, ms, runner, modules):
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("BR_SUPERVISE", "1") == "1":
+        supervise()
+    else:
+        main()

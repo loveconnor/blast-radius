@@ -265,7 +265,9 @@ class Differ:
                 nscope = scope + ("<lambda>",)
                 if ctx != "runtime":
                     # a lambda defined at import time: only its own body lines run later
-                    self.diff(va, vb, nctx, nscope, None)
+                    # (a changed node without a position, e.g. an operator, is placed
+                    # on the body's lines)
+                    self.diff(va, vb, nctx, nscope, va if hasattr(va, "lineno") else None)
                     continue
             elif isinstance(a, (ast.AnnAssign, ast.arg)) and field == "annotation":
                 nctx = "annotation"
