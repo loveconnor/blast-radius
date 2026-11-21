@@ -37,6 +37,9 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 
 from sched import best_schedule  # noqa: E402
+from functools import partial
+
+schedule_cost = partial(best_schedule, want_workers=False)
 from selcore import Map, analyze  # noqa: E402
 
 HEAVY_SECONDS = float(os.environ.get("BR_HEAVY", "1.5"))
@@ -318,7 +321,7 @@ except Exception:  # noqa
 CPU = _cpu
 OVERHEAD_HOT = float(os.environ.get("BR_OVH_HOT", "0.25"))
 OVERHEAD_OVERLAY = float(os.environ.get("BR_OVH_OV", "2.0"))
-FAIL_PENALTY = float(os.environ.get("BR_FAIL_PEN", "0.5"))
+FAIL_PENALTY = float(os.environ.get("BR_FAIL_PEN", "1.5"))
 
 
 CPU_OVR = {}
@@ -699,7 +702,7 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     would_run = ins0 if light0 is None else ins0.intersection(light0)
     worth = sum(cpu_of(t, ms) for t in would_run)
     rest = [t for t in cands if t not in ins0]
-    bound = (best_schedule(cands, ms)[1] - (best_schedule(rest, ms)[1] if rest else 0)) / 1000.0
+    bound = (schedule_cost(cands, ms)[1] - (schedule_cost(rest, ms)[1] if rest else 0)) / 1000.0
     if est > REPLAY_MAX or est > max(0.2, REPLAY_FRAC * worth, bound / REPLAY_BOUND_DIV):
         return cands, f" replay-skip(est={est:.1f} worth={worth:.1f} bound={bound:.1f})"
     import replay
@@ -858,7 +861,7 @@ OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
 MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
-HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.2"))
+HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
 FIX_PFAIL = float(os.environ.get("BR_FIX_PFAIL", "0.9"))
 P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.6"))
 LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.2"))
@@ -881,8 +884,8 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
     second (tests that are cheap to run but long on the clock are worth running).
     Returns (run_list, unrun_list, est_cost_ms, static_cost_ms)."""
     base = list(base)
-    floor = best_schedule(base, ms)[1] if base else 0   # tests selected whatever happens
-    static_cost = best_schedule(list(cands) + base, ms)[1] - floor
+    floor = schedule_cost(base, ms)[1] if base else 0   # tests selected whatever happens
+    static_cost = schedule_cost(list(cands) + base, ms)[1] - floor
     ovh = (OVERHEAD_OVERLAY if overlay else OVERHEAD_HOT) if overhead is None else overhead
     total = sum(cpu_of(t, ms) for t in cands) * mult
     heavy = [t for t in cands if cpu_of(t, ms) >= HEAVY_CPU or ms[t] >= HEAVY_CPU * 1000]
@@ -897,7 +900,7 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
             if k == len(cands):
                 break
             U = order[:k]
-            u_cost = (best_schedule(list(U) + base, ms)[1] - floor) if U else 0
+            u_cost = (schedule_cost(list(U) + base, ms)[1] - floor) if U else 0
             if can_diff and U:
                 u_cost *= (1.0 - P_EQUIV)
             pen = FAIL_PENALTY * 1000 if not U else 500
@@ -912,7 +915,7 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
         U = [t for t in cands if t not in rs]
         if not U:
             break
-        u_cost = best_schedule(U + base, ms)[1] - floor
+        u_cost = schedule_cost(U + base, ms)[1] - floor
         cost = u_cost + (sum(cpu_of(t, ms) for t in rs) * mult + ovh) * 1000 + 500
         if cost + CHEAP_MARGIN * 1000 < best[0]:
             best = (cost, U)
@@ -1207,14 +1210,18 @@ OLD_IMPORT_FAILURES = []
 def run_jobs(jobs, answers, nodeids, ms, deadline):
     import runner
 
+    if MEMO_PATH.is_file() and any(j["memo_duck"] for j in jobs):
+        memo_ids(nodeids)
+        if runner.MEMO is None:
+            runner.load_memo(str(MEMO_PATH))
     modules = set()
     for j in jobs:
-        for t in j["light"]:
+        for t in j["light"] + j["heavy"]:
             modules.add(runner.module_name_for(nodeids[t].split("::")[0]))
     runner.zygote_import(modules)
     if any(j["overlay"] for j in jobs):
         _all_mod_names()
-        OLD_IMPORT_FAILURES[:] = []
+        OLD_IMPORT_FAILURES[:] = [failure[0] for failure in _import_all()]
         load_reads()
         load_imports()
         _preload_src_text()
@@ -1223,7 +1230,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         want = 0
         for j in jobs:
             if not j["overlay"] and j.get("pure_src") and any(
-                    nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"]):
+                    nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"] + j["heavy"]):
                 want += 1
         if want >= PRESET_MIN:
             ok = runner.prebuild_class("tests.test_executor", "TestExecutor", cache=str(PRESET_CACHE))
@@ -1327,8 +1334,8 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
                 sel = list(range(len(nodeids)))
             else:
                 sel = sorted(set(out["failed"]) | set(out.get("unrun", [])))
-            st = best_schedule(answers[j["cid"]], ms)[1] / 1000.0
-            fin = best_schedule(sel, ms)[1] / 1000.0
+            st = schedule_cost(answers[j["cid"]], ms)[1] / 1000.0
+            fin = schedule_cost(sel, ms)[1] / 1000.0
             answers[j["cid"]] = sel
             log(f"{j['cid']} st={st:.1f} fin={fin:.1f} light={len(j['light'])} heavy={len(j['heavy'])} failed={len(out['failed'])} "
                 f"unrun={len(out.get('unrun', []))} {time.time() - started:.2f}s ov={int(j['overlay'])} {out.get('note', '')} | {j['reasons'][:80]}")
@@ -1582,8 +1589,8 @@ def _child(j, nodeids, ms, runner, modules):
         if not cur_failed:
             return False
         base = sorted(set(unrun) | set(cur_failed))
-        delta = best_schedule(base + rest, ms, want_workers=False)[1] - best_schedule(base, ms, want_workers=False)[1]
-        return delta <= 0
+        delta = schedule_cost(base + rest, ms)[1] - schedule_cost(base, ms)[1]
+        return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
 
     def replan(cur_failed, rest):
         """Another test failed: which of the remaining tests are still worth their cpu?"""
@@ -1594,7 +1601,7 @@ def _child(j, nodeids, ms, runner, modules):
         n_run = max(1, n_total - len(rest) - len(rp["dropped"]))
         q = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + 2.0 * Q_PRIOR))
         order = sorted(rest, key=lambda t: -density(t))
-        full = best_schedule(base + order, ms)[1]
+        full = schedule_cost(base + order, ms)[1]
         n = len(order)
         ks = sorted(set(list(range(0, min(n, 12) + 1)) + [int(n * f) for f in (0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0)]))
         best_k, best_net = 0, 0.0
@@ -1604,7 +1611,7 @@ def _child(j, nodeids, ms, runner, modules):
         for k in ks:
             if k == 0:
                 continue
-            saved = (full - best_schedule(base + order[k:], ms)[1]) / 1000.0
+            saved = (full - schedule_cost(base + order[k:], ms)[1]) / 1000.0
             net = saved * (1.0 - q) - RP_MARGIN * cpu_pref[k] - 0.1
             if net > best_net:
                 best_k, best_net = k, net
@@ -1660,7 +1667,7 @@ def _child(j, nodeids, ms, runner, modules):
             if c > budget or (ms[t] / 1000.0 + 2.0) * p_pass <= LATE_MARGIN * c + 0.1:
                 continue
             cur = sorted(set(unrun) | failed | FORCED)
-            gain = (best_schedule(cur, ms)[1] - best_schedule([x for x in cur if x != t], ms)[1]) / 1000.0
+            gain = (schedule_cost(cur, ms)[1] - schedule_cost([x for x in cur if x != t], ms)[1]) / 1000.0
             if gain * p_pass <= LATE_MARGIN * c + 0.1:
                 continue
             if runner.TIMEOUTS[0]:
