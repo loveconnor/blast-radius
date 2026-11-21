@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import gzip
 import json
 import os
@@ -101,6 +102,7 @@ def analyze(patch_text: str, repo: Path, M: Map) -> Decision:
     return D
 
 
+@functools.lru_cache(maxsize=256)
 def _read(repo, rel):
     p = repo / rel
     try:
