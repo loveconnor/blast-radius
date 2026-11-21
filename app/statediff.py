@@ -194,6 +194,13 @@ def diff_state(old_mods: dict, new_mods: dict, only=None):
                 continue
             if isinstance(a, types.ModuleType):
                 continue
+            if isinstance(a, types.FunctionType) and isinstance(b, types.FunctionType) \
+                    and a.__module__ == name and b.__module__ == name:
+                # a module-level function: its body is line-covered like a method's
+                if not cmp.same(a, b):
+                    kind = "methcode" if not cmp.same_code(a.__code__, b.__code__) else "meth"
+                    changes.add((kind, name, k, None))
+                continue
             if not cmp.same(a, b):
                 _record(cmp, changes, ("mod", name, k), a, b)
         # classes defined in the module

@@ -239,6 +239,20 @@ class _LazyFuture(_cf.Future):
 SUBMIT_FILTER: dict = {}  # test number -> set of submit indices to really execute
 
 
+class _AbortTest(Exception):
+    """Raised when a test that already has a failing subtest starts another one."""
+
+
+def install_subtest_failfast():
+    orig = unittest.TestCase.subTest
+
+    def subTest(self, *a, **k):
+        if _SUB["failed"] and getattr(self, "_br_id", None) is not None:
+            raise _AbortTest()  # the test has failed already: its outcome cannot change
+        return orig(self, *a, **k)
+    unittest.TestCase.subTest = subTest
+
+
 def install_inline_pools():
     _cf.ProcessPoolExecutor = InlineExecutor
     import concurrent.futures.process as _p
@@ -281,6 +295,8 @@ def zygote_import(test_modules):
     os.environ["PYTHONPATH"] = REPO + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
     install_inline_pools()
     install_open_hook()
+    if os.environ.get("BR_SUBFF", "1") == "1":
+        install_subtest_failfast()
     import sqlglot  # noqa
     if os.environ.get("BR_WARM", "1") == "1":
         import pkgutil

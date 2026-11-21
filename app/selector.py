@@ -435,7 +435,11 @@ def overlay_candidates(j, old_mods, nodeids):
                 for k2, i in byattr.get((owner, attr), []):
                     cands |= sets[i]
             if kind == "meth" or not precise:
-                cands |= _function_coverage(old_mods, owner, attr, M)
+                fc = _function_coverage(old_mods, owner, attr, M)
+                if fc is None:
+                    unknown.append((kind, owner, attr))
+                else:
+                    cands |= fc
         else:
             unknown.append((kind, owner, attr))
     note = f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]}"
@@ -455,7 +459,7 @@ def _function_coverage(mods, owner, attr, M):
     mod = mods.get(modname)
     obj = mod
     try:
-        for part in qual.split("."):
+        for part in (p for p in qual.split(".") if p):
             obj = vars(obj)[part]
         fn = vars(obj)[attr]
         fn = getattr(fn, "__func__", fn)
@@ -464,7 +468,7 @@ def _function_coverage(mods, owner, attr, M):
         rel = os.path.relpath(code.co_filename, str(REPO))
         return M.covering(rel, min(lines), max(lines))
     except Exception:  # noqa
-        return set()
+        return None
 
 
 MAP_OBJ = None
@@ -557,8 +561,10 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
                 sel = list(range(len(nodeids)))
             else:
                 sel = sorted(set(out["failed"]) | set(out.get("unrun", [])))
+            st = best_schedule(answers[j["cid"]], ms)[1] / 1000.0
+            fin = best_schedule(sel, ms)[1] / 1000.0
             answers[j["cid"]] = sel
-            log(f"{j['cid']} light={len(j['light'])} heavy={len(j['heavy'])} failed={len(out['failed'])} "
+            log(f"{j['cid']} st={st:.1f} fin={fin:.1f} light={len(j['light'])} heavy={len(j['heavy'])} failed={len(out['failed'])} "
                 f"unrun={len(out.get('unrun', []))} {time.time() - started:.2f}s ov={int(j['overlay'])} {out.get('note', '')} | {j['reasons'][:80]}")
         if time.time() > deadline:
             for pid, (j, fd, started, buf) in list(running.items()):
