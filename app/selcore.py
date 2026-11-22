@@ -230,7 +230,9 @@ def _analyze_file(fp, repo, M, D):
         # non-python file inside the package (e.g. data file)
         users = _opened_users(p, M)
         D.add(users, f"pkgdata {p}")
-        if not users:
+        if not users and Path(p).name == "py.typed" and new_text is not None:
+            D.reasons.append(f"ignored {p}")    # a marker for type checkers; nothing reads it
+        elif not users:
             D.all = True
             D.reasons.append(f"unknown pkg file {p}")
     else:
@@ -367,7 +369,7 @@ def _fixture(p, fp, M, D):
 # The same goes for the lazy loaders: the dialect registry (a dialect is imported by name
 # the first time anything asks for it) and the packages that resolve attributes on demand.
 CACHE_FILL = {"sqlglot/generator.py": [(71, 92), (1003, 1009)],
-              "sqlglot/dialects/dialect.py": [(214, 305)],
+              "sqlglot/dialects/dialect.py": [(98, 305)],   # the Dialects enum and the registry built from it
               "sqlglot/dialects/__init__.py": [(1, 10 ** 6)],
               "sqlglot/optimizer/__init__.py": [(1, 10 ** 6)]}
 
@@ -377,6 +379,8 @@ def _python(p, old_text, new_text, fp, M, D, repo=None):
         return
     if old_text is None:
         return
+    # a byte order mark is not part of the source
+    old_text, new_text = old_text.lstrip("\ufeff"), new_text.lstrip("\ufeff")
     try:
         tree = ast.parse(new_text)
         same, changes = ast_changes(old_text, new_text, tree)

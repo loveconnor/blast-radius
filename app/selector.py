@@ -1286,6 +1286,19 @@ def overlay_candidates(j, old_mods, nodeids):
                 for k2, i in OR[1].get((owner, attr), []):
                     if key is None or k2 == key or k2 == "*":
                         outside |= OR[0][i]
+            if _is_enum(old_mods, new_mods, owner):
+                # members are also reached by iterating the class or looking a value up,
+                # which no attribute read shows: everything that names the enum counts
+                refs = _global_refs(owner.rpartition(":")[2].rpartition(".")[2], nodeids) if GLOBAL_REFS else None
+                if refs is None:
+                    unknown.append((kind, owner, attr))
+                else:
+                    for f, ls in refs[0].items():
+                        for l in ls:
+                            cands |= M.covering(f, l, l)
+                    cands |= refs[1]
+                    outside |= refs[1]
+                    OR = False      # not something the recorded inputs can settle
         elif kind in ("meth", "methcode"):
             if kind == "meth":
                 for k2, i in byattr.get((owner, attr), []):
@@ -1357,6 +1370,21 @@ def overlay_candidates(j, old_mods, nodeids):
 
 GLOBAL_REFS = os.environ.get("BR_GLOBAL_REFS", "1") == "1"
 _SRC_TEXT = {}
+
+
+def _is_enum(old_mods, new_mods, owner):
+    import enum
+    modname, _, qual = owner.partition(":")
+    for mods in (old_mods, new_mods):
+        obj = mods.get(modname)
+        try:
+            for part in (x for x in qual.split(".") if x):
+                obj = vars(obj)[part]
+            if isinstance(obj, type) and issubclass(obj, enum.Enum):
+                return True
+        except Exception:  # noqa
+            continue
+    return False
 
 
 def _preload_src_text():
