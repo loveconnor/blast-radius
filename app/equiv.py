@@ -51,14 +51,14 @@ def _dump(n):
     return ast.dump(n, include_attributes=False)
 
 
-def _pairs(old_src, new_src):
+def _pairs(old_src, new_src, new_tree=None):
     """Expression pairs that are the whole difference, or None if we cannot see it all."""
     if old_src == new_src:
         return []
     # _same_ast compares statements by their source lines, which it reads from these
     patchlib._LA = old_src.splitlines()
     patchlib._LB = new_src.splitlines()
-    old, new = patchlib._parse_old(old_src), ast.parse(new_src)
+    old, new = patchlib._parse_old(old_src), new_tree if new_tree is not None else ast.parse(new_src)
     if patchlib._same_ast(old, new):
         return []
     d = patchlib._PairDiffer()
@@ -483,12 +483,12 @@ def _provable_shape(old, new):
     return all(isinstance(s, _CONST_SHAPES) for s in (old.left, *old.comparators))
 
 
-def maybe_equivalent(files: dict, repo) -> bool:
+def maybe_equivalent(files: dict, repo, trees=None) -> bool:
     """Cheap screen for proven_equivalent: False means the proof would fail."""
-    return proven_equivalent(files, repo, _provable_shape)
+    return proven_equivalent(files, repo, _provable_shape, trees)
 
 
-def proven_equivalent(files: dict, repo, prove=None) -> bool:
+def proven_equivalent(files: dict, repo, prove=None, trees=None) -> bool:
     """True when every edited file is behavior-preserving and at least one edit was proven so.
 
     `files` maps a repo-relative path to its new text (None when the file is deleted).
@@ -504,7 +504,7 @@ def proven_equivalent(files: dict, repo, prove=None) -> bool:
             return False
         if old == new:
             continue
-        pairs = _pairs(old, new)
+        pairs = _pairs(old, new, trees.get(rel) if trees else None)
         if pairs is None:
             return False
         if not pairs:

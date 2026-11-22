@@ -215,13 +215,17 @@ def main():
                 log(cid, "analyze failed", repr(e))
                 answers[cid] = sorted(all_tests)
                 continue
+            # Keep the complete patch for reimports. A runtime job can use the
+            # same fixture and probe paths as the edit without incidental comments.
+            if not D.import_change and not D.all and D.ast_unchanged:
+                D.files = {r: src for r, src in D.files.items() if r not in D.ast_unchanged}
             if D.must:
                 must[cid] = set(D.must)
-            if not D.all and D.files:
+            if not D.all and D.parsed and all(r.endswith(".py") for r in D.files):
                 # only the cheap screen here; the proof itself runs after the tests
                 try:
                     from equiv import maybe_equivalent
-                    if maybe_equivalent(D.files, REPO):
+                    if maybe_equivalent(D.files, REPO, D.parsed):
                         maybe_equiv[cid] = D.files
                 except Exception as e:  # noqa
                     log(cid, "equiv screen failed", repr(e))
@@ -311,9 +315,9 @@ def main():
                 if cpu_of(cands[0], ms) + ovh_fx > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
                     light, heavy = [], cands
             force = False
-            if pure_src and not D.import_change and not light and len(cands) >= 2:
+            if pure_src and not D.import_change and not light and cands:
                 ins, _, est = replay_scope(cands, ch_lines)
-                force = len(ins) >= 2 and est <= REPLAY_MAX and est < static_cost / 1000.0
+                force = bool(ins) and est <= REPLAY_MAX and est < static_cost / 1000.0
             if not light and not D.import_change and not force:
                 log(cid, f"static cost={static_cost/1000:.2f}", " ".join(D.reasons)[:150])
                 if not D.import_change:
@@ -724,7 +728,7 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     inputs all still produce their baseline output. Returns (candidates, note)."""
     REPLAY_HIT.clear()
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
-    if len(inside) < 2:
+    if not inside:
         return cands, ""
     R = _replay()
     tkeys = {t: R["tests"][t] for t in inside}
@@ -738,7 +742,8 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             allines.setdefault(f, set()).update(v)
         mask = _key_mask(R, allines) if os.environ.get("BR_REPLAY_FK", "1") == "1" else None
         if mask is not None:
-            tkeys = {t: [k for k in ks if (mask >> k) & 1] for t, ks in tkeys.items()}
+            bits = mask.to_bytes((len(R["dig"]) + 7) // 8, "little")
+            tkeys = {t: [k for k in ks if bits[k >> 3] & (1 << (k & 7))] for t, ks in tkeys.items()}
             keys = sorted({k for ks in tkeys.values() for k in ks})
             est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
     elif attrs is not None and os.environ.get("BR_REPLAY_AK", "1") == "1":
@@ -757,12 +762,13 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             m1 = None       # cannot tell: replay every input of the tests in scope
         if m1 is not None and m2 is not None:
             mask = m1 | m2 | m3
-            tkeys = {t: [k for k in ks if (mask >> k) & 1] for t, ks in tkeys.items()}
+            bits = mask.to_bytes((len(R["dig"]) + 7) // 8, "little")
+            tkeys = {t: [k for k in ks if bits[k >> 3] & (1 << (k & 7))] for t, ks in tkeys.items()}
             tkeys = {t: ks for t, ks in tkeys.items() if ks}
             inside = [t for t in inside if t in tkeys]
             keys = sorted({k for ks in tkeys.values() for k in ks})
             est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
-            if len(inside) < 2:
+            if not inside:
                 return cands, ""
     ins0 = set(inside)
     # tests with 0 masked keys in pure mode never enter any changed function: drop for free
@@ -1549,7 +1555,8 @@ def overlay_candidates(j, old_mods, nodeids):
     try:
         gen_base = old_mods["sqlglot.generator"].Generator
         for d in delta:
-            if d[0] not in ("cls", "meth"):
+            if d[0] not in ("cls", "meth") or not (d[2] == "TRANSFORMS" or
+                    (d[2].endswith("_sql") and not d[2].startswith("_")) or d[2] in ("*", "__mro__")):
                 continue
             modname, _, qual = d[1].partition(":")
             obj = old_mods.get(modname)
@@ -2260,29 +2267,33 @@ def _child(j, nodeids, ms, runner, modules):
             q_other = q_hit = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + Q_PRIOR + Q_BETA))
         def _pp(t):
             return 1.0 - (q_hit if t in REPLAY_HIT else q_other)
-        order = sorted(rest, key=lambda t: -_pp(t) * density(t))
-        full = schedule_cost(base + order, ms)[1]
-        n = len(order)
-        ks = sorted(set(list(range(0, min(n, 12) + 1)) + [int(n * f) for f in (0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0)]))
-        best_k, best_net = 0, 0.0
-        cpu_pref = [0.0]
-        ms_pref = [0.0]
-        wms_pref = [0.0]
-        for t in order:
-            cpu_pref.append(cpu_pref[-1] + cpu_of(t, ms))
-            w = max(ms[t], 1.0)
-            ms_pref.append(ms_pref[-1] + w)
-            wms_pref.append(wms_pref[-1] + w * _pp(t))
-        for k in ks:
-            if k == 0:
-                continue
-            saved = (full - schedule_cost(base + order[k:], ms)[1]) / 1000.0
-            p_pass_k = wms_pref[k] / ms_pref[k]
-            net = saved * p_pass_k - RP_MARGIN * cpu_pref[k] - 0.1
-            if net > best_net:
-                best_k, best_net = k, net
-        rp["dropped"].update(order[best_k:])
-        return order[:best_k]
+        # Check high clock-time tests directly. They can determine the entire
+        # makespan while many cheap tests have essentially no marginal value.
+        full = schedule_cost(base + list(rest), ms)[1]
+        orders = [sorted(rest, key=lambda t: -_pp(t) * density(t)),
+                  sorted(rest, key=lambda t: -ms[t])]
+        best_net = 0.0
+        best_keep = []
+        n = len(rest)
+        cuts = sorted(set(range(1, min(n, 12) + 1)) |
+                      {max(1, int(n * f)) for f in (0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0)})
+        for order in orders:
+            cpu = weight = pass_weight = 0.0
+            start = 0
+            for k in cuts:
+                for t in order[start:k]:
+                    cpu += cpu_of(t, ms)
+                    w = max(ms[t], 1)
+                    weight += w
+                    pass_weight += w * _pp(t)
+                start = k
+                saved = (full - schedule_cost(base + order[k:], ms)[1]) / 1000.0
+                net = saved * pass_weight / weight - RP_MARGIN * cpu - 0.1
+                if net > best_net:
+                    best_net = net
+                    best_keep = order[:k]
+        rp["dropped"].update(set(rest) - set(best_keep))
+        return best_keep
 
     skipped = []
     if os.environ.get("BR_PROFILE"):
@@ -2349,32 +2360,33 @@ def _child(j, nodeids, ms, runner, modules):
         late = []
         big = [t for t in unrun if ms[t] >= LATE_MIN_MS]
         pool_late = []
-        for t in sorted(big, key=lambda t: cpu_of(t, ms) / max(ms[t], 1.0))[:12]:
+        for t in big:
             p_pass = p_pass_hit if t in REPLAY_HIT else p_pass_other
             c = cpu_of(t, ms) * mult
             if c <= budget and (ms[t] / 1000.0 + 2.0) * p_pass > LATE_MARGIN * c + 0.08:
                 pool_late.append(t)
         while pool_late and not runner.TIMEOUTS[0]:
-            cur = sorted(set(unrun) | failed | FORCED)
+            cur = set(unrun) | failed | FORCED
             cur_cost = schedule_cost(cur, ms)[1]
+            efficient = sorted(pool_late, key=lambda t: cpu_of(t, ms) / ms[t])[:12]
+            longest = sorted(pool_late, key=lambda t: -ms[t])[:12]
             pick = None
-            acc_c = 0.0
-            acc_w = 0.0
-            acc_wp = 0.0
-            for k, t in enumerate(pool_late, 1):
-                c = cpu_of(t, ms) * mult
-                if acc_c + c > budget:
-                    break
-                p_pass = p_pass_hit if t in REPLAY_HIT else p_pass_other
-                acc_c += c
-                w = max(ms[t], 1.0)
-                acc_w += w
-                acc_wp += w * p_pass
-                rem = set(pool_late[:k])
-                gain = (cur_cost - schedule_cost([x for x in cur if x not in rem], ms)[1]) / 1000.0
-                if gain * (acc_wp / acc_w) > LATE_MARGIN * acc_c + 0.08:
-                    pick = pool_late[0]
-                    break
+            best_net = 0.0
+            for order in (efficient, longest):
+                rem = set()
+                acc_c = acc_w = acc_wp = 0.0
+                for t in order:
+                    acc_c += cpu_of(t, ms) * mult
+                    if acc_c > budget:
+                        break
+                    rem.add(t)
+                    acc_w += ms[t]
+                    acc_wp += ms[t] * (p_pass_hit if t in REPLAY_HIT else p_pass_other)
+                    gain = (cur_cost - schedule_cost(cur - rem, ms)[1]) / 1000.0
+                    net = gain * acc_wp / acc_w - LATE_MARGIN * acc_c - 0.08
+                    if net > best_net:
+                        best_net = net
+                        pick = order[0]
             if pick is None:
                 break
             pool_late.remove(pick)

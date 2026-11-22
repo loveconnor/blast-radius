@@ -72,6 +72,7 @@ class Decision:
         self.cands: set[int] = set()
         self.precise: set[int] = set()   # candidates not coming from broad import-time guesses
         self.all = False
+        self.ast_unchanged = set()
         self.parsed = {}  # patched trees reused when instrumenting this change
         self.must: set[int] = set()      # tests that fail for certain: selected without being run
         self.reasons: list[str] = []
@@ -398,6 +399,8 @@ def _python(p, old_text, new_text, fp, M, D, repo=None):
     if same:
         # comments / formatting only. Line numbers may shift; only tests that
         # inspect source positions could notice.
+        if not fp.is_new and not fp.is_deleted and fp.old_path == fp.new_path:
+            D.ast_unchanged.add(p)
         D.reasons.append(f"ast-same {p}")
         return
     if p.startswith("sqlglotc/"):
