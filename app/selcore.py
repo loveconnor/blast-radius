@@ -103,6 +103,7 @@ class Decision:
         self.reasons: list[str] = []
         self.import_change = False   # something changed at import time
         self.files: dict[str, str] = {}  # path -> new content (None = deleted)
+        self.body_lines = {}  # (all lines, edited statements, control-flow witnesses) by function
         self.rt_lines: dict[str, set] = {}  # runtime-changed old lines per sqlglot file
         self.ch_lines: dict[str, set] = {}  # every changed old line per non-test python file
 
@@ -545,6 +546,13 @@ def _python(p, old_text, new_text, fp, M, D, repo=None):
         D.ch_lines.setdefault(p, set()).update(range(s, e + 1))
         cov = M.covering(p, s, e)
         if ch.kind == "runtime":
+            scope = p, ".".join(ch.scope)
+            all_rows, statements, witnesses = D.body_lines.setdefault(scope, (set(), set(), set()))
+            all_rows.update(range(s, e + 1))
+            if ch.neighbor_for is None:
+                statements.update(range(s, e + 1))
+            else:
+                witnesses.add(ch.neighbor_for)
             D.rt_lines.setdefault(p, set()).update(range(s, e + 1))
             D.add(cov, f"rt {p}:{s}-{e}")
             if any(l in imp_lines for l in range(s, e + 1)):

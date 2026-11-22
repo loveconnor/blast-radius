@@ -18,6 +18,14 @@ import zlib
 from pathlib import Path
 
 
+_lookup_recorder = None
+
+
+def record_lookup(key):
+    if _lookup_recorder is not None:
+        _lookup_recorder(key)
+
+
 def trace_test(t, tests, data, keys, paths, lookups):
     import replay
     import runner
@@ -62,7 +70,7 @@ def trace_test(t, tests, data, keys, paths, lookups):
 
     replay.REC = Recorder()
     if lookups:
-        import settingtrace
+        global _lookup_recorder
 
         def observe(key):
             if replay.PH["depth"]:
@@ -70,8 +78,7 @@ def trace_test(t, tests, data, keys, paths, lookups):
             else:
                 outside.add(key)
 
-        settingtrace.install_routes(observe)
-        settingtrace.install(observe, escaped=True)
+        _lookup_recorder = observe
     else:
         monitor.use_tool_id(tool, "phase-lines")
         monitor.register_callback(tool, monitor.events.PY_START, start)
@@ -102,6 +109,10 @@ def capture(output, workers, lookups=False):
     keys = {json.dumps(k): i for i, k in enumerate(data["keys"])}
     runner.zygote_import({runner.module_name_for(t.split("::")[0]) for t in tests})
     replay.install_recorder()
+    if lookups:
+        import settingtrace
+        settingtrace.install_routes(record_lookup)
+        tracked = settingtrace.install(record_lookup, escaped=True, schemas=True)
     bad = set(data["bad"])
     pending = iter(t for t in range(len(tests)) if t not in bad and str(t) in data["tests"])
     running = {}
@@ -155,6 +166,9 @@ def capture(output, workers, lookups=False):
             file_index, line = divmod(loc, 65536)
             rel = str(files[file_index].relative_to(repo))
         index.setdefault(rel, {})[line] = zlib.compress(mask, 3)
+    if lookups:
+        empty = zlib.compress(bytes(width))
+        index["!tracked"] = {key: empty for key in tracked}
     with output.open("wb") as fh:
         pickle.dump((valid, index), fh, protocol=4)
 
@@ -173,7 +187,8 @@ def merge(output, captures):
     for path in sorted(set.union(*(set(index) for _, index in entries))):
         tables = [index.get(path, {}) for _, index in entries]
         positions = {}
-        for line in sorted(set.union(*(set(table) for table in tables))):
+        combine = set.intersection if path == "!tracked" else set.union
+        for line in sorted(combine(*(set(table) for table in tables))):
             bits = 0
             for table in tables:
                 if line in table:

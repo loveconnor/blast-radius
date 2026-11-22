@@ -1,4 +1,4 @@
-"""Image-build instrumentation for scalar settings on SQLGlot dialects and generators."""
+"""Image-build instrumentation for scalar settings on SQLGlot dialects and their parser, tokenizer and generator classes."""
 
 
 # These two dialect strings are read eagerly by Generator.__init__ to fill
@@ -53,7 +53,9 @@ def install(record, escaped=False, schemas=False):
             setattr(Generator, slot, EscapeSlot(vars(Generator)[slot], name))
 
     dialects = set(Dialect.classes.values()) | {Dialect}
-    classes = dialects | {base for dialect in dialects for base in dialect.generator_class.__mro__
+    families = {impl for dialect in dialects
+                for impl in (dialect.generator_class, dialect.parser_class, dialect.tokenizer_class)}
+    classes = dialects | {base for impl in families for base in impl.__mro__
                           if base.__module__.startswith("sqlglot.")}
     tracked = set()
     for cls in classes:

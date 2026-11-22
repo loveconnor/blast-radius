@@ -188,13 +188,14 @@ def changed_old_lines(fp: FilePatch):
 # ---------------------------------------------------------------- AST diff
 
 class Change:
-    __slots__ = ("kind", "lines", "scope", "node")
+    __slots__ = ("kind", "lines", "scope", "node", "neighbor_for")
 
     def __init__(self, kind, lines, scope, node=None):
         self.kind = kind      # "runtime" | "import" | "signature"
         self.lines = lines    # (start, end) old-file lines
         self.scope = scope    # tuple of enclosing names (class/def chain)
         self.node = node
+        self.neighbor_for = None
 
     def __repr__(self):
         return f"Change({self.kind}, {self.lines}, {'.'.join(self.scope)})"
@@ -302,6 +303,7 @@ class Differ:
             for x in la[i1:i2]:
                 self.record(x if isinstance(x, ast.AST) else None, ctx, scope,
                             x if isinstance(x, ast.stmt) else stmt)
+            neighbors_start = len(self.changes)
             neigh = []
             if i1 - 1 >= 0:
                 neigh.append(la[i1 - 1])
@@ -325,6 +327,14 @@ class Differ:
                         self.changes.append(Change(ctx, (parent.lineno, parent.lineno), scope, parent))
                 elif not la:
                     self.changes.append(Change(ctx, (1, 10**9), scope))
+            # For a replaced or deleted executable statement, its old line
+            # already witnesses entry into this part of the block. Keep the
+            # neighbours for static fallback and for edits to lexical bindings.
+            if (ctx == "runtime" and field in ("body", "orelse", "finalbody") and i1 < i2
+                    and isinstance(la[i1], (ast.Assign, ast.Return, ast.Raise))
+                    and la[i1].lineno == la[i1].end_lineno):
+                for change in self.changes[neighbors_start:]:
+                    change.neighbor_for = la[i1].lineno
 
 
 _LA: list = []   # source lines of the old / new file being compared

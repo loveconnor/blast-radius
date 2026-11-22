@@ -480,7 +480,7 @@ def main():
                 cid=cid, files=D.files, fixture_edits=fixture_edits, overlay_readers=overlay_readers, comparison_same=comparison_same, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
-                runtime_lines_only=bool(D.rt_lines) and D.ch_lines == D.rt_lines,
+                body_lines=D.body_lines,
                 fixture_sql_only=fixture_sql_only, fixture_only_tests=fixture_only_tests, mixed_source_tests=mixed_source_tests, scale_nodes=scale_nodes,
                 node_limit_edit=not scale_nodes and any(
                     re.search(r"max_nodes|_node_count|Maximum number of AST nodes", line)
@@ -990,10 +990,10 @@ def lookup_keys(watched, count, settings=False):
     data = replay_lookups()
     if not data or data[0] != (count + 7) // 8:
         return None
-    if settings and not set(watched) <= tracked_query_settings():
-        return None
     import zlib
     width, complete, index, masks = data
+    if settings and not set(watched) <= index.get("!tracked", {}).keys():
+        return None
     def union(ids):
         bits = 0
         for i in ids:
@@ -1075,7 +1075,7 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
                 # Older maps did not distinguish constructor reads from later
                 # uses. Require the derived slot index before narrowing.
                 if phase_map and "generator-slot" in phase_map[2]:
-                    effective_plan = lookup_keys(effective, len(data["dig"]))
+                    effective_plan = lookup_keys(effective, len(data["dig"]), settings=True)
                 if effective_plan:
                     outside0 = (set(outside0 or ()) - effective_plan[1]) | set(load_outreads()[2])
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
@@ -1150,14 +1150,21 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             observed = effective_plan or (lookup_keys(settings, len(R["dig"]), settings=True)
                                           if settings and not disp else None)
             complete = set()
+            line_complete = set()
             if observed:
                 observed_mask, complete = observed
-                precise_bits = ((observed_mask | m2) & mask).to_bytes(len(bits), "little")
+                precise_bits = (observed_mask | m2).to_bytes(len(bits), "little")
+                executions = traced_keys(allines, len(R["dig"]))
+                if executions:
+                    line_bits, line_complete = executions
+                    line_complete = line_complete & complete
+                    combined = observed_mask | (m2 & int.from_bytes(line_bits, "little"))
+                    statement_bits = combined.to_bytes(len(bits), "little")
             filtered = {}
             for t, ks in tkeys.items():
-                use = precise_bits if t in complete else bits
+                use = statement_bits if t in line_complete else precise_bits if t in complete else bits
                 traced = [k for k in ks if use[k >> 3] & (1 << (k & 7))]
-                if traced or (effective_plan and t in complete and
+                if traced or ((effective_plan or t in line_complete) and t in complete and
                               any(bits[k >> 3] & (1 << (k & 7)) for k in ks)):
                     filtered[t] = traced
             tkeys = filtered
@@ -1879,45 +1886,64 @@ def _stdlib_binding(old_modules, new_modules, owner, name):
 
 
 def _body_line_changes(job, delta, old_modules, new_modules):
-    """Limit a reimported method to its edited lines when only its own body changed."""
-    if not job.get("runtime_lines_only") or not delta:
-        return False
+    """Match each unchanged callable binding to the edited statements in its body."""
     import types
+    import statediff
+    exact, by_code = {}, {}
+    scopes = job.get("body_lines", {})
     for kind, owner, name, _ in delta:
         if kind != "methcode":
-            return False
+            continue
         module, _, cls_name = owner.partition(":")
         path = module.replace(".", "/") + ".py"
-        if not job["ch_lines"].get(path):
-            return False
-        previous = None
+        qualname = cls_name + "." + name if cls_name else name
+        scope = scopes.get((path, qualname))
+        if not scope:
+            continue
+        rows, statements, witnesses = scope
+        methods = []
         for modules in (old_modules, new_modules):
             target = modules.get(module)
-            if target is None:
-                return False
-            if cls_name:
-                target = vars(target).get(cls_name)
-                if not isinstance(target, type):
-                    return False
-            fn = vars(target).get(name)
+            for part in cls_name.split(".") if cls_name else ():
+                target = vars(target).get(part) if target is not None else None
+            fn = vars(target).get(name) if target is not None else None
             if isinstance(fn, (staticmethod, classmethod)):
                 fn = fn.__func__
-            qualname = cls_name + "." + name if cls_name else name
             if (type(fn) is not types.FunctionType or fn.__module__ != module or fn.__qualname__ != qualname
                     or fn.__code__.co_qualname != qualname or fn.__closure__ or hasattr(fn, "__wrapped__")):
-                return False
-            if modules is old_modules:
-                code_lines = {n for _, _, n in fn.__code__.co_lines() if n}
-                if code_lines.isdisjoint(job["ch_lines"][path]):
-                    return False
-                previous = fn
-            else:
-                import statediff
-                compare = statediff._Cmp()
-                if not compare.same(previous.__defaults__, fn.__defaults__) or not compare.same(previous.__kwdefaults__, fn.__kwdefaults__):
-                    return False
-    return True
-
+                break
+            methods.append(fn)
+        if len(methods) != 2:
+            continue
+        old, new = methods
+        a, b = old.__code__, new.__code__
+        # A signature, generator flag or lexical binding can change a call even
+        # when it never gets to the edited statement.
+        fields = ("co_flags", "co_argcount", "co_posonlyargcount", "co_kwonlyargcount",
+                  "co_cellvars", "co_freevars")
+        arguments = a.co_argcount + a.co_kwonlyargcount + bool(a.co_flags & 4) + bool(a.co_flags & 8)
+        if a.co_varnames[:arguments] != b.co_varnames[:arguments]:
+            continue
+        if a.co_varnames != b.co_varnames:
+            import dis
+            altered = set(a.co_varnames) ^ set(b.co_varnames)
+            if {"locals", "vars", "eval", "exec", "_getframe", "currentframe"} & set(a.co_names + b.co_names):
+                continue
+            # A newly assigned name can shadow a global on an untouched line.
+            if any(isinstance(op.argval, str) and op.argval in altered
+                   and op.positions.lineno not in statements for op in dis.get_instructions(a)):
+                continue
+        compare = statediff._Cmp()
+        if (any(getattr(a, key) != getattr(b, key) for key in fields)
+                or not compare.same(old.__defaults__, new.__defaults__)
+                or not compare.same(old.__kwdefaults__, new.__kwdefaults__)):
+            continue
+        executed = {line for _, _, line in a.co_lines() if line}
+        if not rows.isdisjoint(executed):
+            selected = statements if witnesses <= executed else rows
+            exact[owner, name] = (path, selected)
+            by_code[a.co_filename, min(executed), max(executed)] = (path, selected)
+    return exact, by_code
 
 def overlay_candidates(j, old_mods, nodeids):
     """After re-importing the changed sqlglot: what changed in import-time state, and
@@ -1957,7 +1983,7 @@ def overlay_candidates(j, old_mods, nodeids):
                  or (c[2] != "_abc_impl" and not statediff.reordered_only(old_mods, new_mods, c))]
     except Exception as e:  # noqa
         return {"cands": broad | precise, "note": f"diff-failed {e!r}"}
-    exact_bodies = _body_line_changes(j, delta, old_mods, new_mods)
+    exact_bodies, exact_code = _body_line_changes(j, delta, old_mods, new_mods)
     cands = set(precise)
     unknown = []
     M = MAP_OBJ
@@ -2086,7 +2112,10 @@ def overlay_candidates(j, old_mods, nodeids):
                     for k2, i in OR[1].get((owner, attr), []):
                         outside |= OR[0][i]
             rngs = _function_ranges(old_mods, new_mods, owner, attr)
-            if rngs and not exact_bodies:
+            narrow = exact_bodies.get((owner, attr))
+            if narrow:
+                fn_lines.setdefault(narrow[0], set()).update(narrow[1])
+            elif rngs:
                 for rng in rngs:
                     fn_lines.setdefault(rng[0], set()).update(range(rng[1], rng[2] + 1))
             if kind == "meth" or not precise:
@@ -2115,8 +2144,14 @@ def overlay_candidates(j, old_mods, nodeids):
                 if rel.startswith("..") or not rel.startswith("sqlglot/"):
                     unknown.append((kind, owner, attr))
                 else:
-                    fn_lines.setdefault(rel, set()).update(range(lo, hi + 1))
-                    cands |= M.covering(rel, lo, hi)
+                    match = exact_code.get((co_file, lo, hi))
+                    rows = match[1] if match else range(lo, hi + 1)
+                    fn_lines.setdefault(rel, set()).update(rows)
+                    if match:
+                        for line in rows:
+                            cands.update(M.covering(rel, line, line))
+                    else:
+                        cands |= M.covering(rel, lo, hi)
             except Exception:  # noqa
                 unknown.append((kind, owner, attr))
         else:
@@ -2279,50 +2314,53 @@ def overlay_candidates(j, old_mods, nodeids):
             break
     except Exception:  # noqa
         disp = True
+    # A mixed edit can change executed code and declarative state at once.
+    # Require a baseline descriptor for every changed field. Newly introduced
+    # overrides may have been read through a parent in the pristine checkout.
     setting_delta = set()
-    if not unknown and not forced and not disp:
+    schema = set()
+    if delta and not unknown and not forced and not disp:
+        scalars, schemas = set(), set()
         for kind, owner, attr, key in delta:
             if kind in ("methcode", "dictcode"):
                 continue
-            if kind != "cls" or key is not None or not attr.isupper():
-                setting_delta.clear()
+            if kind != "cls":
                 break
             mod, _, qual = owner.partition(":")
-            try:
-                values = []
-                for modules in (old_mods, new_mods):
-                    cls = modules[mod]
-                    for part in qual.split("."):
-                        cls = vars(cls)[part]
-                    values.append(vars(cls)[attr])
-                if any(value is not None and type(value) not in (bool, str, int, float)
-                       and not isinstance(value, modules["sqlglot.expressions"].Expr)
-                       for modules, value in zip((old_mods, new_mods), values)):
-                    break
-            except (KeyError, TypeError):
+            classes = [old_mods.get(mod), new_mods.get(mod)]
+            for part in qual.split("."):
+                classes = [vars(c).get(part) if c is not None else None for c in classes]
+            if any(c is None for c in classes) or attr not in vars(classes[0]):
                 break
-            setting_delta.add((owner, attr))
+            if owner.startswith("sqlglot.expressions.") and attr in ("arg_types", "required_args"):
+                if (owner, attr) not in tracked_query_settings():
+                    break
+                schemas.add((owner, attr))
+                continue
+            if not attr.isupper() or key is not None:
+                break
+            values = [vars(c).get(attr) for c in classes]
+            if any(v is not None and type(v) not in (bool, str, int, float)
+                   and not isinstance(v, modules["sqlglot.expressions"].Expr)
+                   for modules, v in zip((old_mods, new_mods), values)):
+                break
+            scalars.add((owner, attr))
         else:
-            if setting_delta:
-                note += f" settings={len(setting_delta)}"
-        if len(setting_delta) != sum(d[0] == "cls" for d in delta):
-            setting_delta.clear()
-    # Changing an expression's argument schema changes both the dictionary and
-    # its derived required_args set. Track whole-attribute reads for each row.
-    # Do this only when the state comparison saw exclusively schema changes.
-    schema = set()
-    if (delta and not unknown and not forced and all(
-            kind == "cls" and owner.startswith("sqlglot.expressions.")
-            and attr in ("arg_types", "required_args") for kind, owner, attr, _ in delta)):
-        schema = {(owner, attr) for _, owner, attr, _ in delta}
-        if schema <= tracked_query_settings():
-            note += f" schema-attributes={len(schema)}"
-        else:
-            schema.clear()
+            setting_delta, schema = scalars, schemas
+            if setting_delta or schema:
+                note += f" settings={len(setting_delta)} schema={len(schema)}"
+    runtime_rows = {}
+    if setting_delta or schema:
+        for (path, scope), (rows, _, _) in j["body_lines"].items():
+            cls, _, name = scope.rpartition(".")
+            module = _modname(path)
+            own = module + ":" + cls if cls else module
+            match = exact_bodies.get((own, name))
+            runtime_rows.setdefault(path, set()).update(match[1] if match else rows)
     alias_rows = (n_glob and only_aliases and not unknown and not forced
                   and all(d[0] in ("mod", "methcode", "meth") for d in delta))
-    return {"alias_readers": alias_readers if alias_rows else None, "cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "schema": schema, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
-            "scalar_only": bool(setting_delta) and all(d[0] in ("cls", "methcode") for d in delta),
+    return {"alias_readers": alias_readers if alias_rows else None, "cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta | schema, "setting_lines": runtime_rows, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+            "scalar_only": bool(setting_delta) and not schema and all(d[0] in ("cls", "methcode") for d in delta),
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
             "cls_readers": (cls_readers | untraced) if (cls_ok and not unknown and not forced and not disp) else None,
@@ -2914,7 +2952,8 @@ def _child(j, nodeids, ms, runner, modules):
             if HANG[0] or not (cands or fixture_readers):
                 return {"failed": [], "unrun": sorted(set(cands) | fixture_readers), "note": note}
         elif res.get("replay_ok") and j.get("pure_src"):
-            cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
+            rows = res["setting_lines"] if res.get("settings") else j.get("ch_lines")
+            cands, rn = replay_narrow(cands, rows, ms, res.get("outside"), res.get("fn_lines"),
                                       light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")),
                                       attrs=None if res.get("pure") else res.get("attrs"),
                                       disp=bool(res.get("disp", True)), settings=res.get("settings"),
@@ -2927,7 +2966,8 @@ def _child(j, nodeids, ms, runner, modules):
         aff = None
         ov_lines = None
         if j.get("pure_src") and j.get("ch_lines") is not None:
-            ov_lines = {f: set(v) for f, v in j["ch_lines"].items()}
+            base_lines = res["setting_lines"] if res.get("settings") else j["ch_lines"]
+            ov_lines = {f: set(v) for f, v in base_lines.items()}
             for f, v in (res.get("fn_lines") or {}).items():
                 ov_lines.setdefault(f, set()).update(v)
         if res.get("validator_routes") and ov_lines is not None:
@@ -2977,7 +3017,7 @@ def _child(j, nodeids, ms, runner, modules):
             itf = iter_filter(query_readers, ov_lines)
             runner.ITER_FILTER.update(itf)
             iter_cpu(itf)
-        query_settings = res.get("settings") or res.get("schema")
+        query_settings = res.get("settings")
         if query_settings and ov_lines is not None:
             plan_fixture_workers(cands, ov_lines, query_settings)
             plan_scope_check(runner, cands, nodeids, ov_lines, query_settings)
