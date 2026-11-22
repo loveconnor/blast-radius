@@ -1,0 +1,24 @@
+diff --git a/sqlglot/__init__.py b/sqlglot/__init__.py
+--- a/sqlglot/__init__.py
++++ b/sqlglot/__init__.py
+@@ -162,7 +162,7 @@
+     else:
+         result = dialect.parse(sql, **opts)
+ 
+-    if not result or result[0] is None:
++    if not result or result[-1] is None:
+         raise ParseError(f"No expression was parsed from '{sql}'")
+ 
+     return exp.Block(expressions=result) if len(result) > 1 else result[0]
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -2404,7 +2404,7 @@
+ 
+ def date_delta_sql(name: str, cast: bool = False) -> t.Callable[[Generator, DATE_ADD_OR_DIFF], str]:
+     def _delta_sql(self: Generator, expression: DATE_ADD_OR_DIFF) -> str:
+-        if cast and isinstance(expression, exp.TsOrDsAdd):
++        if cast and (not isinstance(expression, exp.TsOrDsAdd)):
+             expression = ts_or_ds_add_cast(expression)
+ 
+         return self.func(

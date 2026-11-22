@@ -123,7 +123,18 @@ def original_tree(loader, path, before, ids, row):
     return tree if deterministic_function(tree, row) else None
 
 
-def unchanged(path, before, edited, ids, row):
+def stable_or_unseen(data, site, uncovered):
+    eligible = data["both"].get(site, 0)
+    if uncovered:
+        # A test must miss the line in the coverage map and the instrumented
+        # operand in both baseline runs, including module initialization.
+        for readers in data["reads"][site].values():
+            uncovered &= ~readers
+        eligible |= uncovered
+    return eligible & ~data["unknown"]
+
+
+def unchanged(path, before, edited, ids, row, uncovered=0):
     original = original_tree(index, path, before, ids, row)
     if original is None:
         return set()
@@ -147,7 +158,7 @@ def unchanged(path, before, edited, ids, row):
                 continue
         finally:
             new.ops, new.comparators = ops, comparators
-        allowed = data["both"].get(site, 0)
+        allowed = stable_or_unseen(data, site, uncovered)
         for sample, tests in data["reads"][site].items():
             if not agrees(sample, left, right):
                 allowed &= ~tests

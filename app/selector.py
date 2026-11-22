@@ -380,23 +380,39 @@ def main():
                 import generatorsites
                 D.cands.difference_update(generatorsites.cleared(D.files, REPO, M) - D.must)
             comparison_same = set()
-            if (len(D.files) == 1 and D.rt_lines and D.rt_lines == D.ch_lines and not D.all and not fixture_edits
-                    and not fixture_only_tests and not mixed_source_tests and not fixture_reach):
-                path, after = next(iter(D.files.items()))
-                if path.startswith("sqlglot/") and path in D.parsed:
-                    import branchreach
-                    import comparisonreads
-                    import guardreads
-                    import indexreads
+            if (D.files and D.rt_lines and D.rt_lines == D.ch_lines and not D.all and not fixture_edits
+                    and not fixture_only_tests and not mixed_source_tests and not fixture_reach
+                    and all(path.startswith("sqlglot/") and path in D.parsed for path in D.files)):
+                import branchreach
+                import comparisonreads
+                import guardreads
+                import indexreads
+                separate = len(D.files) > 1
+                stable = None
+                for path, after in D.files.items():
                     before = (REPO / path).read_text()
                     row = comparisonreads.changed_row(before, after)
-                    if row:
-                        for module in (comparisonreads, guardreads, indexreads, branchreach):
-                            comparison_same.update(module.unchanged(path, before, D.parsed[path], nodeids, row))
-                    if comparison_same:
-                        comparison_same.difference_update(source_observers(path, M) | D.must)
-                        if not D.import_change:
-                            D.cands.difference_update(comparison_same)
+                    if row is None or (separate and row not in D.rt_lines.get(path, ())):
+                        break
+                    uncovered = 0
+                    if separate and row not in M.importlines.get(path, ()):
+                        readers = set()
+                        for line in D.rt_lines[path]:
+                            readers.update(M.covering(path, line, line))
+                        uncovered = sum(1 << t for t in all_tests - readers)
+                    same = set()
+                    for module in (comparisonreads, guardreads, indexreads, branchreach):
+                        same.update(module.unchanged(path, before, D.parsed[path], nodeids, row, uncovered))
+                    same.difference_update(source_observers(path, M) | D.must)
+                    stable = same if stable is None else stable & same
+                    if not stable:
+                        break
+                else:
+                    # Before a first divergence from the original test, every
+                    # changed expression must have seen its original inputs.
+                    comparison_same = stable or set()
+                    if not D.import_change:
+                        D.cands.difference_update(comparison_same)
             if D.must:
                 must[cid] = set(D.must)
             if not D.all and not fixture_edits and D.parsed and all(r.endswith(".py") for r in D.files):

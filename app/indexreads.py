@@ -26,8 +26,8 @@ def index():
         return None
 
 
-def unchanged(path, before, edited, ids, row):
-    from comparisonreads import covering, original_tree, restored
+def unchanged(path, before, edited, ids, row, uncovered=0):
+    from comparisonreads import covering, original_tree, restored, stable_or_unseen
     original = original_tree(index, path, before, ids, row)
     if original is None:
         return set()
@@ -51,7 +51,7 @@ def unchanged(path, before, edited, ids, row):
                 continue
         finally:
             node.slice = saved
-        allowed = data["both"].get(site, 0) & ~data["unknown"]
+        allowed = stable_or_unseen(data, site, uncovered)
         bit = 1 << INDICES.index(new_index)
         for mask, readers in data["reads"][site].items():
             if not isinstance(mask, int) or not mask & bit:

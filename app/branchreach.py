@@ -33,7 +33,7 @@ def index():
         return None
 
 
-def unchanged(path, before, edited, ids, row):
+def unchanged(path, before, edited, ids, row, uncovered=0):
     data = index()
     if not data or ids != data["ids"] or (path, row) not in data["lines"]:
         return set()
@@ -80,5 +80,7 @@ def unchanged(path, before, edited, ids, row):
                 parent = data["sites"][(*base, "parent")]
                 child = data["sites"][(*base, k)]
                 cleared |= data["both"].get(parent, 0) & ~data["either"].get(child, 0)
+                if parent in data["either"]:
+                    cleared |= uncovered & ~data["either"][parent]
     cleared &= ~data["unknown"]
     return {i for i in range(len(ids)) if cleared & (1 << i)}
