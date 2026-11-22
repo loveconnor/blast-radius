@@ -1,0 +1,12 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -203,7 +203,7 @@
+     for strict_format, lax_format in STRICT_TIME_FORMATS.items():
+         if strict_format in inverse_mapping:
+             # In strict dialects, a foreign lax %m formats the same padded way as %mstrict (MM)
+-            inverse_mapping.setdefault(lax_format, inverse_mapping[strict_format])
++            inverse_mapping.setdefault(strict_format, inverse_mapping[strict_format])
+         else:
+             # Elsewhere, the strict format degrades to its lax counterpart so it never leaks
+             inverse_mapping.setdefault(strict_format, inverse_mapping.get(lax_format, lax_format))

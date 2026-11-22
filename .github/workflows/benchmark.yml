@@ -16,4 +16,8 @@ jobs:
       - name: Build and score three fresh containers
         run: |
           uname -m
-          make sample
+          set -o pipefail
+          make sample | tee /tmp/public-score
+          grep -Eq '^Misses: +[1-9]' /tmp/public-score && exit 1
+          make sample SAMPLE="$PWD/tools/regression" | tee /tmp/regression-score
+          if grep -Eq '^Misses: +[1-9]' /tmp/regression-score; then exit 1; fi

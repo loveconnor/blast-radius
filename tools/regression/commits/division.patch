@@ -1,0 +1,12 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -501,7 +501,7 @@
+     Possible values: `"nulls_are_small"`, `"nulls_are_large"`, `"nulls_are_last"`
+     """
+ 
+-    TYPED_DIVISION = False
++    TYPED_DIVISION = True
+     """
+     Whether the behavior of `a / b` depends on the types of `a` and `b`.
+     False means `a / b` is always float division.

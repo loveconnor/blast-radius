@@ -1734,7 +1734,9 @@ def overlay_candidates(j, old_mods, nodeids):
                     for part in qual.split("."):
                         cls = vars(cls)[part]
                     values.append(vars(cls)[attr])
-                if any(v is not None and type(v) not in (bool, str, int, float) for v in values):
+                if any(value is not None and type(value) not in (bool, str, int, float)
+                       and not isinstance(value, modules["sqlglot.expressions"].Expr)
+                       for modules, value in zip((old_mods, new_mods), values)):
                     break
             except (KeyError, TypeError):
                 break
@@ -2368,6 +2370,10 @@ def _child(j, nodeids, ms, runner, modules):
         j["light"], j["heavy"] = light, heavy
         unrun = list(heavy)
     signal.setitimer(signal.ITIMER_REAL, 0)
+    # The executor compares result tables. A changed intermediate SQL string or
+    # parse tree is a reason to run the query, but gives weak evidence that its
+    # final table differs. Use the ordinary pass prior for these tests.
+    REPLAY_HIT.difference_update(memo_ids(nodeids))
     runner.TIMEOUTS[0] = 0
     PROF["marks"].append(("plan", round(time.process_time(), 2)))
 

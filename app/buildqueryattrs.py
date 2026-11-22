@@ -5,6 +5,7 @@ import sys
 
 import runner
 sys.path.insert(0, runner.REPO)
+from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 
@@ -27,10 +28,13 @@ ids = ["tests/test_executor.py::TestExecutor::test_execute_" + suffix for suffix
 runner.zygote_import({"tests.test_executor"})
 # Force dialect registration before installing descriptors on the concrete owners.
 classes = set(Dialect.classes.values()) | {Dialect}
+generators = {base for dialect in classes for base in dialect.generator_class.__mro__
+              if base.__module__.startswith("sqlglot.")}
+classes.update(generators)
 tracked = set()
 for cls in classes:
     for name, value in list(vars(cls).items()):
-        if name.isupper() and (value is None or type(value) in (bool, str, int, float)):
+        if name.isupper() and (value is None or type(value) in (bool, str, int, float) or isinstance(value, exp.Expr)):
             key = (f"{cls.__module__}:{cls.__qualname__}", name)
             setattr(cls, name, Setting(key, value))
             tracked.add(key)
