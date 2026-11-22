@@ -974,13 +974,30 @@ def _replay():
     return _REPLAY
 
 
+@lru_cache(maxsize=1)
+def call_observers(coverage):
+    """Tests that inspect call behavior which a phase result cannot represent."""
+    if coverage is None:
+        return frozenset()
+    attrs = re.compile(r"\.(?:call_count|called|call_args(?:_list)?|mock_calls|method_calls|"
+                       r"assert_(?:not_called|called(?:_once)?(?:_with)?|any_call|has_calls))\b")
+    readers = set()
+    for path, sites in coverage.lines.items():
+        if not path.startswith("tests/") or not path.endswith(".py"):
+            continue
+        for row, line in enumerate((REPO / path).read_text().splitlines(), 1):
+            if row in sites and attrs.search(line):
+                readers.update(coverage.sets[sites[row]])
+    return frozenset(readers)
+
+
 def replay_scope(cands, ch_lines, outside0=None, extra_lines=None):
     """Candidates that run the changed lines only inside recorded parse phases.
     Returns (tests, key ids, estimated cpu seconds)."""
     R = _replay() if REPLAY_ON else {}
     if not R or ch_lines is None:
         return [], [], 0.0
-    outside = set(outside0 or ())
+    outside = set(outside0 or ()) | call_observers(MAP_OBJ)
     allines = {f: set(v) for f, v in ch_lines.items()}
     for f, v in (extra_lines or {}).items():
         allines.setdefault(f, set()).update(v)
@@ -2868,7 +2885,8 @@ def filter_validators(runner, cands, nodeids, lines, settings=(), routes=()):
                              or p in ("sqlglot/parser.py", "sqlglot/generator.py")) for p in lines):
         return
     import validatorcalls
-    plans = validatorcalls.masks(lines, settings, (nodeids[t] for t in cands), routes)
+    observers = call_observers(MAP_OBJ)
+    plans = validatorcalls.masks(lines, settings, (nodeids[t] for t in cands if t not in observers), routes)
     runner.VALIDATOR_CALLS.update(plans)
     for t in cands:
         plan = plans.get(nodeids[t])
@@ -3319,7 +3337,8 @@ def _child(j, nodeids, ms, runner, modules):
         if unrun and not failed and hits and not bad and all(hits.get(k, 0) > 0 for k in range(n_sites)) \
                 and (n_ran >= 0.5 * (n_ran + len(unrun)) or (n_ran >= 8 and all(hits.get(k, 0) >= 30 for k in range(n_sites)))):
             note += " EQUIV->drop heavy"
-            unrun = [t for t in unrun if t == SIZE_SENSITIVE_TEST[0]]
+            observers = call_observers(MAP_OBJ)
+            unrun = [t for t in unrun if t == SIZE_SENSITIVE_TEST[0] or t in observers]
     # second phase: the light tests are done; a heavy test left unrun is run after
     # all when the schedule time it would free outweighs its cpu
     if unrun and not (j["overlay"] and j.get("unknown")):
