@@ -585,16 +585,25 @@ def submit_filter(lines_by_file, cands, nodeids):
                 allow.update(sf.get(l, ()))
         if ok and len(allow) < n:
             out[t] = allow
+    # The older pool trace records LINE events. A lambda returning on its
+    # definition line may emit only PY_START. Preserve each query observed by
+    # either trace, and keep shared setup when the complete trace saw it.
+    if shared_query_change(lines_by_file):
+        return {}
     complete, _ = query_filter(lines_by_file, cands, nodeids)
     for t, allow in complete.items():
-        out[t] = allow.intersection(out.get(t, allow))
+        out[t] = allow.union(out.get(t, ()))
     return out
+
+
+def shared_query_change(lines):
+    shared = (_memo_lite() or {}).get("query_shared", {})
+    return any(shared.get(f, set()).intersection(ls) for f, ls in lines.items())
 
 
 def query_filter(lines, cands, nodeids):
     memo = _memo_lite() or {}
-    shared = memo.get("query_shared", {})
-    if any(shared.get(f, set()).intersection(ls) for f, ls in lines.items()):
+    if shared_query_change(lines):
         return {}, {}
     complete, parse_only = {}, {}
     pos = _nodeid_pos(nodeids)

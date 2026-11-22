@@ -364,8 +364,17 @@ if len(sys.argv) > 2:
             if tree is not None and tree == meta["plan_inputs"].get(key):
                 stable[2] |= 1 << i
         verified[tid] = (n, phases, setup, stable)
+    for tid, (n, phases) in first["query_index"].items():
+        alternate = query_index.get(tid)
+        if alternate is None or alternate[0] != n:
+            continue
+        for phase, alt_phase in zip(phases, alternate[1]):
+            for path, rows in alt_phase.items():
+                target = phase.setdefault(path, {})
+                for row, mask in rows.items():
+                    target[row] = target.get(row, 0) | mask
     first["stage_index"] = verified
-    first["stage_shared"] = {path: set(first["query_shared"].get(path, ())) | set(shared.get(path, ()))
+    first["query_shared"] = first["stage_shared"] = {path: set(first["query_shared"].get(path, ())) | set(shared.get(path, ()))
                              for path in first["query_shared"].keys() | shared.keys()}
     with open(lite_path, "wb") as fh:
         pickle.dump(first, fh, protocol=4)

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/python.py b/sqlglot/generators/python.py
+--- a/sqlglot/generators/python.py
++++ b/sqlglot/generators/python.py
+@@ -106,7 +106,7 @@
+         exp.Case: _case_sql,
+         exp.Alias: lambda self, e: self.sql(e.this),
+         exp.Array: inline_array_sql,
+-        exp.And: lambda self, e: f"AND(lambda: {self.sql(e.left)}, lambda: {self.sql(e.right)})",
++        exp.And: lambda self, e: f"OR(lambda: {self.sql(e.left)}, lambda: {self.sql(e.right)})",
+         exp.Between: _rename,
+         exp.Boolean: lambda self, e: "True" if e.this else "False",
+         exp.Cast: lambda self, e: f"CAST({self.sql(e.this)}, exp.DType.{e.args['to']})",
