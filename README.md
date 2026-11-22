@@ -21,6 +21,7 @@ built from the pinned commit.
    - A zygote process imports sqlglot and all test modules once. Each commit then runs in a forked child.
    - Runtime-only edits are applied by swapping `__code__` on the live functions.
    - Edits that run at import time rebuild a symlink overlay and re-import. The old and new module and class state are then diffed structurally (`app/statediff.py`). Each changed attribute or dict key is mapped to the tests that read it, using an attribute-read trace of the pinned commit (`app/reads.json.gz`).
+   - Generator routing has a separate test map built from actual handler lookups, including cold test-module imports. For eligible cache-builder guard edits, the selector compares the old and new dispatch tables for each builtin generator in an isolated process.
    - A cost model (`plan_split`) weighs running a test (container CPU) against selecting it unrun (scheduled seconds plus 2 s per worker). The expensive tail is selected without being run.
    - Runtime edits are instrumented with old/new differential probes. If the light tests pass and every probe saw identical values, the heavy tail is dropped.
    - TPC-H and TPC-DS trace each query from its initial parse through its result comparison. For a patch to a function body, the selector runs the affected queries and preserves their fixture indices. If the initial parse is the only affected step and its expression matches the baseline digest, the rest of that query can be skipped. An independent baseline run tracks reads of dialect and generator settings, including pre-parsed expression templates, per query. Reads during shared setup disable this pruning.
@@ -65,7 +66,7 @@ built from the pinned commit.
   - `buildimports.py`: the sqlglot modules each test imports
   - `optfrac.py`: share of each test's time spent in `optimize()`
   - `genmutants.py`, `fastlabel.py` and friends: evaluation on synthetic mutants
-- The native AMD64 GitHub Actions benchmark scores the public sample and three regression patches on an x86-64 Linux runner. The regression labels come from running all 1,620 pinned tests on each patch. The Docker build excludes these inputs and labels. The selector calibrates its cost estimates before planning the first patch.
+- The native AMD64 GitHub Actions benchmark scores the public sample and six regression patches on an x86-64 Linux runner. The regression labels come from running all 1,620 pinned tests on each patch. The Docker build excludes these inputs and labels. The selector calibrates its cost estimates before planning the first patch.
 - `make sample` scores three fresh containers and reports the median of simulated time plus measured CPU. The default build targets linux/amd64. On ARM, use `make sample PLATFORM=linux/arm64 IMAGE=blast-radius-native` for native CPU measurements. AMD64 emulation can crash DuckDB during preparation and exercise a slower fallback. A native AMD64 Docker host gives the closest hardware comparison with the fleet.
 
 The tools expect a dev container with this repo at `/w`, the sqlglot checkout at `/w/sqlglot`, and the starter kit at `/kit`.

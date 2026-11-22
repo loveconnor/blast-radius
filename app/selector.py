@@ -289,6 +289,14 @@ def main():
                         maybe_equiv[cid] = D.files
                 except Exception as e:  # noqa
                     log(cid, "equiv screen failed", repr(e))
+            guard_tests = None
+            if D.all and not STATIC_ONLY[0] and D.reasons == ["cache-fill sqlglot/generator.py"]:
+                import dispatch
+                guard_tests = dispatch.guard_reach(D, M, REPO)
+                if guard_tests is not None:
+                    D.all = False
+                    D.import_change = True
+                    D.cands = set(guard_tests)
             if D.all:
                 affected = broken_leaf_tests(D, M, nodeids)
                 answers[cid] = sorted(all_tests) if affected is None else affected
@@ -393,7 +401,7 @@ def main():
                 if not D.import_change:
                     continue
             jobs.append(dict(
-                cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
+                cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
                 fixture_sql_only=fixture_sql_only, scale_nodes=scale_nodes,
@@ -1239,10 +1247,10 @@ MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
-LATE_MIN_MS = float(os.environ.get("BR_LATE_MIN_MS", "500"))
+LATE_MIN_MS = float(os.environ.get("BR_LATE_MIN_MS", "125"))
 FIX_PFAIL = float(os.environ.get("BR_FIX_PFAIL", "0.85"))
 P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.6"))
-LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.15"))
+LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "0.65"))
 P2_PASS = float(os.environ.get("BR_P2_PASS", "0.75"))
 P2_PASS_FAILED = float(os.environ.get("BR_P2_PASS_F", "0.40"))
 REPLAN = os.environ.get("BR_REPLAN", "1") == "1"
@@ -1253,7 +1261,7 @@ DENSE_MIN = float(os.environ.get("BR_DENSE_MIN", "2.0"))
 Q_MAX = float(os.environ.get("BR_Q_MAX", "0.70"))
 Q_PRIOR = float(os.environ.get("BR_Q_PRIOR", "0.5"))
 Q_BETA = float(os.environ.get("BR_Q_BETA", "3.0"))
-RP_MARGIN = float(os.environ.get("BR_RP_MARGIN", "1.05"))
+RP_MARGIN = float(os.environ.get("BR_RP_MARGIN", "0.60"))
 
 
 def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0, base=()):
@@ -1681,6 +1689,14 @@ def overlay_candidates(j, old_mods, nodeids):
             return {"all": True, "note": note + " broad"}
     if delta:
         cands |= untraced & (broad | precise)
+    if (delta and not forced and not unknown and j.get("pure_src")
+            and all(p.startswith("sqlglot/generators/") for p in j["files"])):
+        import dispatch
+        reached = dispatch.transform_reach(delta, M)
+        if reached is not None:
+            observed, direct = reached
+            cands = observed | precise | (cands & direct)
+            note += f" dispatch={len(cands)}"
     default_sites = []
     if j.get("default_edit") and not forced and len(delta) == 1:
         path, cls, method, arg = j["default_edit"]
@@ -2249,7 +2265,10 @@ def _child(j, nodeids, ms, runner, modules):
         optmemo.ON[0] = False   # decided again once the state diff is known
         optmemo.set_changed(None)
         c0 = time.process_time()
-        res = overlay_candidates(j, old_mods, nodeids)
+        if j.get("guard_tests") is not None:
+            res = {"cands": j["guard_tests"], "note": f"dispatch={len(j['guard_tests'])}"}
+        else:
+            res = overlay_candidates(j, old_mods, nodeids)
         PROF["ovc"] = time.process_time() - c0
         if res.get("all"):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}

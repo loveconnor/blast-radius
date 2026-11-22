@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/mysql.py b/sqlglot/generators/mysql.py
+--- a/sqlglot/generators/mysql.py
++++ b/sqlglot/generators/mysql.py
+@@ -161,7 +161,7 @@
+         exp.BitwiseAndAgg: rename_func("BIT_AND"),
+         exp.BitwiseOrAgg: rename_func("BIT_OR"),
+         exp.BitwiseXorAgg: rename_func("BIT_XOR"),
+-        exp.BitwiseCount: rename_func("BIT_COUNT"),
++        exp.BitwiseCount: rename_func("BIT_SUM"),
+         exp.Chr: lambda self, e: self.chr_sql(e, "CHAR"),
+         exp.CurrentDate: no_paren_current_date_sql,
+         exp.CurrentVersion: rename_func("VERSION"),
