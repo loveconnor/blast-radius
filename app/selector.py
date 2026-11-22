@@ -1904,8 +1904,22 @@ def overlay_candidates(j, old_mods, nodeids):
     if "sqlglot/expressions/properties.py" in j["files"] and not forced:
         import dispatch
         property_leaf = dispatch.removed_property(j, old_mods["sqlglot.expressions.properties"], M)
+    table_rows = {d for d in delta if d[0] == "cls" and d[2] == "TRANSFORMS" and isinstance(d[3], str)}
+    table_readers = None
+    if table_rows and (property_leaf or (j.get("pure_src") and not forced
+            and all(p.startswith(("sqlglot/generators/", "sqlglot/parsers/", "sqlglot/expressions/"))
+                    for p in j["files"]))):
+        import dispatch
+        table_readers = dispatch.transform_reach(table_rows, M)
     for kind, owner, attr, key in delta:
         if kind == "cls":
+            if table_readers and (kind, owner, attr, key) in table_rows:
+                observed, direct_tests, _ = table_readers
+                readers = observed | direct_tests
+                cands.update(readers)
+                outside.update(readers)
+                cls_readers.update(readers)
+                continue
             if attr == "*" and property_leaf and owner == property_leaf[0]:
                 refs = _global_refs(property_leaf[1], nodeids)
                 if refs is not None:
@@ -1917,6 +1931,11 @@ def overlay_candidates(j, old_mods, nodeids):
                     # Deserialization can resolve the class by a computed name.
                     # Enumeration can observe its absence without constructing it.
                     for mod, fn in (("sqlglot.serde", "_load"), ("sqlglot.helper", "subclasses")):
+                        if mod == "sqlglot.serde":
+                            readers = dispatch.deserialization_readers(M, property_leaf[1])
+                            if readers is not None:
+                                uses.update(readers)
+                                continue
                         spans = _function_ranges(old_mods, new_mods, mod, fn)
                         if spans is None:
                             uses.update(M.file_users(mod.replace(".", "/") + ".py"))

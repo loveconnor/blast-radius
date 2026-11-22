@@ -178,6 +178,22 @@ def transform_reach(delta, coverage):
         return None
 
 
+@functools.lru_cache(maxsize=1)
+def property_reads():
+    with gzip.open(Path(__file__).with_name("propertyreads.json.gz"), "rt") as fh:
+        return json.load(fh)
+
+
+def deserialization_readers(coverage, cls):
+    try:
+        data = property_reads()
+        if data["tests"] == coverage.tests:
+            return set(data["unknown"]) | set(data["reads"].get(cls, ()))
+    except (OSError, KeyError, ValueError):
+        pass
+    return None
+
+
 def removed_property(job, module, coverage):
     """Recognize deletion of a declarative Property subclass from the pinned checkout."""
     path = "sqlglot/expressions/properties.py"
