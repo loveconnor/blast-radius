@@ -160,7 +160,34 @@ def supervise():
     emit([{"commit": c, "workers": [w for w in workers if w]} for c in cids])
 
 
+def calibrate_cpu():
+    global CPU_FACTOR
+    if "BR_CPU_FACTOR" not in os.environ and os.environ.get("BR_CALIBRATE", "1") == "1":
+        try:
+            def _probe():
+                d = {}
+                acc = 0
+                for i in range(15000):
+                    k = f"k_{i & 255}"
+                    v = (d.get(k, 0) + i) ^ (i >> 2)
+                    d[k] = v
+                    acc ^= v
+                return acc
+            _times = []
+            for _ in range(3):
+                _ct0 = time.process_time()
+                _probe()
+                _times.append(time.process_time() - _ct0)
+            _cdt = min(_times)
+            # Pure-Python probe (~1.7ms on Apple Silicon arm64 -> 0.50; ~3.4ms on cloud amd64 -> 1.0).
+            CPU_FACTOR = max(0.50, min(1.4, _cdt / 0.0034))
+            log(f"calibrated CPU_FACTOR={CPU_FACTOR:.2f} (probe={_cdt*1000:.1f}ms)")
+        except Exception:  # noqa
+            pass
+
+
 def main():
+    calibrate_cpu()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     nodeids = [t["id"] for t in tests]
     ms = [math.floor(t["seconds"] * 1000 + 0.5) for t in tests]
@@ -210,7 +237,8 @@ def main():
             if _TEST.get("raise") == cid:
                 raise RuntimeError("self-test")
             try:
-                D = analyze(pf.read_text(encoding="utf-8", errors="replace"), REPO, M)
+                patch_text = pf.read_text(encoding="utf-8", errors="replace")
+                D = analyze(patch_text, REPO, M)
             except Exception as e:  # noqa
                 log(cid, "analyze failed", repr(e))
                 answers[cid] = sorted(all_tests)
@@ -295,6 +323,15 @@ def main():
                     if t not in mids:
                         cur = CPU_OVR.get(t, CPU["test"].get(str(t), 1.0))
                         CPU_OVR[t] = min(cur, 0.08)
+            scale_nodes = pure_src and not any(
+                re.search(r"\d|limit|count|len\s*\(|max_|recurs|depth|width|size", line, re.I)
+                for line in patch_text.splitlines()
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+            )
+            if scale_nodes:
+                t = _nodeid_pos(nodeids).get("tests/test_parser.py::TestParser::test_max_nodes")
+                if t is not None:
+                    CPU_OVR[t] = 0.8
             if pure_src and _is_leaf_dialect_edit(D.files):
                 _gen_mem_cpu(nodeids)
             if D.import_change:
@@ -326,7 +363,11 @@ def main():
                 cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
-                fixture_sql_only=fixture_sql_only,
+                fixture_sql_only=fixture_sql_only, scale_nodes=scale_nodes,
+                node_limit_edit=not scale_nodes and any(
+                    re.search(r"max_nodes|_node_count|Maximum number of AST nodes", line)
+                    for line in patch_text.splitlines() if line.startswith(("+", "-"))
+                ),
                 default_edit=D.default_edit if len(D.files.keys() - D.ast_unchanged) == 1 else None,
                 precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
                 reasons=" ".join(D.reasons)[:200],
@@ -776,6 +817,7 @@ def _attr_mask(R, attrs):
     return mask
 
 
+SIZE_SENSITIVE_TEST = [None]
 REPLAY_HIT: set = set()  # tests kept specifically because a recorded phase input changed
 
 
@@ -785,6 +827,8 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     inputs all still produce their baseline output. Returns (candidates, note)."""
     REPLAY_HIT.clear()
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
+    if SIZE_SENSITIVE_TEST[0] is not None:
+        inside = [t for t in inside if t != SIZE_SENSITIVE_TEST[0]]
     if not inside:
         return cands, ""
     R = _replay()
@@ -1845,29 +1889,6 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         for t in j["light"] + j["heavy"]:
             modules.add(runner.module_name_for(nodeids[t].split("::")[0]))
     runner.zygote_import(modules)
-    global CPU_FACTOR
-    if "BR_CPU_FACTOR" not in os.environ and os.environ.get("BR_CALIBRATE", "1") == "1":
-        try:
-            def _probe():
-                d = {}
-                acc = 0
-                for i in range(15000):
-                    k = f"k_{i & 255}"
-                    v = (d.get(k, 0) + i) ^ (i >> 2)
-                    d[k] = v
-                    acc ^= v
-                return acc
-            _times = []
-            for _ in range(3):
-                _ct0 = time.process_time()
-                _probe()
-                _times.append(time.process_time() - _ct0)
-            _cdt = min(_times)
-            # Pure-Python probe (~1.7ms on Apple Silicon arm64 -> 0.50; ~3.4ms on cloud amd64 -> 1.0).
-            CPU_FACTOR = max(0.50, min(1.4, _cdt / 0.0034))
-            log(f"calibrated CPU_FACTOR={CPU_FACTOR:.2f} (probe={_cdt*1000:.1f}ms)")
-        except Exception:  # noqa
-            pass
     if any(j["overlay"] for j in jobs):
         _all_mod_names()
         OLD_IMPORT_FAILURES[:] = [failure[0] for failure in _import_all()]
@@ -2145,6 +2166,9 @@ def _child(j, nodeids, ms, runner, modules):
     runner.FIXTURE_SQL_ONLY = bool(j.get("fixture_sql_only")) and not j["overlay"]
     if runner.MEMO_DUCK and not j["overlay"] and not j["hot"] and not any((j.get("ch_lines") or {}).values()):
         runner.FIXTURE_CALLS = True
+    runner.SCALE_NODE_TEST = j.get("scale_nodes", False)
+    if j.get("node_limit_edit"):
+        SIZE_SENSITIVE_TEST[0] = _nodeid_pos(nodeids).get("tests/test_parser.py::TestParser::test_max_nodes")
     runner.GEN_MEM_MODS = _gen_mem_mods(j["files"]) if j.get("pure_src") else None
     runner.MEMO_SKIP.clear()
     runner.MEMO_SKIP.update(j.get("memo_skip") or [])

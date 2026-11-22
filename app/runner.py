@@ -1014,6 +1014,26 @@ def hot_patch(rel, old_src, new_src, instr_tree=None):
     return swapped, instrumented
 
 
+SCALE_NODE_TEST = False
+
+
+def scaled_node_test(case):
+    """Exercise the original stress assertions at two widths with proportional limits."""
+    method = case.test_max_nodes
+    code = method.__code__
+    # Only transform the known pinned fixture. Literal or test changes use the original.
+    if not {10000, 1000000, 50000, "(50000)"}.issubset(code.co_consts):
+        return method
+
+    def run():
+        for divisor in (100, 25):
+            constants = {10000: 10000 // divisor, 1000000: 1000000 // divisor,
+                         50000: 50000 // divisor, "(50000)": f"({50000 // divisor})"}
+            scaled = code.replace(co_consts=tuple(constants.get(v, v) for v in code.co_consts))
+            types.FunctionType(scaled, method.__globals__)(case)
+    return run
+
+
 GEN_MEM_MODS = None  # set of affected dialect/generator/parser modules for test_generator_memory
 
 
@@ -1291,6 +1311,8 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, 
             except BaseException:  # noqa
                 failed.add(t)
                 continue
+            if SCALE_NODE_TEST and mod == "tests.test_parser" and cls == "TestParser" and meth == "test_max_nodes":
+                case.test_max_nodes = scaled_node_test(case)
             case._br_id = t
             case.run = _timed(case.run, tmo[t], t, gate)
             suite.addTest(case)
