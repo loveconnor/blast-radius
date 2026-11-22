@@ -38,13 +38,21 @@ class InlineExecutor:
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         self.input_digest = None
+        self._is_exec = False
         if initializer:
-            payload = pickle.dumps(initargs)
-            if (MEMO_REC is not None or FIXTURE_CALLS is not None) and (
-                    getattr(initializer, "__module__", None), getattr(initializer, "__name__", None)
-            ) == ("tests.test_executor", "initializer"):
-                self.input_digest = hashlib.sha256(payload).digest()
-            initializer(*pickle.loads(payload))
+            is_exec_init = (
+                getattr(initializer, "__module__", None),
+                getattr(initializer, "__name__", None),
+            ) == ("tests.test_executor", "initializer")
+            self._is_exec = is_exec_init
+            if is_exec_init and MEMO_REC is None:
+                # tests.test_executor.initializer only stores read-only schema/tables refs
+                initializer(*initargs)
+            else:
+                payload = pickle.dumps(initargs)
+                if MEMO_REC is not None and is_exec_init:
+                    self.input_digest = hashlib.sha256(payload).digest()
+                initializer(*pickle.loads(payload))
 
     def submit(self, fn, *a, **k):
         n = _SUB["n"]
@@ -71,13 +79,18 @@ class InlineExecutor:
             return f
         f = _LazyFuture()
         f._n = n
+        is_mp_exec = (
+            getattr(fn, "__module__", None),
+            getattr(fn, "__name__", None),
+        ) == ("tests.test_executor", "mp_execute")
+        if is_mp_exec and MEMO_REC is None:
+            f._job = (fn, a, k)
+            f._nopickle = True
+            return f
         try:
             payload = pickle.dumps((fn, a, k))
-            if self.input_digest is not None and (getattr(fn, "__module__", None), getattr(fn, "__name__", None)) == ("tests.test_executor", "mp_execute"):
+            if self.input_digest is not None and is_mp_exec:
                 key = (self.input_digest, hashlib.sha256(payload).digest())
-                if FIXTURE_CALLS is not None and key in FIXTURE_CALLS:
-                    f.set_result(pickle.loads(FIXTURE_CALLS[key]))
-                    return f
                 if MEMO_REC is not None:
                     f._record_key = key
             f._job = pickle.loads(payload)
@@ -111,15 +124,17 @@ def _rearm(done=False):
         signal.setitimer(signal.ITIMER_REAL, max(0.05, left if done else min(left, SUBMIT_MAX)), 1.0)
 
 
-# ------------------------------------------------- baseline memo (TPC executor tests)
+# ------------------------------------------------- baseline memo (TPC executor + DuckDB optimizer tests)
 # Built from the pinned commit at image build time (buildmemo.py):
-#   duck: (tpch, duckdb sql) -> reference dataframe     dsql: (tpch, sql) -> duckdb sql
-#   opt:  test id -> {query index -> digest of the optimized expression}
-#   rlines: test id -> {file: lines run outside parse/optimize/transpile}
+#   memo.pkl: dsql, opt, rlines, tpch, tpch_opt_pairs, duck_rows, duck_idx, pool_idx (no pandas!)
+#   memo.bin: raw pickled DataFrames / pool blobs loaded lazily via os.pread
 MEMO = None
-FIXTURE_CALLS = None  # successful pool results from the unmodified checkout
+MEMO_BIN_PATH = None
+_MEMO_BIN_FD = [None]
+_MEMO_DUCK_CACHE: dict = {}
+FIXTURE_CALLS = None  # pool_idx or pool_results dict from the unmodified checkout
 MEMO_IDS: dict = {}     # test number -> test id
-MEMO_DUCK = False       # reuse reference dataframes when the duckdb sql is unchanged
+MEMO_DUCK = False       # reuse reference dataframes / duckdb results when sql is unchanged
 MEMO_SKIP: set = set()  # tests whose queries may skip execution when their plan is unchanged
 MEMO_STAT = [0, 0]      # queries skipped, queries re-run after a reference mismatch
 MEMO_REC = None         # build time: record instead of use
@@ -130,13 +145,58 @@ class _SkipExec(BaseException):
 
 
 def load_memo(path):
-    global MEMO
+    global MEMO, MEMO_BIN_PATH
     try:
         with _orig_open(path, "rb") as fh:
             MEMO = pickle.load(fh)
+        bp = path[:-4] + ".bin" if path.endswith(".pkl") else path + ".bin"
+        MEMO_BIN_PATH = bp if os.path.isfile(bp) else None
     except Exception as e:  # noqa
         MEMO = None
+        MEMO_BIN_PATH = None
         log("memo unavailable", repr(e))
+
+
+def _memo_pread(off, length):
+    fd = _MEMO_BIN_FD[0]
+    if fd is None:
+        if not MEMO_BIN_PATH:
+            return None
+        fd = os.open(MEMO_BIN_PATH, os.O_RDONLY)
+        _MEMO_BIN_FD[0] = fd
+    return os.pread(fd, length, off)
+
+
+def _memo_get_duck(key):
+    df = _MEMO_DUCK_CACHE.get(key)
+    if df is not None:
+        return df.copy()
+    if MEMO is None:
+        return None
+    idx = MEMO.get("duck_idx")
+    if idx is not None:
+        ent = idx.get(key)
+        if ent is None:
+            return None
+        raw = _memo_pread(ent[0], ent[1])
+        if raw is None:
+            return None
+        df = pickle.loads(raw)
+        _MEMO_DUCK_CACHE[key] = df
+        return df.copy()
+    df = MEMO.get("duck", {}).get(key)
+    return df.copy() if df is not None else None
+
+
+def _memo_get_pool(key):
+    if FIXTURE_CALLS is None:
+        return None
+    if isinstance(FIXTURE_CALLS, dict) and MEMO is not None and FIXTURE_CALLS is MEMO.get("pool_idx"):
+        ent = FIXTURE_CALLS.get(key)
+        if ent is None:
+            return None
+        return _memo_pread(ent[0], ent[1])
+    return FIXTURE_CALLS.get(key)
 
 
 from canon import canon, digest  # noqa: E402
@@ -176,9 +236,7 @@ def _memo_cached_execute(self, sql, tpch=True):
         q = T.transpile(sql, write="duckdb")[0]
         df = None
         if MEMO_REC is None and MEMO_DUCK and MEMO is not None:
-            df = MEMO["duck"].get((bool(tpch), q))
-            if df is not None:
-                df = df.copy()
+            df = _memo_get_duck((bool(tpch), q))
         if df is None:
             conn = self.tpch_conn if tpch else self.tpcds_conn
             df = conn.execute(q).fetchdf()
@@ -190,6 +248,112 @@ def _memo_cached_execute(self, sql, tpch=True):
 
 
 _memo_cached_execute._br_memo = True
+
+
+def _memo_test_optimized_tpch(orig):
+    def test_optimized_tpch(self):
+        if MEMO_REC is not None or not MEMO_DUCK or MEMO is None or "tpch_opt_pairs" not in MEMO:
+            return orig(self)
+        pairs = MEMO["tpch_opt_pairs"]
+        T = sys.modules[type(self).__module__]
+        for i, (_, sql, optimized) in enumerate(self.tpch_sqls, start=1):
+            with self.subTest(f"{i}, {sql}"):
+                qa = T.transpile(sql, write="duckdb")[0]
+                qb = T.transpile(optimized, write="duckdb")[0]
+                if pairs.get((sql, optimized)) == (qa, qb):
+                    continue
+                a = self.cached_execute(sql, tpch=True)
+                b = self.tpch_conn.execute(qb).fetchdf()
+                self.rename_anonymous(b, a)
+                T.assert_frame_equal(a, b)
+    test_optimized_tpch._br_memo = True
+    return test_optimized_tpch
+
+
+class _FakeDuckResult:
+    __slots__ = ("_rows",)
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _MemoDuckConn:
+    def __init__(self, real_connect, rows_map):
+        self._connect = real_connect
+        self._rows = rows_map
+        self._stmts = []
+        self._digest = b""
+        self._real = None
+        self._dirty = False
+
+    def _materialize(self):
+        if self._real is None:
+            c = self._connect()
+            for s in self._stmts:
+                c.execute(s)
+            self._real = c
+        return self._real
+
+    def execute(self, sql, *a, **k):
+        if a or k or self._dirty or not isinstance(sql, str):
+            self._dirty = True
+            return self._materialize().execute(sql, *a, **k)
+        s = sql.lstrip().upper()
+        if s.startswith(("CREATE ", "INSERT ")):
+            self._stmts.append(sql)
+            self._digest = hashlib.sha256(self._digest + b"\0" + sql.encode("utf-8")).digest()
+            if self._real is not None:
+                self._real.execute(sql)
+            return self
+        rows = self._rows.get((self._digest, sql))
+        if rows is not None:
+            return _FakeDuckResult(rows)
+        return self._materialize().execute(sql)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def close(self):
+        if self._real is not None:
+            self._real.close()
+            self._real = None
+
+    def __getattr__(self, name):
+        return getattr(self._materialize(), name)
+
+
+class _MemoDuckMod:
+    def __init__(self, real_mod, rows_map):
+        self._real = real_mod
+        self._rows = rows_map
+
+    def connect(self, *a, **k):
+        if not a and not k:
+            return _MemoDuckConn(self._real.connect, self._rows)
+        return self._real.connect(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def install_opt_duck_memo():
+    """Wrap duckdb inside tests.test_optimizer so unchanged DuckDB queries reuse baseline rows."""
+    if MEMO_REC is not None or not MEMO_DUCK or MEMO is None:
+        return
+    rows_map = MEMO.get("duck_rows")
+    if not rows_map:
+        return
+    TO = sys.modules.get("tests.test_optimizer")
+    if TO is None:
+        return
+    if not isinstance(getattr(TO, "duckdb", None), _MemoDuckMod):
+        TO.duckdb = _MemoDuckMod(TO.duckdb, rows_map)
 
 
 MEMO_T = [0.0, 0.0, 0.0]    # seconds: reference-query check, submitted calls, of which optimize
@@ -217,17 +381,50 @@ def _memo_duck_same0(n):
         return False
 
 
+def _memo_mp_execute(orig):
+    def _mp_execute(self, schema, tables, sqls, tpch):
+        if MEMO_REC is None and FIXTURE_CALLS is not None and MEMO is not None:
+            base = MEMO.get("base_sqls", {}).get(bool(tpch))
+            if base is not None:
+                changed = [
+                    (i, args, sql)
+                    for i, (args, sql, _) in enumerate(sqls)
+                    if (sql, repr(sorted(args.items()))) not in base
+                ]
+                if not changed:
+                    return
+                T = sys.modules[type(self).__module__]
+                with T.ProcessPoolExecutor(
+                    mp_context=T.get_context("spawn"),
+                    initializer=T.initializer,
+                    initargs=(schema, tables),
+                ) as pool:
+                    futures = [(i, pool.submit(T.mp_execute, T.parse_one(sql), args)) for i, args, sql in changed]
+                    for i, future in futures:
+                        table = future.result()
+                        if table is not None:
+                            self.subtestHelper(i, table, tpch=tpch)
+                return
+        return orig(self, schema, tables, sqls, tpch)
+    _mp_execute._br_memo = True
+    return _mp_execute
+
+
 def install_memo():
     """(Re)install the wrappers on the currently imported modules."""
     try:
         T = sys.modules.get("tests.test_executor")
         E = sys.modules.get("sqlglot.executor")
-        if T is None or E is None:
-            return
-        if not getattr(T.TestExecutor.__dict__.get("cached_execute"), "_br_memo", False):
-            T.TestExecutor.cached_execute = _memo_cached_execute
-        if not getattr(E.optimize, "_br_memo", False):
-            E.optimize = _memo_optimize(E.optimize)
+        if T is not None:
+            if not getattr(T.TestExecutor.__dict__.get("cached_execute"), "_br_memo", False):
+                T.TestExecutor.cached_execute = _memo_cached_execute
+            if not getattr(T.TestExecutor.__dict__.get("test_optimized_tpch"), "_br_memo", False):
+                T.TestExecutor.test_optimized_tpch = _memo_test_optimized_tpch(T.TestExecutor.test_optimized_tpch)
+            if not getattr(T.TestExecutor.__dict__.get("_mp_execute"), "_br_memo", False):
+                T.TestExecutor._mp_execute = _memo_mp_execute(T.TestExecutor._mp_execute)
+        if E is not None:
+            if not getattr(E.optimize, "_br_memo", False):
+                E.optimize = _memo_optimize(E.optimize)
     except Exception as e:  # noqa
         log("memo install failed", repr(e))
 SUBMIT_LAZY: set = set()  # tests that only read futures one by one via .result()
@@ -238,6 +435,7 @@ class _LazyFuture(_cf.Future):
     running test has a failing subtest, later calls are skipped (the test fails anyway)."""
     _job = None
     _record_key = None
+    _nopickle = False
 
     def _run(self):
         job, self._job = self._job, None
@@ -252,10 +450,14 @@ class _LazyFuture(_cf.Future):
         t0 = time.process_time()
         try:
             try:
-                result = pickle.dumps(fn(*a, **k))
-                if self._record_key is not None:
-                    MEMO_REC["pool_results"][self._record_key] = result
-                self.set_result(pickle.loads(result))
+                res = fn(*a, **k)
+                if self._nopickle:
+                    self.set_result(res)
+                else:
+                    result = pickle.dumps(res)
+                    if self._record_key is not None:
+                        MEMO_REC["pool_results"][self._record_key] = result
+                    self.set_result(pickle.loads(result))
             except _SkipExec:
                 if _memo_duck_same(self._n):
                     MEMO_STAT[0] += 1
@@ -263,7 +465,8 @@ class _LazyFuture(_cf.Future):
                 else:
                     MEMO_STAT[1] += 1
                     _SUB["cur"] = None
-                    self.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                    res = fn(*a, **k)
+                    self.set_result(res if self._nopickle else pickle.loads(pickle.dumps(res)))
         except BaseException as e:  # noqa
             self.set_exception(e)
         finally:
@@ -371,12 +574,20 @@ class _LazyConn:
         return getattr(self._br_conn(), name)
 
 
-def _lazyconn_restore(stmts):
+def _duckdb_connect():
     import duckdb
-    c = _LazyConn(duckdb.connect)
+    return duckdb.connect()
+
+
+def _lazyconn_restore(stmts):
+    c = _LazyConn(_duckdb_connect)
     c._br_stmts = list(stmts)
     c._br_setup = False
     return c
+
+
+PRESET_ATTRS: dict = {}  # "mod.Cls" -> saved attrs dict for overlay reuse
+OV_EXEC_PRESET = [False, False]  # [enabled, reload_sqls]
 
 
 def prebuild_class(modname, clsname, cache=None):
@@ -384,7 +595,6 @@ def prebuild_class(modname, clsname, cache=None):
     `cache`: a pickle of the resulting class attributes made at image build time from
     the same pinned checkout (prep.py); loading it replaces the run."""
     try:
-        import duckdb
         C = getattr(sys.modules[modname], clsname)
         orig = C.__dict__["setUpClass"]
         if cache and os.environ.get("BR_PREP") != "1":
@@ -394,9 +604,11 @@ def prebuild_class(modname, clsname, cache=None):
                 for k, v in saved["attrs"].items():
                     setattr(C, k, v)
                 PRESETS[C] = (saved["lines"], orig)
+                PRESET_ATTRS[f"{modname}.{clsname}"] = dict(saved["attrs"])
                 return True
             except Exception:  # noqa
                 pass
+        import duckdb
         before = dict(vars(C))
         real_connect = duckdb.connect
         conns = []
@@ -434,8 +646,9 @@ def prebuild_class(modname, clsname, cache=None):
         for c in conns:
             c._br_setup = False
         PRESETS[C] = (lines, orig)
+        attrs = {k: v for k, v in vars(C).items() if k not in before or before[k] is not v}
+        PRESET_ATTRS[f"{modname}.{clsname}"] = dict(attrs)
         if cache and os.environ.get("BR_PREP") == "1":
-            attrs = {k: v for k, v in vars(C).items() if k not in before or before[k] is not v}
             with _orig_open(cache, "wb") as fh:
                 pickle.dump({"attrs": attrs, "lines": lines}, fh, protocol=5)
         return True
@@ -445,10 +658,20 @@ def prebuild_class(modname, clsname, cache=None):
         return False
 
 
-def apply_presets(ok, lines_by_file):
+def apply_presets(ok, lines_by_file, sql_only=False):
     """In a child: keep the shared setup of each class if the patch cannot have changed it."""
     kept = 0
     for C, (lines, orig) in PRESETS.items():
+        if sql_only and C.__name__ == "TestExecutor":
+            T = sys.modules.get("tests.test_executor")
+            if T is not None:
+                def _reload_sqls(cls, _T=T):
+                    cls.cache = {}
+                    cls.tpch_sqls = list(_T.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+                    cls.tpcds_sqls = list(_T.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+                C.setUpClass = classmethod(_reload_sqls)
+                kept += 1
+                continue
         valid = ok
         if valid:
             for f, ls in (lines_by_file or {}).items():
@@ -459,6 +682,91 @@ def apply_presets(ok, lines_by_file):
             C.setUpClass = classmethod(lambda cls: None)
             kept += 1
     return kept
+
+
+def apply_overlay_executor_preset(reload_sqls=False):
+    """After an overlay re-import where sqlglot.executor.table did not change:
+    reuse the zygote's prebuilt TPC tables/connections by rebinding Table.__class__."""
+    try:
+        attrs = PRESET_ATTRS.get("tests.test_executor.TestExecutor")
+        if not attrs:
+            return False
+        T = sys.modules.get("tests.test_executor")
+        if T is None:
+            return False
+        C = T.TestExecutor
+        if C.__dict__.get("_br_ov_preset"):
+            return True
+        ET = sys.modules.get("sqlglot.executor.table") or importlib.import_module("sqlglot.executor.table")
+        new_Table = ET.Table
+        for k, v in attrs.items():
+            setattr(C, k, {} if k == "cache" else v)
+        for tdict in (C.tpch_tables, C.tpcds_tables):
+            for tbl in tdict.values():
+                tbl.__class__ = new_Table
+        if reload_sqls:
+            def _reload_sqls(cls, _T=T):
+                cls.cache = {}
+                cls.tpch_sqls = list(_T.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+                cls.tpcds_sqls = list(_T.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            C.setUpClass = classmethod(_reload_sqls)
+        else:
+            C.setUpClass = classmethod(lambda cls: None)
+        C._br_ov_preset = True
+        return True
+    except Exception:  # noqa
+        return False
+
+
+FIXTURE_SQL_ONLY = False
+
+
+def install_fixture_sql_filter(mod):
+    """When only existing tests/fixtures/*.sql changed, skip entries unchanged from baseline."""
+    if not FIXTURE_SQL_ONLY:
+        return
+    m = sys.modules.get(mod)
+    H = sys.modules.get("tests.helpers")
+    if m is None or H is None:
+        return
+    orig_pairs = getattr(m, "load_sql_fixture_pairs", None)
+    if orig_pairs is not None and not getattr(orig_pairs, "_br_fx", False):
+        def filtered_pairs(filename, _orig=orig_pairs, _H=H):
+            p = os.path.realpath(os.path.join(_H.FIXTURES_DIR, filename))
+            if p not in _redirect:
+                return
+            saved = dict(_redirect)
+            _redirect.clear()
+            try:
+                base = {(repr(sorted(meta.items())), sql, exp) for meta, sql, exp in _orig(filename)}
+            except FileNotFoundError:
+                base = set()
+            finally:
+                _redirect.update(saved)
+            for meta, sql, exp in _orig(filename):
+                if (repr(sorted(meta.items())), sql, exp) not in base:
+                    yield meta, sql, exp
+        filtered_pairs._br_fx = True
+        m.load_sql_fixture_pairs = filtered_pairs
+    orig_single = getattr(m, "load_sql_fixtures", None)
+    if orig_single is not None and not getattr(orig_single, "_br_fx", False):
+        def filtered_single(filename, _orig=orig_single, _H=H):
+            p = os.path.realpath(os.path.join(_H.FIXTURES_DIR, filename))
+            if p not in _redirect:
+                return
+            saved = dict(_redirect)
+            _redirect.clear()
+            try:
+                base = set(_orig(filename))
+            except FileNotFoundError:
+                base = set()
+            finally:
+                _redirect.update(saved)
+            for sql in _orig(filename):
+                if sql not in base:
+                    yield sql
+        filtered_single._br_fx = True
+        m.load_sql_fixtures = filtered_single
 
 
 class _AbortTest(Exception):
@@ -553,6 +861,28 @@ class NeedReimport(Exception):
 
 DIFF_HITS: dict = {}
 DIFF_BAD: set = set()
+_UNINSTR: list = []          # [(func_obj, clean_new_code), ...] for instant un-instrumentation
+_OLD_CODES_CACHE: dict = {}  # rel -> compiled old_codes list (cached in zygote)
+
+
+def precompile_old(rel, src):
+    """Compile baseline source once in the zygote when multiple hot jobs edit the same file."""
+    if rel not in _OLD_CODES_CACHE:
+        path = os.path.join(REPO, rel)
+        try:
+            _OLD_CODES_CACHE[rel] = _walk_codes(compile(src, path, "exec", dont_inherit=True), [])
+        except Exception:  # noqa
+            pass
+
+
+def _uninstrument():
+    if _UNINSTR:
+        for obj, clean_code in _UNINSTR:
+            try:
+                obj.__code__ = clean_code
+            except Exception:  # noqa
+                pass
+        _UNINSTR.clear()
 
 
 def _br_d(k, fo, fn, b):
@@ -564,6 +894,7 @@ def _br_d(k, fo, fn, b):
         o = fo()
     except BaseException:  # noqa
         DIFF_BAD.add(k)
+        _uninstrument()
         return v
     try:
         if b:
@@ -574,6 +905,7 @@ def _br_d(k, fo, fn, b):
         same = False
     if not same:
         DIFF_BAD.add(k)
+        _uninstrument()
     return v
 
 
@@ -585,7 +917,9 @@ def hot_patch(rel, old_src, new_src, instr_tree=None):
     instrumented version (old and new expression evaluated side by side).
     Returns (swapped, instrumented: bool)."""
     path = os.path.join(REPO, rel)
-    old_codes = _walk_codes(compile(old_src, path, "exec", dont_inherit=True), [])
+    old_codes = _OLD_CODES_CACHE.get(rel)
+    if old_codes is None:
+        old_codes = _walk_codes(compile(old_src, path, "exec", dont_inherit=True), [])
     new_codes = _walk_codes(compile(new_src, path, "exec", dont_inherit=True), [])
     if len(old_codes) != len(new_codes):
         raise NeedReimport("code count differs")
@@ -599,6 +933,7 @@ def hot_patch(rel, old_src, new_src, instr_tree=None):
             pairs[o] = n
     if not pairs:
         return 0, False
+    clean_pairs = pairs
     instrumented = False
     if instr_tree is not None:
         try:
@@ -624,11 +959,56 @@ def hot_patch(rel, old_src, new_src, instr_tree=None):
     if funcs is None:
         funcs = [o for o in gc.get_objects() if type(o) is types.FunctionType and o.__code__.co_filename == path]
     for obj in funcs:
-        n = pairs.get(obj.__code__)
+        oc = obj.__code__
+        n = pairs.get(oc)
         if n is not None:
+            if instrumented:
+                _UNINSTR.append((obj, clean_pairs[oc]))
             obj.__code__ = n
             swapped += 1
     return swapped, instrumented
+
+
+GEN_MEM_MODS = None  # set of affected dialect/generator/parser modules for test_generator_memory
+
+
+def install_gen_mem_filter():
+    """For leaf dialect/generator edits, filter Dialects in test_generator_memory to only
+    dialects whose class hierarchy touches an affected module."""
+    if not GEN_MEM_MODS:
+        return
+    TG = sys.modules.get("tests.test_generator")
+    if TG is None:
+        return
+    cls = getattr(TG, "TestGenerator", None)
+    if cls is None or getattr(cls.__dict__.get("test_generator_memory"), "_br_gmf", False):
+        return
+    orig = cls.test_generator_memory
+
+    def filtered(self):
+        orig_dialects = TG.Dialects
+        mods = GEN_MEM_MODS
+        keep = []
+        for name in orig_dialects:
+            d = TG.Dialect.get_or_raise(name)
+            dc = d if isinstance(d, type) else type(d)
+            mro = dc.__mro__
+            for attr in ("generator_class", "parser_class", "tokenizer_class"):
+                sub = getattr(d, attr, None)
+                if isinstance(sub, type):
+                    mro = mro + sub.__mro__
+            if any(getattr(c, "__module__", None) in mods for c in mro):
+                keep.append(name)
+        if not keep:
+            return
+        TG.Dialects = keep
+        try:
+            return orig(self)
+        finally:
+            TG.Dialects = orig_dialects
+
+    filtered._br_gmf = True
+    cls.test_generator_memory = filtered
 
 
 FUNC_MAP = None
@@ -850,6 +1230,14 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, 
         except BaseException:  # noqa
             failed.update(t for t, _ in items)
             continue
+        if mod == "tests.test_optimizer":
+            install_opt_duck_memo()
+        elif mod == "tests.test_executor" and OV_EXEC_PRESET[0]:
+            apply_overlay_executor_preset(OV_EXEC_PRESET[1])
+        elif mod == "tests.test_generator" and GEN_MEM_MODS:
+            install_gen_mem_filter()
+        if FIXTURE_SQL_ONLY and mod in ("tests.test_optimizer", "tests.test_serde", "tests.test_transpile"):
+            install_fixture_sql_filter(mod)
         _once_fixtures(C)
         suite = unittest.TestSuite()
         for t, meth in items:

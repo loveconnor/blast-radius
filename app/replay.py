@@ -119,11 +119,13 @@ _DIALECTS: dict = {}
 
 
 def _dialect(key):
-    d = json.dumps(key[1:6], sort_keys=True)
+    s = key[5]
+    d = (key[1], key[2], tuple(key[3]) if key[3] is not None else None, key[4],
+         tuple(sorted(s.items())) if s else ())
     inst = _DIALECTS.get(d)
     if inst is None:
         cls = _resolve(key[1], key[2])
-        kw = dict(key[5])
+        kw = dict(s)
         if key[3] is not None:
             kw["version"] = ".".join(str(x) for x in key[3])
         if key[4] is not None:
@@ -145,12 +147,32 @@ class _Logs(logging.Handler):
 
 
 _LOGGER = logging.getLogger("sqlglot")
+_BATCH_LOG = [None]
+_sha1 = hashlib.sha1
+
+
+def begin_batch():
+    h = _Logs()
+    _LOGGER.addHandler(h)
+    _BATCH_LOG[0] = h
+
+
+def end_batch():
+    h = _BATCH_LOG[0]
+    _BATCH_LOG[0] = None
+    if h is not None:
+        _LOGGER.removeHandler(h)
 
 
 def observe(fn):
     """Run fn() and digest everything observable about it. Returns (digest, result, exc)."""
-    h = _Logs()
-    _LOGGER.addHandler(h)
+    bh = _BATCH_LOG[0]
+    if bh is not None:
+        h = bh
+        h.records.clear()
+    else:
+        h = _Logs()
+        _LOGGER.addHandler(h)
     res = exc = None
     try:
         res = fn()
@@ -165,9 +187,10 @@ def observe(fn):
         out = ("EXC", type(e).__qualname__, sorted(str(e).split("\n\n")),
                sorted(repr(runner.canon(x)) for x in errs) if isinstance(errs, list) else runner.canon(errs))
     finally:
-        _LOGGER.removeHandler(h)
+        if bh is None:
+            _LOGGER.removeHandler(h)
     try:
-        dig = hashlib.sha1(repr((out, h.records)).encode("utf-8", "replace")).hexdigest()[:16]
+        dig = _sha1(repr((out, h.records)).encode("utf-8", "replace")).hexdigest()[:16]
     except RecursionError:
         dig = None
     return dig, res, exc
@@ -176,15 +199,37 @@ def observe(fn):
 _PCACHE: dict = {}   # parse results reused by the generate inputs recorded after them
 
 
+def _freeze(x):
+    if type(x) is list:
+        return tuple(_freeze(i) for i in x)
+    if type(x) is dict:
+        return tuple(sorted((k, _freeze(v)) for k, v in x.items()))
+    return x
+
+
+def _pkey(key):
+    s = key[5]
+    opts = key[7]
+    into = key[8]
+    return (key[0], key[1], key[2], tuple(key[3]) if key[3] is not None else None, key[4],
+            tuple(sorted(s.items())) if s else (), key[6],
+            _freeze(opts) if opts else (), _freeze(into) if into is not None else None)
+
+
 def _parse_key(key):
     d = _dialect(key)
-    opts = {k: _dec(v) for k, v in key[7]}
+    k7 = key[7]
+    if k7:
+        opts = {k: _dec(v) for k, v in k7}
+        if key[0] == "p":
+            return d.parse(key[6], **opts)
+        return d.parse_into(_dec(key[8]), key[6], **opts)
     if key[0] == "p":
-        return d.parse(key[6], **opts)
-    return d.parse_into(_dec(key[8]), key[6], **opts)
+        return d.parse(key[6])
+    return d.parse_into(_dec(key[8]), key[6])
 
 
-def run_key(key):
+def run_key(key, cache_parse=True):
     """Replay one recorded phase call under the current code; returns its digest."""
     if key[0] == "g":
         src, idx = key[6]
@@ -195,7 +240,7 @@ def run_key(key):
             except Exception:  # noqa
                 return None
         else:
-            sk = json.dumps(src)
+            sk = _pkey(src)
             res = _PCACHE.get(sk) if copy else None
             if res is None:
                 try:
@@ -211,13 +256,39 @@ def run_key(key):
             except Exception:  # noqa
                 return None
         d = _dialect(key)
-        opts = {k: _dec(v) for k, v in key[7]}
+        k7 = key[7]
+        opts = {k: _dec(v) for k, v in k7} if k7 else {}
         return observe(lambda: ("G", d.generate(tree, copy=copy, **opts), None if copy else runner.canon(tree)))[0]
-    dig, res, exc = observe(lambda: _parse_key(key))
-    if exc is None:
+    bh = _BATCH_LOG[0]
+    if bh is not None:
+        h = bh
+        h.records.clear()
+    else:
+        h = _Logs()
+        _LOGGER.addHandler(h)
+    res = exc = None
+    try:
+        res = _parse_key(key)
+        out = ("OK", runner.canon(res))
+    except RecursionError as e:
+        exc = e
+        out = ("REC",)
+    except Exception as e:  # noqa
+        exc = e
+        errs = getattr(e, "errors", None)
+        out = ("EXC", type(e).__qualname__, sorted(str(e).split("\n\n")),
+               sorted(repr(runner.canon(x)) for x in errs) if isinstance(errs, list) else runner.canon(errs))
+    finally:
+        if bh is None:
+            _LOGGER.removeHandler(h)
+    try:
+        dig = _sha1(repr((out, h.records)).encode("utf-8", "replace")).hexdigest()[:16]
+    except RecursionError:
+        dig = None
+    if exc is None and cache_parse:
         if len(_PCACHE) > 512:
             _PCACHE.clear()
-        _PCACHE[json.dumps(key)] = res
+        _PCACHE[_pkey(key)] = res
     return dig
 
 

@@ -13,6 +13,7 @@ Anything that goes wrong for a commit falls back to the static candidates.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import resource
@@ -162,7 +163,7 @@ def supervise():
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     nodeids = [t["id"] for t in tests]
-    ms = [round(t["seconds"] * 1000) for t in tests]
+    ms = [math.floor(t["seconds"] * 1000 + 0.5) for t in tests]
     patches = sorted((DATA / "commits").glob("*.patch"))
     n_commits = len(patches)
     deadline = min(T_START + max(25.0, SECONDS_PER_COMMIT * n_commits), T_START + WALL_MAX - 12.0)
@@ -242,7 +243,8 @@ def main():
                 answers[cid] = sorted(all_tests)
             instr = {}
             n_sites = 0
-            if not D.import_change and len(hot) == 1 and all(r.endswith(".py") for r in D.files):
+            if not D.import_change and len(hot) == 1 and all(r.endswith(".py") for r in D.files) \
+                    and (len(cands) >= 6 or any(CPU["test"].get(str(t), ms[t] / 1000.0) >= 0.4 for t in cands)):
                 from patchlib import instrument
                 for r in hot:
                     try:
@@ -273,10 +275,24 @@ def main():
                 opt_aff = opt_affected(D.ch_lines)
                 opt_cpu(opt_aff, cands)
             memo_skip = []
-            if memo_duck and any(t in D.cands for t in memo_ids(nodeids)):
-                if not D.import_change:
+            fixture_sql_only = (
+                not D.import_change and bool(D.files)
+                and all(f.startswith("tests/fixtures/") and f.endswith(".sql") and c is not None
+                        for f, c in D.files.items())
+            )
+            if memo_duck:
+                if not D.import_change and any(t in D.cands for t in memo_ids(nodeids)):
                     memo_skip = memo_skippable(ch_lines, nodeids)
-                memo_cpu(memo_skip, nodeids, subf)
+                memo_cpu(memo_skip, nodeids, subf, opt_aff,
+                         fixture_sql_only=(not D.import_change and not any((ch_lines or {}).values())))
+            if fixture_sql_only:
+                mids = memo_ids(nodeids)
+                for t in cands:
+                    if t not in mids:
+                        cur = CPU_OVR.get(t, CPU["test"].get(str(t), 1.0))
+                        CPU_OVR[t] = min(cur, 0.08)
+            if pure_src and _is_leaf_dialect_edit(D.files):
+                _gen_mem_cpu(nodeids)
             if D.import_change:
                 # decided in the child once the import-time state diff is known; the static
                 # candidates are no safe answer for such a change, so if the child cannot
@@ -284,13 +300,15 @@ def main():
                 answers[cid] = sorted(all_tests)
                 light, heavy = [], []
             else:
-                light, heavy, est_run, static_cost = plan_split(cands, ms, CPU, False, bool(instr))
+                ovh = OVERHEAD_FIXTURE if not hot else None
+                light, heavy, est_run, static_cost = plan_split(cands, ms, CPU, False, bool(instr), overhead=ovh)
             if light and not D.import_change and len(cands) == 1 and \
                     all(r.split(" ", 1)[0] in ("fixture", "ast-same", "annotation", "ignored", "fixture-unused")
                         for r in D.reasons):
                 # a lone test reading an edited fixture nearly always fails: running it
                 # only pays when it is cheap next to the chance of dropping it
-                if cpu_of(cands[0], ms) + OVERHEAD_HOT > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
+                ovh_fx = OVERHEAD_FIXTURE if not hot else OVERHEAD_HOT
+                if cpu_of(cands[0], ms) + ovh_fx > (1.0 - FIX_PFAIL) * static_cost / 1000.0:
                     light, heavy = [], cands
             force = False
             if pure_src and not D.import_change and not light and len(cands) >= 2:
@@ -304,6 +322,7 @@ def main():
                 cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change),
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
+                fixture_sql_only=fixture_sql_only,
                 precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
                 reasons=" ".join(D.reasons)[:200],
             ))
@@ -355,6 +374,7 @@ except Exception:  # noqa
     _cpu = {"test": {}, "class": {}}
 CPU = _cpu
 OVERHEAD_HOT = float(os.environ.get("BR_OVH_HOT", "0.25"))
+OVERHEAD_FIXTURE = float(os.environ.get("BR_OVH_FIX", "0.03"))
 OVERHEAD_OVERLAY = float(os.environ.get("BR_OVH_OV", "2.0"))
 FAIL_PENALTY = float(os.environ.get("BR_FAIL_PEN", "1.5"))
 
@@ -445,7 +465,7 @@ def opt_cpu(aff, cands):
             _OPT_FRAC = {int(t): f for t, f in json.loads(OPT_FRAC_PATH.read_text()).items()}
         except Exception:  # noqa
             _OPT_FRAC = {}
-    save = 0.8 if aff else 0.95
+    save = 0.35 if aff else 0.90
     for t in cands:
         f = _OPT_FRAC.get(t)
         if f:
@@ -568,14 +588,16 @@ def iter_cpu(iterf):
         base = CPU["test"].get(str(t))
         if base is not None:
             n = tests_meta.get(t, (1,))[0]
-            CPU_OVR[t] = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, n))
+            est = base * (ITER_BASE + (1 - ITER_BASE) * len(allow) / max(1, n))
+            cur = CPU_OVR.get(t)
+            CPU_OVR[t] = min(cur, est) if cur is not None else est
 
 
 
 REPLAY_PATH = Path(os.environ.get("BR_REPLAY", HERE / "replay.json.gz"))
 REPLAY_ON = os.environ.get("BR_REPLAY_ON", "1") == "1"
 REPLAY_FACTOR = float(os.environ.get("BR_REPLAY_FACTOR", "0.9"))  # recorded seconds -> cpu here
-REPLAY_FRAC = float(os.environ.get("BR_REPLAY_FRAC", "0.6"))
+REPLAY_FRAC = float(os.environ.get("BR_REPLAY_FRAC", "0.75"))
 REPLAY_BOUND_DIV = float(os.environ.get("BR_REPLAY_BOUND_DIV", "1.15"))
 REPLAY_MAX = float(os.environ.get("BR_REPLAY_MAX", "18"))
 _REPLAY = None
@@ -693,10 +715,14 @@ def _attr_mask(R, attrs):
     return mask
 
 
+REPLAY_HIT: set = set()  # tests kept specifically because a recorded phase input changed
+
+
 def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False, attrs=None,
                   disp=False):
     """Replay the recorded phase inputs under the patched code; drop the candidates whose
     inputs all still produce their baseline output. Returns (candidates, note)."""
+    REPLAY_HIT.clear()
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
     if len(inside) < 2:
         return cands, ""
@@ -739,14 +765,22 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             if len(inside) < 2:
                 return cands, ""
     ins0 = set(inside)
+    # tests with 0 masked keys in pure mode never enter any changed function: drop for free
+    cleared = {t for t in inside if not tkeys[t]}
+    todo_tests = [t for t in inside if t not in cleared]
     # what replay can buy: cpu of the tests that would otherwise be run, or the
     # schedule time freed if every replayed test turns out unaffected
     would_run = ins0 if light0 is None else ins0.intersection(light0)
     worth = sum(cpu_of(t, ms) for t in would_run)
     rest = [t for t in cands if t not in ins0]
     bound = (schedule_cost(cands, ms)[1] - (schedule_cost(rest, ms)[1] if rest else 0)) / 1000.0
-    if est > REPLAY_MAX or est > max(0.2, REPLAY_FRAC * worth, bound / REPLAY_BOUND_DIV):
-        return cands, f" replay-skip(est={est:.1f} worth={worth:.1f} bound={bound:.1f})"
+    max_budget = min(REPLAY_MAX, max(0.3, REPLAY_FRAC * worth, bound / REPLAY_BOUND_DIV))
+    if not todo_tests:
+        out = [t for t in cands if t not in cleared]
+        return out, f" replay(free={len(cleared)} kept={len(out)}/{len(cands)})"
+    if max_budget <= 0.05:
+        out = [t for t in cands if t not in cleared]
+        return out, f" replay-skip(est={est:.1f} worth={worth:.1f} bound={bound:.1f})"
     import replay
     t0 = time.time()
     c0 = time.process_time()
@@ -766,57 +800,133 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             log("REPLAYDEBUG", dt, "in_cands", dt in cands, "inside", dt in inside, "bad", dt in R["bad"], "keys", len(allk),
                 "masked", None if mk is None else len(mk), "changed(all keys)", res[:6])
     signal.signal(signal.SIGALRM, runner._alarm)
-    limit = t0 + 3.0 * est + 5.0
+    limit = t0 + max(5.0, min(3.0 * max_budget + 4.0, 25.0))
     state = {}   # key -> True when its output differs from the baseline
     n_changed = 0
-    ins = set(inside)
+    n_hangs = 0
     kept = set()
     kms = R["ms"]
-    # a test is affected as soon as one of its inputs differs, so its other inputs are
-    # not replayed; tests with few inputs go first (their results are shared)
-    for t in sorted(inside, key=lambda t: len(tkeys[t])):
-        hit = False
-        ks = tkeys[t]
-        for k in ks:
-            if state.get(k):
-                hit = True
-                break
-        if not hit:
-            for k in sorted((k for k in ks if k not in state), key=kms.__getitem__):
-                if time.time() > limit:
-                    return cands, " replay-abort(slow)"
-                # a patched parser may loop forever on an input: the tests would hang the
-                # same way, so nothing more is replayed or run and every candidate stays
-                signal.setitimer(signal.ITIMER_REAL, max(KEY_T_MIN, kms[k] / 1000.0 * 30))
+    rkeys = R["keys"]
+    rdig = R["dig"]
+    has_gen = any(rkeys[k][0] == "g" for k in keys)
+    # Order by value per estimated replay cost so heavy tests clear first even under tight caps.
+    t_val = {}
+    t_est0 = {}
+    for t in todo_tests:
+        t_est0[t] = sum(kms[k] for k in tkeys[t]) / 1000.0 * REPLAY_FACTOR
+        v = ms[t] / 1000.0
+        if light0 is None or t in light0:
+            v = max(v, cpu_of(t, ms))
+        t_val[t] = v
+    order = sorted(todo_tests, key=lambda t: (-t_val[t] / max(t_est0[t], 0.002), len(tkeys[t])))
+    undecided = len(order)
+    aborted = ""
+    replay.begin_batch()
+    try:
+        for t in order:
+            undecided -= 1
+            ks = tkeys[t]
+            hit = False
+            for k in ks:
+                if state.get(k):
+                    hit = True
+                    break
+            if hit:
+                kept.add(t)
+                REPLAY_HIT.add(t)
+                continue
+            unseen = [k for k in ks if k not in state]
+            if not unseen:
+                cleared.add(t)
+                continue
+            cpu_used = time.process_time() - c0
+            if cpu_used >= max_budget or time.time() > limit:
+                aborted = "cap" if cpu_used >= max_budget else "slow"
+                kept.add(t)
+                continue
+            new_est = sum(kms[k] for k in unseen) / 1000.0 * REPLAY_FACTOR
+            t_worth = t_val[t]
+            if not rest and not kept:
+                t_worth += 2.0 / max(1, undecided + 1)
+            if est > max_budget and new_est > max(0.04, t_worth * 0.90):
+                kept.add(t)
+                continue
+            unseen.sort(key=kms.__getitem__)
+            changed_hit = False
+            fast_cnt = 0
+            timer_armed = False
+            for idx_k, k in enumerate(unseen):
+                if (idx_k & 7) == 0:
+                    if time.time() > limit or (time.process_time() - c0) >= max_budget * 1.15:
+                        aborted = "slow"
+                        hit = True
+                        break
+                km = kms[k]
+                if km < 10:
+                    if not timer_armed or fast_cnt >= 8:
+                        signal.setitimer(signal.ITIMER_REAL, KEY_T_MIN)
+                        timer_armed = True
+                        fast_cnt = 0
+                    fast_cnt += 1
+                else:
+                    signal.setitimer(signal.ITIMER_REAL, max(KEY_T_MIN, km / 1000.0 * 15.0))
+                    timer_armed = True
+                    fast_cnt = 8
                 try:
-                    ch = replay.run_key(R["keys"][k]) != R["dig"][k]
+                    ch = replay.run_key(rkeys[k], cache_parse=has_gen) != rdig[k]
                 except runner.Timeout:
-                    HANG[0] = True
-                    return cands, " replay-abort(hang)"
+                    ch = True
+                    n_hangs += 1
+                    timer_armed = False
+                    fast_cnt = 0
                 except BaseException:  # noqa
                     ch = True
-                finally:
-                    signal.setitimer(signal.ITIMER_REAL, 0)
                 state[k] = ch
                 if ch:
                     n_changed += 1
                     hit = True
+                    changed_hit = True
                     break
-        if hit:
-            kept.add(t)
-    out = [t for t in cands if t not in ins or t in kept]
+            if timer_armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            if hit:
+                kept.add(t)
+                if changed_hit:
+                    REPLAY_HIT.add(t)
+            else:
+                cleared.add(t)
+            if n_hangs >= 2:
+                HANG[0] = True
+                aborted = "hang"
+                break
+        if n_hangs >= 1 and aborted in ("cap", "slow"):
+            HANG[0] = True
+            aborted = "hang"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        replay.end_batch()
+    out = [t for t in cands if t not in cleared]
     PROF["replay"] = PROF.get("replay", 0.0) + time.process_time() - c0
+    ab = f" abort={aborted}" if aborted else ""
     return out, (f" replay(tests={len(inside)} keys={len(state)}/{len(keys)} changed={n_changed} "
-                 f"kept={len(out)}/{len(cands)} {time.time() - t0:.2f}s est={est:.1f})")
+                 f"kept={len(out)}/{len(cands)} {time.time() - t0:.2f}s est={est:.1f}{ab})")
 
 
 MEMO_PATH = Path(os.environ.get("BR_MEMO", HERE / "memo.pkl"))
 MEMO_LITE_PATH = Path(os.environ.get("BR_MEMO_LITE", HERE / "memo_lite.pkl"))
 CHEAP_MARGIN = float(os.environ.get("BR_CHEAP_MARGIN", "3.0"))
-C_SKIP = float(os.environ.get("BR_C_SKIP", "5.0"))        # cpu of a TPC run that executes no query
+C_SKIP = float(os.environ.get("BR_C_SKIP", "4.0"))        # cpu of a TPC run that executes no query
 DUCK_FRAC = float(os.environ.get("BR_DUCK_FRAC", "0.55"))  # share of TPC cpu left once references are reused
 _MEMO_IDS = None
 _MEMO_LITE = None
+_NODEID_POS = None
+
+
+def _nodeid_pos(nodeids):
+    global _NODEID_POS
+    if _NODEID_POS is None:
+        _NODEID_POS = {n: i for i, n in enumerate(nodeids)}
+    return _NODEID_POS
 
 
 def _memo_lite():
@@ -849,7 +959,7 @@ def memo_ids(nodeids):
         ml = _memo_lite()
         _MEMO_IDS = {}
         if ml is not None:
-            pos = {n: i for i, n in enumerate(nodeids)}
+            pos = _nodeid_pos(nodeids)
             _MEMO_IDS = {pos[tid]: tid for tid in ml.get("rlines", {}) if tid in pos}
         try:
             import runner
@@ -875,24 +985,95 @@ def memo_skippable(ch_lines, nodeids):
     return out
 
 
-def memo_cpu(memo_skip, nodeids, subf=None):
+def memo_cpu(memo_skip, nodeids, subf=None, opt_aff=None, fixture_sql_only=False):
     ml = _memo_lite()
     if ml is None:
         return
+    pos = _nodeid_pos(nodeids)
+    opt_on = opt_aff is not None and 0 not in opt_aff
+    tpch_opt_tid = ml.get("tpch_opt_tid", "tests/test_executor.py::TestExecutor::test_optimized_tpch")
     for t, tid in memo_ids(nodeids).items():
         base = CPU["test"].get(str(t))
         if base is None:
             continue
-        if t in memo_skip:
-            CPU_OVR[t] = min(C_SKIP, base)
+        cur = CPU_OVR.get(t, base)
+        if tid == tpch_opt_tid:
+            CPU_OVR[t] = min(cur, 0.08)
+        elif fixture_sql_only:
+            CPU_OVR[t] = min(cur, 0.25)
+        elif t in memo_skip:
+            # execution + duckdb are skipped; only parse/optimize/transpile runs
+            skip_est = min(C_SKIP, base * 0.25)
+            if subf and t in subf:
+                n = _submap().get(t, (1,))[0]
+                skip_est *= (SUB_BASE + (1.0 - SUB_BASE) * len(subf[t]) / max(1, n))
+            if opt_on:
+                skip_est = max(0.15, skip_est * (0.25 if opt_aff else 0.10))
+            CPU_OVR[t] = min(cur, skip_est)
         elif ml.get("opt", {}).get(tid):
-            CPU_OVR[t] = sub_cpu({t: subf[t]} if subf and t in subf else {}).get(t, base) * DUCK_FRAC
+            duck_est = sub_cpu({t: subf[t]} if subf and t in subf else {}).get(t, cur) * DUCK_FRAC
+            CPU_OVR[t] = min(cur, duck_est)
+    for tid in ml.get("duck_opt_tids", ()):
+        t = pos.get(tid)
+        if t is None:
+            continue
+        base = CPU["test"].get(str(t))
+        if base is not None:
+            cur = CPU_OVR.get(t, base)
+            CPU_OVR[t] = min(cur, max(0.04, base * 0.12))
+
+
+_LEAF_DIALECT_EXCL = {
+    "sqlglot/dialects/__init__.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/generators/__init__.py",
+    "sqlglot/parsers/__init__.py",
+}
+
+
+def _is_leaf_dialect_edit(files):
+    if not files:
+        return False
+    for r, content in files.items():
+        if content is None or r in _LEAF_DIALECT_EXCL:
+            return False
+        if not (r.endswith(".py") and (
+            r.startswith("sqlglot/dialects/") or r.startswith("sqlglot/generators/") or r.startswith("sqlglot/parsers/")
+        )):
+            return False
+    return True
+
+
+def _gen_mem_mods(files):
+    if not _is_leaf_dialect_edit(files):
+        return None
+    seeds = {_modname(r) for r in files}
+    graph = _import_graph()
+    rev = {}
+    for m, deps in graph.items():
+        for d in deps:
+            rev.setdefault(d, set()).add(m)
+    reached = set(seeds)
+    todo = list(seeds)
+    while todo:
+        for m in rev.get(todo.pop(), ()):
+            if m not in reached:
+                reached.add(m)
+                todo.append(m)
+    return reached
+
+
+def _gen_mem_cpu(nodeids):
+    t = _nodeid_pos(nodeids).get("tests/test_generator.py::TestGenerator::test_generator_memory")
+    if t is not None:
+        cur = CPU_OVR.get(t, CPU["test"].get(str(t), 2.0))
+        CPU_OVR[t] = min(cur, 0.15)
 
 
 
-KEY_T_MIN = float(os.environ.get("BR_KEY_T_MIN", "1.5"))
+KEY_T_MIN = float(os.environ.get("BR_KEY_T_MIN", "0.30"))
 HANG = [False]     # the patched code was seen to hang: run nothing, keep every candidate
-T_MIN = float(os.environ.get("BR_T_MIN", "3"))
+T_MIN = float(os.environ.get("BR_T_MIN", "2.5"))
 T_MAX = float(os.environ.get("BR_T_MAX", "30"))
 CHILD_CPU_MAX = int(os.environ.get("BR_CHILD_CPU_MAX", "60"))
 SETUP_TIMEOUT = float(os.environ.get("BR_SETUP_TIMEOUT", "25"))
@@ -913,24 +1094,26 @@ def cpu_of(t, ms):
     return v * CPU_FACTOR
 
 
-OV_MULT = float(os.environ.get("BR_OV_MULT", "1.6"))
+OV_MULT = float(os.environ.get("BR_OV_MULT", "1.15"))
 MAX_CHILD_CPU = float(os.environ.get("BR_MAX_CHILD", "20"))
 BROAD_CANDS = int(os.environ.get("BR_BROAD_CANDS", "400"))
 BROAD_FAILS = int(os.environ.get("BR_BROAD", "3"))
 HEAVY_CPU = float(os.environ.get("BR_HEAVY_CPU", "1.0"))
-FIX_PFAIL = float(os.environ.get("BR_FIX_PFAIL", "0.9"))
+LATE_MIN_MS = float(os.environ.get("BR_LATE_MIN_MS", "500"))
+FIX_PFAIL = float(os.environ.get("BR_FIX_PFAIL", "0.85"))
 P_EQUIV = float(os.environ.get("BR_P_EQUIV", "0.6"))
-LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.2"))
-P2_PASS = float(os.environ.get("BR_P2_PASS", "0.7"))
-P2_PASS_FAILED = float(os.environ.get("BR_P2_PASS_F", "0.3"))
+LATE_MARGIN = float(os.environ.get("BR_LATE_MARGIN", "1.15"))
+P2_PASS = float(os.environ.get("BR_P2_PASS", "0.75"))
+P2_PASS_FAILED = float(os.environ.get("BR_P2_PASS_F", "0.40"))
 REPLAN = os.environ.get("BR_REPLAN", "1") == "1"
 PRESET_MIN = int(os.environ.get("BR_PRESET_MIN", "1"))
 PRESET_CACHE = Path(os.environ.get("BR_PRESET_CACHE", HERE / "preset_executor.pkl"))
 DENSE_MS = float(os.environ.get("BR_DENSE_MS", "500"))
 DENSE_MIN = float(os.environ.get("BR_DENSE_MIN", "2.0"))
-Q_MAX = float(os.environ.get("BR_Q_MAX", "0.7"))
-Q_PRIOR = float(os.environ.get("BR_Q_PRIOR", "1.0"))
-RP_MARGIN = float(os.environ.get("BR_RP_MARGIN", "1.1"))
+Q_MAX = float(os.environ.get("BR_Q_MAX", "0.70"))
+Q_PRIOR = float(os.environ.get("BR_Q_PRIOR", "0.5"))
+Q_BETA = float(os.environ.get("BR_Q_BETA", "3.0"))
+RP_MARGIN = float(os.environ.get("BR_RP_MARGIN", "1.05"))
 
 
 def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0, base=()):
@@ -1093,7 +1276,7 @@ def _modname(rel):
     return name
 
 
-SCOPE_ON = os.environ.get("BR_SCOPE", "0") == "1"
+SCOPE_ON = os.environ.get("BR_SCOPE", "1") == "1"
 _IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([.\w]+)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)|import[ \t]+([^\n]+))", re.M)
 _IMPORT_GRAPH = None
 
@@ -1273,6 +1456,8 @@ def overlay_candidates(j, old_mods, nodeids):
     OR = load_outreads() if REPLAY_ON else False
     outside = set(OR[2]) if OR else set()   # tests that touch a change outside parse phases
     fn_lines = {}
+    cls_readers = set()
+    cls_ok = True
     n_glob = 0
     for kind, owner, attr, key in delta:
         if kind == "cls":
@@ -1282,11 +1467,13 @@ def overlay_candidates(j, old_mods, nodeids):
             for k2, i in byattr.get((owner, attr), []):
                 if key is None or k2 == key or k2 == "*":
                     cands |= sets[i]
+                    cls_readers |= sets[i]
             if OR:
                 for k2, i in OR[1].get((owner, attr), []):
                     if key is None or k2 == key or k2 == "*":
                         outside |= OR[0][i]
             if _is_enum(old_mods, new_mods, owner):
+                cls_ok = False
                 # members are also reached by iterating the class or looking a value up,
                 # which no attribute read shows: everything that names the enum counts
                 refs = _global_refs(owner.rpartition(":")[2].rpartition(".")[2], nodeids) if GLOBAL_REFS else None
@@ -1306,16 +1493,30 @@ def overlay_candidates(j, old_mods, nodeids):
                 if OR:
                     for k2, i in OR[1].get((owner, attr), []):
                         outside |= OR[0][i]
-            rng = _function_range(old_mods, owner, attr)
-            if rng is not None:
-                fn_lines.setdefault(rng[0], set()).update(range(rng[1], rng[2] + 1))
+            rngs = _function_ranges(old_mods, new_mods, owner, attr)
+            if rngs:
+                for rng in rngs:
+                    fn_lines.setdefault(rng[0], set()).update(range(rng[1], rng[2] + 1))
             if kind == "meth" or not precise:
-                if rng is None:
+                if not rngs:
                     unknown.append((kind, owner, attr))
                 else:
-                    cands |= M.covering(*rng)
-            elif rng is None:
+                    for rng in rngs:
+                        cands |= M.covering(*rng)
+            elif not rngs:
                 OR = False
+                cls_ok = False
+        elif kind == "dictcode":
+            try:
+                co_file, lo, hi = key
+                rel = os.path.relpath(co_file, str(REPO))
+                if rel.startswith("..") or not rel.startswith("sqlglot/"):
+                    unknown.append((kind, owner, attr))
+                else:
+                    fn_lines.setdefault(rel, set()).update(range(lo, hi + 1))
+                    cands |= M.covering(rel, lo, hi)
+            except Exception:  # noqa
+                unknown.append((kind, owner, attr))
         else:
             refs = _global_refs(attr, nodeids) if (kind == "mod" and GLOBAL_REFS) else None
             if refs is None:
@@ -1328,6 +1529,7 @@ def overlay_candidates(j, old_mods, nodeids):
                         cands |= M.covering(f, l, l)
                 cands |= refs[1]
                 outside |= refs[1]
+                cls_readers |= refs[1]
                 n_glob += 1
     note = fail_note + f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]} scope={0 if scope is None else len(scope)}"
     if n_glob:
@@ -1363,7 +1565,10 @@ def overlay_candidates(j, old_mods, nodeids):
     except Exception:  # noqa
         disp = True
     return {"cands": cands, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
-            "pure": all(d[0] == "methcode" for d in delta) and not forced,
+            "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
+            "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
+            "cls_readers": (cls_readers | untraced) if (cls_ok and not unknown and not forced and not disp) else None,
+            "table_changed": any(d[1].startswith("sqlglot.executor.table") for d in delta),
             "replay_ok": bool(OR) and not unknown, "outside": outside, "fn_lines": fn_lines,
             "attrs": sorted({(d[1], d[2]) for d in delta if d[0] in ("cls", "meth")})}
 
@@ -1426,17 +1631,64 @@ def _global_refs(name, nodeids):
         return None
 
 
-def _function_range(mods, owner, attr):
+def _function_ranges(old_mods, new_mods, owner, attr):
     modname, _, qual = owner.partition(":")
-    obj = mods.get(modname)
+    obj = old_mods.get(modname)
+    nobj = new_mods.get(modname) if new_mods is not None else None
     try:
         for part in (p for p in qual.split(".") if p):
             obj = vars(obj)[part]
+            if nobj is not None:
+                nobj = vars(nobj).get(part)
         fn = vars(obj)[attr]
-        fn = getattr(fn, "__func__", fn)
-        code = fn.__code__
-        lines = [l for _, _, l in code.co_lines() if l]
-        return os.path.relpath(code.co_filename, str(REPO)), min(lines), max(lines)
+        nfn = vars(nobj).get(attr) if nobj is not None else None
+        out = []
+        seen = set()
+        while fn is not None and id(fn) not in seen:
+            seen.add(id(fn))
+            f2 = getattr(fn, "__func__", fn)
+            nf2 = getattr(nfn, "__func__", nfn) if nfn is not None else None
+            wrapped = getattr(f2, "__wrapped__", getattr(fn, "__wrapped__", None))
+            nwrapped = getattr(nf2, "__wrapped__", getattr(nfn, "__wrapped__", None)) if nf2 is not None else None
+            skip_outer = False
+            if wrapped is not None and nwrapped is not None and f2 is not None and nf2 is not None:
+                try:
+                    import statediff
+                    cmp = statediff._Cmp()
+                    if (getattr(f2, "__code__", None) is not None
+                            and getattr(nf2, "__code__", None) is not None
+                            and cmp.same_code(f2.__code__, nf2.__code__)
+                            and cmp.same(getattr(f2, "__defaults__", None), getattr(nf2, "__defaults__", None))
+                            and cmp.same(getattr(f2, "__kwdefaults__", None), getattr(nf2, "__kwdefaults__", None))):
+                        ca = getattr(f2, "__closure__", None) or ()
+                        cb = getattr(nf2, "__closure__", None) or ()
+                        if len(ca) == len(cb):
+                            other_diff = False
+                            for x, y in zip(ca, cb):
+                                try:
+                                    vx, vy = x.cell_contents, y.cell_contents
+                                except ValueError:
+                                    continue
+                                if vx is wrapped and vy is nwrapped:
+                                    continue
+                                if not cmp.same(vx, vy):
+                                    other_diff = True
+                                    break
+                            if not other_diff:
+                                skip_outer = True
+                except Exception:  # noqa
+                    skip_outer = False
+            if not skip_outer:
+                code = getattr(f2, "__code__", None)
+                if code is not None:
+                    lines = [l for _, _, l in code.co_lines() if l]
+                    if lines:
+                        rel = os.path.relpath(code.co_filename, str(REPO))
+                        if rel.startswith("sqlglot/"):
+                            out.append((rel, min(lines), max(lines)))
+            fn = wrapped
+            nfn = nwrapped
+        return out or None
     except Exception:  # noqa
         return None
 
@@ -1490,6 +1742,29 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         for t in j["light"] + j["heavy"]:
             modules.add(runner.module_name_for(nodeids[t].split("::")[0]))
     runner.zygote_import(modules)
+    global CPU_FACTOR
+    if "BR_CPU_FACTOR" not in os.environ and os.environ.get("BR_CALIBRATE", "1") == "1":
+        try:
+            def _probe():
+                d = {}
+                acc = 0
+                for i in range(15000):
+                    k = f"k_{i & 255}"
+                    v = (d.get(k, 0) + i) ^ (i >> 2)
+                    d[k] = v
+                    acc ^= v
+                return acc
+            _times = []
+            for _ in range(3):
+                _ct0 = time.process_time()
+                _probe()
+                _times.append(time.process_time() - _ct0)
+            _cdt = min(_times)
+            # Pure-Python probe (~1.7ms on Apple Silicon arm64 -> 0.50; ~3.4ms on cloud amd64 -> 1.0).
+            CPU_FACTOR = max(0.50, min(1.4, _cdt / 0.0034))
+            log(f"calibrated CPU_FACTOR={CPU_FACTOR:.2f} (probe={_cdt*1000:.1f}ms)")
+        except Exception:  # noqa
+            pass
     if any(j["overlay"] for j in jobs):
         _all_mod_names()
         OLD_IMPORT_FAILURES[:] = [failure[0] for failure in _import_all()]
@@ -1497,16 +1772,48 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         load_imports()
         _preload_src_text()
         _import_graph()
+    elif any(j.get("pure_src") and _is_leaf_dialect_edit(j["files"]) for j in jobs):
+        _import_graph()
+    hot_counts = {}
+    hot_olds = {}
+    for j in jobs:
+        if not j["overlay"]:
+            for rel in j["hot"]:
+                hot_counts[rel] = hot_counts.get(rel, 0) + 1
+                if rel not in hot_olds and rel in j.get("olds", {}):
+                    hot_olds[rel] = j["olds"][rel]
+    for rel, cnt in hot_counts.items():
+        if cnt >= 2 and rel in hot_olds:
+            runner.precompile_old(rel, hot_olds[rel])
     if os.environ.get("BR_PRESET", "1") == "1":
-        # executor tests wanted by at least two commits: load their class fixtures once
-        want = 0
+        want_light = 0
+        want_ov = 0
         for j in jobs:
-            if not j["overlay"] and j.get("pure_src") and any(
-                    nodeids[t].startswith("tests/test_executor.py::TestExecutor::") for t in j["light"] + j["heavy"]):
-                want += 1
-        if want >= PRESET_MIN:
-            ok = runner.prebuild_class("tests.test_executor", "TestExecutor", cache=str(PRESET_CACHE))
-            log(f"shared executor fixtures for {want} commits: {ok}")
+            if any(p == "tests/test_executor.py" or p.endswith(".csv.gz") or p == "sqlglot/executor/table.py"
+                   for p in j["files"]):
+                continue
+            if not j["overlay"]:
+                if any(nodeids[t].startswith("tests/test_executor.py::TestExecutor::")
+                       for t in j["light"]):
+                    want_light += 1
+            else:
+                if any(nodeids[t].startswith("tests/test_executor.py::TestExecutor::")
+                       for t in j.get("broad", ()) + j.get("precise", ())):
+                    want_ov += 1
+        want = want_light + want_ov
+        if want_light >= PRESET_MIN or want >= 2:
+            if "tests.test_executor" in sys.modules:
+                ok = runner.prebuild_class("tests.test_executor", "TestExecutor", cache=str(PRESET_CACHE))
+                log(f"shared executor fixtures for {want} commits: {ok}")
+            elif want_ov >= 1 and PRESET_CACHE.is_file():
+                try:
+                    import pickle
+                    with open(PRESET_CACHE, "rb") as fh:
+                        saved = pickle.load(fh)
+                    runner.PRESET_ATTRS["tests.test_executor.TestExecutor"] = dict(saved["attrs"])
+                    log(f"shared overlay executor fixtures for {want_ov} commits: True")
+                except Exception as e:  # noqa
+                    log("shared overlay executor fixtures failed", repr(e))
     # maps every child would otherwise load for itself
     try:
         _submap()
@@ -1527,12 +1834,28 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
     log(f"zygote ready at {time.time() - T_START:.2f}s")
 
     # cheapest jobs first so that a tight budget hurts the fewest commits
-    def est(j):
-        return sum(cpu_of(t, ms) for t in j["light"]) * 1000
-    pending = sorted(jobs, key=est)
+    def job_cpu_of(j, t):
+        v = (j.get("cpu_ovr") or {}).get(t)
+        if v is not None:
+            return v * CPU_FACTOR
+        v = CPU["test"].get(str(t))
+        if v is None:
+            v = ms[t] / 1000.0 * 1.2
+        return v * CPU_FACTOR
+
+    def est_sec(j):
+        if j["overlay"]:
+            return 0.6
+        return sum(job_cpu_of(j, t) for t in j["light"])
+
+    def est_reserve(j):
+        # pre-replay / pre-early-stop estimates overstate actual runtime by ~3-5x
+        return min(est_sec(j) * 0.35 + 0.15, 2.0)
+
+    pending = sorted(jobs, key=est_sec)
     running = {}  # pid -> (job, fd, started)
     tmp_root = tempfile.mkdtemp(prefix="br")
-    total_est_left = sum(est(j) for j in pending) / 1000.0 * CPU_FACTOR
+    total_est_left = sum(est_reserve(j) for j in pending)
 
     while pending or running:
         now = time.time()
@@ -1540,12 +1863,12 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         while pending and len(running) < PARALLEL:
             j = pending.pop(0)
             remaining = deadline - time.time()
-            need = est(j) / 1000.0 * CPU_FACTOR
-            total_est_left -= need
+            total_est_left -= est_reserve(j)
             # allow heavy runs only when the rest of the batch still fits
-            heavy_budget = remaining - 3.0 - max(0.0, total_est_left) / PARALLEL
-            light_cost = est(j) / 1000.0
-            if remaining < 4.0 or light_cost > remaining - 3.0:
+            reserve = min(max(0.0, total_est_left) / PARALLEL, max(0.0, remaining - 5.0) * 0.6)
+            heavy_budget = max(0.0, remaining - 3.0 - reserve)
+            light_cost = est_sec(j)
+            if remaining < 4.0 or (not j["overlay"] and light_cost > remaining - 3.0 and remaining < 15.0):
                 log(j["cid"], "skipped (budget)")
                 continue
             j["tmp"] = os.path.join(tmp_root, j["cid"])
@@ -1712,11 +2035,14 @@ def _child(j, nodeids, ms, runner, modules):
     optmemo.ON[0] = j.get("opt_aff") is not None and not j["overlay"]
     optmemo.AFFECTED[:] = j.get("opt_aff") or []
     optmemo.set_changed(j.get("ch_lines") if (optmemo.ON[0] and OPT_PER_CALL) else None)
+    REPLAY_HIT.clear()
     runner.ITER_FILTER.clear()
     runner.ITER_FILTER.update({int(t): set(v) for t, v in (j.get("iterf") or {}).items()})
     runner.MEMO_DUCK = bool(j.get("memo_duck")) and runner.MEMO is not None
-    if runner.MEMO_DUCK and all(p.startswith("tests/fixtures/") and p.endswith(".sql") for p in j["files"]):
-        runner.FIXTURE_CALLS = runner.MEMO.get("pool_results")
+    runner.FIXTURE_SQL_ONLY = bool(j.get("fixture_sql_only")) and not j["overlay"]
+    if runner.MEMO_DUCK and not j["overlay"] and not j["hot"] and not any((j.get("ch_lines") or {}).values()):
+        runner.FIXTURE_CALLS = True
+    runner.GEN_MEM_MODS = _gen_mem_mods(j["files"]) if j.get("pure_src") else None
     runner.MEMO_SKIP.clear()
     runner.MEMO_SKIP.update(j.get("memo_skip") or [])
     tempfile.tempdir = j["tmp"]
@@ -1747,8 +2073,10 @@ def _child(j, nodeids, ms, runner, modules):
     PROF["marks"] = [("prep", round(time.process_time(), 2))]
     unrun = list(j["heavy"])
     if runner.PRESETS:
+        sql_only = (not j["overlay"] and not j["hot"] and bool(j["files"])
+                    and all(p.startswith("tests/fixtures/") and p.endswith(".sql") for p in j["files"]))
         kept = runner.apply_presets(not j["overlay"] and bool(j.get("pure_src")) and not j.get("was_import"),
-                                    j.get("ch_lines"))
+                                    j.get("ch_lines"), sql_only=sql_only)
         if kept:
             note += " preset"
     if j["overlay"]:
@@ -1759,6 +2087,11 @@ def _child(j, nodeids, ms, runner, modules):
         PROF["ovc"] = time.process_time() - c0
         if res.get("all"):
             return {"failed": [], "unrun": [], "all": True, "note": res["note"]}
+        if ("tests.test_executor.TestExecutor" in runner.PRESET_ATTRS
+                and not res.get("table_changed")
+                and not any(p == "tests/test_executor.py" or p.endswith(".csv.gz") or p == "sqlglot/executor/table.py"
+                            for p in j["files"])):
+            runner.OV_EXEC_PRESET[:] = [True, not j.get("pure_src")]
         forced = set(res.get("forced") or ())
         FORCED.update(forced)
         cands = sorted(set(res["cands"]) - forced)
@@ -1773,36 +2106,56 @@ def _child(j, nodeids, ms, runner, modules):
                 return {"failed": [], "unrun": sorted(cands), "note": note + " " + res["note"]}
             if not cands:
                 return {"failed": [], "unrun": [], "note": note}
-        if res.get("pure") and j.get("pure_src") and j.get("ch_lines") is not None:
-            lines = {f: set(v) for f, v in j["ch_lines"].items()}
+        aff = None
+        ov_lines = None
+        if j.get("pure_src") and j.get("ch_lines") is not None:
+            ov_lines = {f: set(v) for f, v in j["ch_lines"].items()}
             for f, v in (res.get("fn_lines") or {}).items():
-                lines.setdefault(f, set()).update(v)
-            aff = opt_affected(lines)
+                ov_lines.setdefault(f, set()).update(v)
+        if res.get("fn_only") and ov_lines is not None:
+            aff = opt_affected(ov_lines)
             if aff is not None:
                 optmemo.ON[0] = True
                 optmemo.AFFECTED[:] = aff
-                optmemo.set_changed(lines if OPT_PER_CALL else None)
+                optmemo.set_changed(ov_lines if OPT_PER_CALL else None)
                 opt_cpu(aff, cands)
-            itf = iter_filter(cands, lines)
+            itf = iter_filter(cands, ov_lines)
             iter_cpu(itf)
             runner.ITER_FILTER.update(itf)
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
         runner.MEMO_SKIP.clear()
         if runner.MEMO_DUCK:
-            if res.get("pure"):
-                # import-time state is unchanged: only function bodies differ
-                runner.MEMO_SKIP.update(memo_skippable(j.get("ch_lines"), nodeids))
-            memo_cpu(runner.MEMO_SKIP, nodeids, j.get("subf"))
+            if res.get("fn_only") and ov_lines is not None:
+                # only function bodies/defaults/closures differ; all changed fn lines included
+                runner.MEMO_SKIP.update(memo_skippable(ov_lines, nodeids))
+            elif ov_lines is not None and res.get("cls_readers") is not None:
+                cls_r = res["cls_readers"]
+                runner.MEMO_SKIP.update(t for t in memo_skippable(ov_lines, nodeids) if t not in cls_r)
+            memo_cpu(runner.MEMO_SKIP, nodeids, j.get("subf"), aff)
+        if runner.GEN_MEM_MODS:
+            _gen_mem_cpu(nodeids)
         note += " " + res["note"]
         if not cands:
             return {"failed": [], "unrun": [], "note": note}
         light, heavy, est, static = plan_split(cands, ms, CPU, True, False, overhead=0.0, mult=OV_MULT,
                                                base=sorted(forced))
         budget = j.get("heavy_budget", 1e9)
+        limit = max(0.0, min(budget, MAX_CHILD_CPU))
         est_light = sum(cpu_of(t, ms) for t in light) * OV_MULT
-        if est_light > min(budget, MAX_CHILD_CPU):
-            light, heavy = [], cands
+        if est_light > limit:
+            # keep highest schedule-time-per-CPU prefix within budget instead of dropping everything
+            kept_light, moved = [], []
+            acc = 0.0
+            for t in sorted(light, key=lambda t: -ms[t] / max(cpu_of(t, ms), 0.002)):
+                c = cpu_of(t, ms) * OV_MULT
+                if acc + c <= limit:
+                    kept_light.append(t)
+                    acc += c
+                else:
+                    moved.append(t)
+            light = kept_light
+            heavy = list(heavy) + moved
         note += f" cands={len(cands)} run={len(light)} est={est/1000:.1f}/{static/1000:.1f}"
         note += f" cpu={sum(cpu_of(t, ms) for t in cands):.1f} top={[(t, round(cpu_of(t, ms), 1)) for t in sorted(cands, key=lambda t: -cpu_of(t, ms))[:3]]} skip={sorted(runner.MEMO_SKIP)} bud={budget:.0f}"
         j["light"], j["heavy"] = light, heavy
@@ -1812,7 +2165,7 @@ def _child(j, nodeids, ms, runner, modules):
         cands, rn = replay_narrow(allc, j.get("ch_lines"), ms, light0=j["light"], pure=True)
         note += rn
         if HANG[0]:
-            return {"failed": [], "unrun": allc, "note": note}
+            return {"failed": [], "unrun": sorted(cands), "note": note}
         if len(cands) != len(allc) or not j["light"]:
             if not cands:
                 return {"failed": [], "unrun": [], "note": note}
@@ -1838,19 +2191,39 @@ def _child(j, nodeids, ms, runner, modules):
             g.sort(key=lambda t: cpu_of(t, ms))
         ordered = [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
     else:
-        tier1 = sorted((t for t in j["light"] if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN), key=lambda t: -density(t))
-        t1 = set(tier1)
-        groups = {}
-        for t in tier1:
-            groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-        ordered = [t for g in groups.values() for t in g]
-        groups = {}
-        for t in j["light"]:
-            if t not in t1:
+        n_hit_light = sum(1 for t in j["light"] if t in REPLAY_HIT)
+        prefer_non_hit = n_hit_light < 0.7 * len(j["light"])
+        if prefer_non_hit:
+            tier1 = sorted((t for t in j["light"]
+                            if ms[t] >= DENSE_MS and density(t) >= DENSE_MIN and t not in REPLAY_HIT),
+                           key=lambda t: -density(t))
+            t1 = set(tier1)
+            groups = {}
+            for t in tier1:
                 groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
-        ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+            ordered = [t for g in groups.values() for t in g]
+            for is_hit in (False, True):
+                groups = {}
+                for t in j["light"]:
+                    if t not in t1 and (t in REPLAY_HIT) == is_hit:
+                        groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+                ordered += [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
+        else:
+            groups = {}
+            for t in j["light"]:
+                groups.setdefault(nodeids[t].rsplit("::", 1)[0], []).append(t)
+            for g in groups.values():
+                g.sort(key=lambda t: cpu_of(t, ms))
+            ordered = [t for g in sorted(groups.values(), key=lambda g: sum(cpu_of(t, ms) for t in g)) for t in g]
     n_total = len(ordered)
+    ordered_set = set(ordered)
     rp = {"dropped": set(), "n": 0}
+    _rmult = OV_MULT if j["overlay"] else 1.0
+
+    def _fixed_unrun():
+        if j["overlay"] and j.get("unknown"):
+            return list(unrun)
+        return [t for t in unrun if not (ms[t] >= LATE_MIN_MS and cpu_of(t, ms) * _rmult < ms[t] / 1000.0 * 0.85)]
 
     def should_stop(cur_failed, rest):
         if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
@@ -1863,7 +2236,7 @@ def _child(j, nodeids, ms, runner, modules):
                 return True
         if not cur_failed:
             return False
-        base = sorted(set(unrun) | set(cur_failed))
+        base = sorted(set(_fixed_unrun()) | set(cur_failed) | FORCED)
         delta = schedule_cost(base + rest, ms)[1] - schedule_cost(base, ms)[1]
         return delta / 1000.0 <= sum(cpu_of(t, ms) for t in rest) + 0.2
 
@@ -1872,22 +2245,40 @@ def _child(j, nodeids, ms, runner, modules):
         if j["overlay"] and j.get("unknown") and len(cur_failed) >= BROAD_FAILS:
             return []
         rp["n"] += 1
-        base = sorted(set(unrun) | set(cur_failed) | rp["dropped"] | FORCED)
-        n_run = max(1, n_total - len(rest) - len(rp["dropped"]))
-        q = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + 2.0 * Q_PRIOR))
-        order = sorted(rest, key=lambda t: -density(t))
+        base = sorted(set(_fixed_unrun()) | set(cur_failed) | rp["dropped"] | FORCED)
+        ran_set = ordered_set - set(rest) - rp["dropped"]
+        if REPLAY_HIT:
+            n_other_ran = sum(1 for t in ran_set if t not in REPLAY_HIT)
+            n_other_fail = sum(1 for t in cur_failed if t not in REPLAY_HIT)
+            q_other = (min(Q_MAX, (n_other_fail + Q_PRIOR) / (n_other_ran + Q_PRIOR + Q_BETA))
+                       if n_other_ran else Q_PRIOR / (Q_PRIOR + Q_BETA))
+            n_hit_ran = len(ran_set) - n_other_ran
+            n_hit_fail = len(cur_failed) - n_other_fail
+            q_hit = min(0.85, (n_hit_fail + 2.0) / (n_hit_ran + 2.5))
+        else:
+            n_run = max(1, len(ran_set))
+            q_other = q_hit = min(Q_MAX, (len(cur_failed) + Q_PRIOR) / (n_run + Q_PRIOR + Q_BETA))
+        def _pp(t):
+            return 1.0 - (q_hit if t in REPLAY_HIT else q_other)
+        order = sorted(rest, key=lambda t: -_pp(t) * density(t))
         full = schedule_cost(base + order, ms)[1]
         n = len(order)
         ks = sorted(set(list(range(0, min(n, 12) + 1)) + [int(n * f) for f in (0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0)]))
         best_k, best_net = 0, 0.0
         cpu_pref = [0.0]
+        ms_pref = [0.0]
+        wms_pref = [0.0]
         for t in order:
             cpu_pref.append(cpu_pref[-1] + cpu_of(t, ms))
+            w = max(ms[t], 1.0)
+            ms_pref.append(ms_pref[-1] + w)
+            wms_pref.append(wms_pref[-1] + w * _pp(t))
         for k in ks:
             if k == 0:
                 continue
             saved = (full - schedule_cost(base + order[k:], ms)[1]) / 1000.0
-            net = saved * (1.0 - q) - RP_MARGIN * cpu_pref[k] - 0.1
+            p_pass_k = wms_pref[k] / ms_pref[k]
+            net = saved * p_pass_k - RP_MARGIN * cpu_pref[k] - 0.1
             if net > best_net:
                 best_k, best_net = k, net
         rp["dropped"].update(order[best_k:])
@@ -1934,24 +2325,72 @@ def _child(j, nodeids, ms, runner, modules):
     if unrun and not (j["overlay"] and j.get("unknown")):
         budget = min(j.get("heavy_budget", 1e9), MAX_CHILD_CPU)
         mult = OV_MULT if j["overlay"] else 1.0
-        p_pass = P2_PASS if not failed else P2_PASS_FAILED
+        ran_set = ordered_set - set(skipped)
+        if REPLAY_HIT:
+            n_or = sum(1 for t in ran_set if t not in REPLAY_HIT)
+            n_of = sum(1 for t in failed if t not in REPLAY_HIT)
+            if not n_of:
+                p_pass_other = P2_PASS
+            else:
+                emp_pass = (max(0, n_or - n_of) + 2.0) / (max(1, n_or) + 4.0)
+                p_pass_other = max(P2_PASS_FAILED, min(P2_PASS, emp_pass))
+            n_hr = len(ran_set) - n_or
+            n_hf = len(failed) - n_of
+            p_pass_hit = max(0.15, (max(0, n_hr - n_hf) + 0.5) / (n_hr + 2.5))
+        else:
+            n_or = len(ran_set)
+            n_of = len(failed)
+            if not failed:
+                p_pass_other = P2_PASS
+            else:
+                emp_pass = (max(0, n_or - n_of) + 2.0) / (max(1, n_or) + 4.0)
+                p_pass_other = max(P2_PASS_FAILED, min(P2_PASS, emp_pass))
+            p_pass_hit = p_pass_other
         late = []
-        big = [t for t in unrun if ms[t] >= HEAVY_CPU * 1000]
-        for t in sorted(big, key=lambda t: cpu_of(t, ms) / max(ms[t], 1.0))[:8]:
+        big = [t for t in unrun if ms[t] >= LATE_MIN_MS]
+        pool_late = []
+        for t in sorted(big, key=lambda t: cpu_of(t, ms) / max(ms[t], 1.0))[:12]:
+            p_pass = p_pass_hit if t in REPLAY_HIT else p_pass_other
             c = cpu_of(t, ms) * mult
-            if c > budget or (ms[t] / 1000.0 + 2.0) * p_pass <= LATE_MARGIN * c + 0.1:
-                continue
+            if c <= budget and (ms[t] / 1000.0 + 2.0) * p_pass > LATE_MARGIN * c + 0.08:
+                pool_late.append(t)
+        while pool_late and not runner.TIMEOUTS[0]:
             cur = sorted(set(unrun) | failed | FORCED)
-            gain = (schedule_cost(cur, ms)[1] - schedule_cost([x for x in cur if x != t], ms)[1]) / 1000.0
-            if gain * p_pass <= LATE_MARGIN * c + 0.1:
-                continue
-            if runner.TIMEOUTS[0]:
-                break       # the patched code hangs: no more runs
-            f = runner.run_tests([t], nodeids, timeouts=[test_timeout(t, ms)])
+            cur_cost = schedule_cost(cur, ms)[1]
+            pick = None
+            acc_c = 0.0
+            acc_w = 0.0
+            acc_wp = 0.0
+            for k, t in enumerate(pool_late, 1):
+                c = cpu_of(t, ms) * mult
+                if acc_c + c > budget:
+                    break
+                p_pass = p_pass_hit if t in REPLAY_HIT else p_pass_other
+                acc_c += c
+                w = max(ms[t], 1.0)
+                acc_w += w
+                acc_wp += w * p_pass
+                rem = set(pool_late[:k])
+                gain = (cur_cost - schedule_cost([x for x in cur if x not in rem], ms)[1]) / 1000.0
+                if gain * (acc_wp / acc_w) > LATE_MARGIN * acc_c + 0.08:
+                    pick = pool_late[0]
+                    break
+            if pick is None:
+                break
+            pool_late.remove(pick)
+            c = cpu_of(pick, ms) * mult
+            f = runner.run_tests([pick], nodeids, timeouts=[test_timeout(pick, ms)])
             budget -= c
-            unrun.remove(t)
+            unrun.remove(pick)
             failed |= set(f)
-            late.append(t)
+            late.append(pick)
+            if f:
+                if not REPLAY_HIT or pick not in REPLAY_HIT:
+                    n_or += 1
+                    n_of += 1
+                    p_pass_other = max(P2_PASS_FAILED, min(P2_PASS, (max(0, n_or - n_of) + 2.0) / (max(1, n_or) + 4.0)))
+                    if not REPLAY_HIT:
+                        p_pass_hit = p_pass_other
         if late:
             note += f" late-run{late}"
     if any(runner.MEMO_STAT):

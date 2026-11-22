@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import operator
 import os
 import pickle
 import sys
 import zlib
 
 from canon import digest, load_tree  # noqa: F401
+
+_Enum = enum.Enum
+_sha1 = hashlib.sha1
+_item0 = operator.itemgetter(0)
 
 
 class Unkeyable(Exception):
@@ -19,32 +24,59 @@ def _strict(e, depth=0):
     """Canonical form of a call argument; raises for anything it cannot describe exactly."""
     if depth > 400:
         raise Unkeyable()
-    if e is None or isinstance(e, (str, int, float, bool)):
+    t = type(e)
+    if e is None or t is str or t is int or t is bool or t is float:
         return e
-    if isinstance(e, enum.Enum):
-        return ("E", type(e).__qualname__, e.name)
+    if t is list or t is tuple:
+        d1 = depth + 1
+        return ["L" if t is list else "U"] + [_strict(x, d1) for x in e]
+    if hasattr(e, "_meta") and hasattr(e, "_type"):
+        args = getattr(e, "args", None)
+        if type(args) is dict:
+            d1 = depth + 1
+            items = [(k, _strict(v, d1)) for k, v in args.items() if v is not None and v != []]
+            items.sort(key=_item0)
+            et = e._type
+            ec = e.comments
+            em = e._meta
+            return ("X", t.__qualname__, items,
+                    None if et is None else _strict(et, d1),
+                    None if not ec else _strict(ec, d1),
+                    None if not em else _strict(em, d1))
+    if isinstance(e, (str, int, float, bool)):
+        return e
+    if isinstance(e, _Enum):
+        return ("E", t.__qualname__, e.name)
     if isinstance(e, type):
         return ("T", e.__module__, e.__qualname__)
     if isinstance(e, (list, tuple)):
-        return ["L" if isinstance(e, list) else "U"] + [_strict(x, depth + 1) for x in e]
-    if isinstance(e, dict):
-        return ("D", sorted(((repr(_strict(k, depth + 1)), _strict(v, depth + 1)) for k, v in e.items()),
-                            key=lambda kv: kv[0]))
+        d1 = depth + 1
+        return ["L" if isinstance(e, list) else "U"] + [_strict(x, d1) for x in e]
+    if t is dict or isinstance(e, dict):
+        d1 = depth + 1
+        items = [(repr(_strict(k, d1)), _strict(v, d1)) for k, v in e.items()]
+        items.sort(key=_item0)
+        return ("D", items)
     if isinstance(e, (set, frozenset)):
-        return ("S", sorted(repr(_strict(x, depth + 1)) for x in e))
+        d1 = depth + 1
+        return ("S", sorted(repr(_strict(x, d1)) for x in e))
     args = getattr(e, "args", None)
     if isinstance(args, dict) and hasattr(e, "_meta") and hasattr(e, "_type"):
-        return ("X", type(e).__qualname__,
-                sorted(((k, _strict(v, depth + 1)) for k, v in args.items() if v is not None and v != []),
-                       key=lambda kv: kv[0]),
-                _strict(e._type, depth + 1), _strict(e.comments or None, depth + 1), _strict(e._meta or None, depth + 1))
-    mod = type(e).__module__
+        d1 = depth + 1
+        items = [(k, _strict(v, d1)) for k, v in args.items() if v is not None and v != []]
+        items.sort(key=_item0)
+        return ("X", t.__qualname__, items,
+                _strict(e._type, d1), _strict(e.comments or None, d1), _strict(e._meta or None, d1))
+    mod = t.__module__
     if mod.startswith("sqlglot.dialects") and hasattr(e, "settings") and hasattr(e, "version"):
-        return ("DIALECT", type(e).__qualname__, _strict(tuple(e.version)), _strict(e.normalization_strategy),
-                _strict(dict(e.settings)))
-    if mod == "sqlglot.schema" and type(e).__qualname__ == "MappingSchema":
-        d = dict(vars(e))
-        return ("SCHEMA", sorted((k, _strict(v, depth + 1)) for k, v in d.items()))
+        d1 = depth + 1
+        return ("DIALECT", t.__qualname__, _strict(tuple(e.version), d1), _strict(e.normalization_strategy, d1),
+                _strict(dict(e.settings), d1))
+    if mod == "sqlglot.schema" and t.__qualname__ == "MappingSchema":
+        d1 = depth + 1
+        items = [(k, _strict(v, d1)) for k, v in vars(e).items()]
+        items.sort(key=_item0)
+        return ("SCHEMA", items)
     raise Unkeyable()
 
 
@@ -52,7 +84,7 @@ def call_key(expression, schema, db, catalog, dialect, sql, kwargs):
     try:
         parts = (_strict(expression), _strict(schema), _strict(db), _strict(catalog), _strict(dialect),
                  _strict(sql), _strict(kwargs))
-        return hashlib.sha1(repr(parts).encode("utf-8", "replace")).digest()
+        return _sha1(repr(parts).encode("utf-8", "replace")).digest()
     except RecursionError:
         raise Unkeyable()
 
@@ -123,11 +155,21 @@ def affected(lines_by_file):
     return [i for i in range(len(IDX["rules"]) + 1) if (m >> i) & 1]
 
 
+_TREE_RAW: dict = {}
+_RUN_SAME: set = set()
+_CACHE_OK = [False]
+
+
 def _tree(d):
-    if _FD[0] is None:
-        _FD[0] = os.open(IDX["_bin"], os.O_RDONLY)
-    off, ln = IDX["blobs"][d]
-    return load_tree(pickle.loads(zlib.decompress(os.pread(_FD[0], ln, off))))
+    raw = _TREE_RAW.get(d)
+    if raw is None:
+        if _FD[0] is None:
+            _FD[0] = os.open(IDX["_bin"], os.O_RDONLY)
+        off, ln = IDX["blobs"][d]
+        raw = pickle.loads(zlib.decompress(os.pread(_FD[0], ln, off)))
+        if len(_TREE_RAW) < 1024:
+            _TREE_RAW[d] = raw
+    return load_tree(raw)
 
 
 _ORIG = [None, None]    # the real optimize and its module
@@ -145,8 +187,10 @@ class Base:
 
 def set_changed(lines_by_file):
     """Tell the stand-in which lines the patch changed (function bodies only)."""
+    _RUN_SAME.clear()
     if IDX is None or not IDX.get("lineid") or lines_by_file is None:
         CH_MASK[0] = None
+        _CACHE_OK[0] = False
         return
     m = 0
     for f, ls in lines_by_file.items():
@@ -158,7 +202,9 @@ def set_changed(lines_by_file):
                     m |= 1 << i
     # a changed line that fills a process-level cache or depends on the hash seed is not
     # tied to the calls that happened to run it: no per-call judgement then
-    CH_MASK[0] = None if (m & IDX.get("cold", 0)) or not IDX.get("kcov") else m
+    cold = bool(m & IDX.get("cold", 0))
+    _CACHE_OK[0] = not cold
+    CH_MASK[0] = None if cold or not IDX.get("kcov") else m
 
 
 def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules=None, sql=None,
@@ -190,6 +236,15 @@ def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules
             return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
         finally:
             TIMES[4] += _pt() - t0
+    if _CACHE_OK[0] and key in _RUN_SAME:
+        STAT[0] += 1
+        if want:
+            return Base(st[-1])
+        t0 = _pt()
+        try:
+            return _tree(st[-1])
+        finally:
+            TIMES[1] += _pt() - t0
     kc = IDX["kcov"].get(key) if mask is not None and "kcov" in IDX else None
     if kc is not None:
         # this very call, at the pinned commit: which stages ran a changed line?
@@ -239,6 +294,8 @@ def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules
         return orig(first, schema, db, catalog, dialect, tuple(seq), sql, False, **kwargs)
     except _Final:
         STAT[1] += 1
+        if _CACHE_OK[0]:
+            _RUN_SAME.add(key)
         TIMES[3] += _pt() - t0
         if want:
             return Base(st[-1])

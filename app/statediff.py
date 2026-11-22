@@ -304,7 +304,23 @@ def _record(cmp, changes, base, a, b):
         kb = {cmp.key(k): v for k, v in b.items()}
         n = 0
         for k in set(ka) | set(kb):
-            if k not in ka or k not in kb or not cmp.same(ka[k], kb[k]):
+            if k not in ka or k not in kb:
+                changes.add(base + (_keystr(k),))
+                n += 1
+            elif not cmp.same(ka[k], kb[k]):
+                va, vb = ka[k], kb[k]
+                if (type(va) is types.FunctionType and type(vb) is types.FunctionType
+                        and va.__module__ == vb.__module__
+                        and va.__qualname__ == vb.__qualname__
+                        and cmp.same(va.__defaults__, vb.__defaults__)
+                        and cmp.same(va.__kwdefaults__, vb.__kwdefaults__)
+                        and cmp.same_closure(va, vb, 0)):
+                    code = va.__code__
+                    lines = [l for _, _, l in code.co_lines() if l]
+                    if lines:
+                        changes.add(("dictcode", base[1], base[2], (code.co_filename, min(lines), max(lines))))
+                        n += 1
+                        continue
                 changes.add(base + (_keystr(k),))
                 n += 1
         if n == 0:
