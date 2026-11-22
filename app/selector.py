@@ -2206,6 +2206,10 @@ def _child(j, nodeids, ms, runner, modules):
     runner.SUBMIT_FILTER.clear()
     runner.SUBMIT_FILTER.update(j.get("subf") or {})
     runner.SUBMIT_LAZY.update(_submap())
+    runner.FAST_PROJECTIONS = bool(j["files"]) and all(
+        path.startswith(("sqlglot/optimizer/", "sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
+        or path in {"sqlglot/parser.py", "sqlglot/generator.py"} for path in j["files"]
+    )
     import optmemo
     optmemo.ON[0] = j.get("opt_aff") is not None and not j["overlay"]
     optmemo.AFFECTED[:] = j.get("opt_aff") or []

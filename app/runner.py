@@ -136,6 +136,7 @@ FIXTURE_CALLS = None  # pool_idx or pool_results dict from the unmodified checko
 MEMO_IDS: dict = {}     # test number -> test id
 MEMO_DUCK = False       # reuse reference dataframes / duckdb results when sql is unchanged
 MEMO_SKIP: set = set()  # tests whose queries may skip execution when their plan is unchanged
+FAST_PROJECTIONS = False
 MEMO_STAT = [0, 0]      # queries skipped, queries re-run after a reference mismatch
 MEMO_REC = None         # build time: record instead of use
 
@@ -1218,6 +1219,10 @@ def _timed(run, seconds, t=None, gate=None):
         _SUB["deadline"] = time.time() + seconds
         c0 = time.process_time()
         try:
+            if FAST_PROJECTIONS and t in SUBMIT_LAZY:
+                import rowprojection
+                with rowprojection.enabled():
+                    return run(*a, **k)
             return run(*a, **k)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
