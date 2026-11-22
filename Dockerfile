@@ -30,6 +30,7 @@ RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildqueryattrs.p
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildvalidators.py /app/validatorcalls.idx
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildscope.py
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildpoolmemo.py
+RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildreplaytrees.py
 RUN BR_DATA=/nonexistent python /app/prep.py || echo "map preparation failed: maps are parsed at run time"
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

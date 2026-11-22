@@ -514,3 +514,109 @@ def proven_equivalent(files: dict, repo, prove=None, trees=None) -> bool:
                 return False
         proved = True
     return proved
+
+
+def unused_initial_value(files, repo, trees):
+    """Prove an edited local literal is overwritten or discarded on every path.
+
+    Until the first overwrite, accept only direct truth tests of that local.
+    A loop can run zero times, so its following statements are checked as well.
+    """
+    if len(files) != 1:
+        return False
+    rel, new = next(iter(files.items()))
+    if not rel.startswith("sqlglot/") or not new:
+        return False
+    old = (repo / rel).read_text()
+    pairs = _pairs(old, new, trees.get(rel))
+    if not pairs or len(pairs) != 1:
+        return False
+    before, after = pairs[0]
+    if not isinstance(before, ast.Constant) or not isinstance(after, ast.Constant):
+        return False
+    if type(before.value) not in (int, bool, str, type(None)) or type(after.value) not in (int, bool, str, type(None)):
+        return False
+    if before.lineno != after.lineno or before.end_lineno != before.lineno or after.end_lineno != after.lineno:
+        return False
+    old_lines, new_lines = old.encode().splitlines(keepends=True), new.encode().splitlines(keepends=True)
+    at = before.lineno - 1
+    literal = old_lines[at][before.col_offset:before.end_col_offset]
+    new_lines[at] = new_lines[at][:after.col_offset] + literal + new_lines[at][after.end_col_offset:]
+    if old_lines != new_lines:
+        return False
+    truth = bool(before.value)
+    if truth != bool(after.value):
+        return False
+    for fn in ast.walk(patchlib._parse_old(old)):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for i, stmt in enumerate(fn.body):
+            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.value is not before:
+                continue
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                return False
+            var = targets[0].id
+            for node in ast.walk(fn):
+                if node is not fn and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    if any(isinstance(n, ast.Name) and n.id == var for n in ast.walk(node)):
+                        return False
+                if isinstance(node, (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom)):
+                    return False
+                if isinstance(node, ast.Name) and node.id in ("locals", "vars", "eval", "exec", "inspect"):
+                    return False
+                if isinstance(node, ast.Attribute) and node.attr in ("_getframe", "f_locals", "currentframe"):
+                    return False
+            return _check_initial_flow(fn.body[i + 1:], var, truth) is not None
+    return False
+
+
+def _check_initial_flow(statements, var, truth):
+    # True = the original value can reach the next statement, False = it
+    # cannot, None = an observation or control transfer we cannot prove safe.
+    def mentions(node):
+        return node is not None and any(isinstance(n, ast.Name) and n.id == var for n in ast.walk(node))
+
+    def condition(expr):
+        if isinstance(expr, ast.Name) and expr.id == var:
+            return truth
+        if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+            value = condition(expr.operand)
+            return None if value is None else not value
+        return None
+
+    for stmt in statements:
+        if isinstance(stmt, (ast.Break, ast.Continue, ast.Try, ast.TryStar, ast.With, ast.Match, ast.While)):
+            return None
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            return None if mentions(stmt) else False
+        if isinstance(stmt, ast.Assert):
+            value = condition(stmt.test)
+            if value is False:
+                return None if mentions(stmt.msg) else False
+            if value is None and mentions(stmt):
+                return None
+        elif isinstance(stmt, ast.If):
+            value = condition(stmt.test)
+            if value is None and mentions(stmt.test):
+                return None
+            branches = [stmt.body, stmt.orelse] if value is None else [stmt.body if value else stmt.orelse]
+            result = [_check_initial_flow(branch, var, truth) for branch in branches]
+            if None in result:
+                return None
+            if not any(result):
+                return False
+        elif isinstance(stmt, ast.For):
+            if mentions(stmt.iter) or mentions(stmt.target) or stmt.orelse:
+                return None
+            if _check_initial_flow(stmt.body, var, truth) is None:
+                return None
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == var and stmt.value is not None:
+                return None if mentions(stmt.value) else False
+            if mentions(stmt):
+                return None
+        elif mentions(stmt):
+            return None
+    return True

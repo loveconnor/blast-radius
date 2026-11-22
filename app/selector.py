@@ -306,12 +306,22 @@ def main():
             # same fixture and probe paths as the edit without incidental comments.
             if not D.import_change and not D.all and D.ast_unchanged:
                 D.files = {r: src for r, src in D.files.items() if r not in D.ast_unchanged}
+            if (not STATIC_ONLY[0] and not D.import_change and not D.all and not fixture_edits
+                    and len(D.files) == 1 and "comment=" in patch_text):
+                import generatorsites
+                D.cands.difference_update(generatorsites.cleared(D.files, REPO, M) - D.must)
             if D.must:
                 must[cid] = set(D.must)
             if not D.all and not fixture_edits and D.parsed and all(r.endswith(".py") for r in D.files):
                 # only the cheap screen here; the proof itself runs after the tests
                 try:
-                    from equiv import maybe_equivalent
+                    from equiv import maybe_equivalent, unused_initial_value
+                    if (not D.import_change and not D.must and len(D.files) == 1
+                            and re.search(r"(?m)^[-+]\s+\w+(?:: [^=\n]+)? = (?:None|False|True|[0-9]+)\s*$", patch_text)
+                            and unused_initial_value(D.files, REPO, D.parsed)):
+                        answers[cid] = []
+                        log(cid, "none (unobserved local initializer)")
+                        continue
                     if maybe_equivalent(D.files, REPO, D.parsed):
                         maybe_equiv[cid] = D.files
                 except Exception as e:  # noqa
@@ -1032,6 +1042,7 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     R = _replay()
     tkeys = {t: R["tests"][t] for t in inside}
     likely = None
+    parser_reach = None
     if route_plan is not None:
         mask, eligible = route_plan
         bits = mask.to_bytes((len(R["dig"]) + 7) // 8, "little")
@@ -1066,6 +1077,8 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
             else:
                 complete_tests = ()
                 narrowed = bits
+            if all(f == "sqlglot/generator.py" or f.startswith("sqlglot/generators/") for f in allines):
+                parser_reach = bits
             filtered = {}
             for t, ks in tkeys.items():
                 use = narrowed if t in complete_tests else bits
@@ -1154,6 +1167,7 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
     rkeys = R["keys"]
     rdig = R["dig"]
     has_gen = any(rkeys[k][0] == "g" for k in keys)
+    trees = replay.generator_inputs() if parser_reach is not None and has_gen else {}
     # Order by value per estimated replay cost so heavy tests clear first even under tight caps.
     t_val = {}
     t_est0 = {}
@@ -1218,7 +1232,12 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
                     timer_armed = True
                     fast_cnt = 8
                 try:
-                    ch = replay.run_key(rkeys[k], cache_parse=has_gen) != rdig[k]
+                    tree = trees.get(k)
+                    if tree:
+                        source = tree[0]
+                        if parser_reach[source >> 3] & (1 << (source & 7)):
+                            tree = None
+                    ch = replay.run_key(rkeys[k], cache_parse=has_gen, tree_record=tree) != rdig[k]
                 except runner.Timeout:
                     ch = True
                     n_hangs += 1
@@ -2020,14 +2039,8 @@ def _global_refs(name, nodeids):
         import sourcerefs
         found = sourcerefs.find(name)
         if found is not None:
-            source, paths = found
-            tests = set()
-            for path in paths:
-                matched = MAP_OBJ.tests_in_file(path)
-                if not matched:
-                    return None
-                tests.update(matched)
-            return source, tests
+            source, tests = found
+            return None if tests is None else (source, set(tests))
         _preload_src_text()
         pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name))
         src, tests = {}, set()

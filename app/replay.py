@@ -13,6 +13,8 @@ the log records emitted through the "sqlglot" logger.
 from __future__ import annotations
 
 import enum
+import functools
+from pathlib import Path
 import hashlib
 import importlib
 import json
@@ -229,11 +231,43 @@ def _parse_key(key):
     return d.parse_into(_dec(key[8]), key[6])
 
 
-def run_key(key, cache_parse=True):
+TREE_INDEX = Path(__file__).with_name("replaytrees.idx")
+TREE_DATA = Path(__file__).with_name("replaytrees.bin")
+
+
+@functools.lru_cache(maxsize=1)
+def generator_inputs():
+    if not TREE_INDEX.is_file() or not TREE_DATA.is_file():
+        return {}
+    with TREE_INDEX.open("rb") as fh:
+        return pickle.load(fh)
+
+
+@functools.lru_cache(maxsize=1)
+def _tree_fd():
+    return os.open(TREE_DATA, os.O_RDONLY)
+
+
+def generate(key, tree):
+    dialect = _dialect(key)
+    opts = {k: _dec(v) for k, v in key[7]} if key[7] else {}
+    copy = bool(key[8])
+    return observe(lambda: ("G", dialect.generate(tree, copy=copy, **opts), None if copy else runner.canon(tree)))[0]
+
+
+def run_key(key, cache_parse=True, tree_record=None):
     """Replay one recorded phase call under the current code; returns its digest."""
     if key[0] == "g":
         src, idx = key[6]
         copy = bool(key[8])
+        if tree_record is not None:
+            _, offset, length = tree_record
+            try:
+                tree = load_tree(pickle.loads(zlib.decompress(os.pread(_tree_fd(), length, offset))))
+            except Exception:
+                pass  # Regenerate this input from its original parse call.
+            else:
+                return generate(key, tree)
         if src == "s":
             try:
                 tree = snapshot(idx)
@@ -255,10 +289,7 @@ def run_key(key, cache_parse=True):
                 tree = res[idx]
             except Exception:  # noqa
                 return None
-        d = _dialect(key)
-        k7 = key[7]
-        opts = {k: _dec(v) for k, v in k7} if k7 else {}
-        return observe(lambda: ("G", d.generate(tree, copy=copy, **opts), None if copy else runner.canon(tree)))[0]
+        return generate(key, tree)
     bh = _BATCH_LOG[0]
     if bh is not None:
         h = bh
