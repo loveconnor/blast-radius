@@ -389,6 +389,44 @@ def ast_changes(old_src: str, new_src: str, new_tree=None):
     return False, d.changes
 
 
+def literal_default_edit(path, old_src, new_tree):
+    """Identify a single changed literal default with identical syntax everywhere else."""
+    old_tree = _parse_old(old_src)
+
+    def defaults(tree):
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                args = fn.args
+                pos = args.posonlyargs + args.args
+                for params, values in ((pos[len(pos) - len(args.defaults):], args.defaults),
+                                       (args.kwonlyargs, args.kw_defaults)):
+                    for i, (param, value) in enumerate(zip(params, values)):
+                        if isinstance(value, ast.Constant):
+                            yield (cls.name, fn.name, param.arg), (values, i)
+
+    old = dict(defaults(old_tree))
+    for key, (values, i) in defaults(new_tree):
+        if key not in old:
+            continue
+        previous, j = old[key]
+        if ast.dump(values[i]) == ast.dump(previous[j]):
+            continue
+        # Restore the literal temporarily to check the entire module for other edits.
+        saved = values[i]
+        values[i] = previous[j]
+        try:
+            if ast.dump(old_tree) == ast.dump(new_tree):
+                return (path, *key)
+        finally:
+            values[i] = saved
+        break
+    return None
+
+
 # ---------------------------------------------------------------- differential instrumentation
 
 _PURE_CALLS = {"isinstance", "len", "get", "getattr", "hasattr", "type", "bool", "str", "int", "float",

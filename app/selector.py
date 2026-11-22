@@ -262,7 +262,7 @@ def main():
                     n_sites = res[1]
             subf = {}
             if not D.import_change and all(r.split(" ", 1)[0] in ("rt", "ast-same", "annotation") for r in D.reasons):
-                subf = submit_filter(D, cands)
+                subf = submit_filter(D.rt_lines, cands)
             CPU_OVR.clear()
             CPU_OVR.update(sub_cpu(subf))
             memo_duck = all((f.startswith("sqlglot/") and f.endswith(".py")) or
@@ -327,6 +327,7 @@ def main():
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
                 fixture_sql_only=fixture_sql_only,
+                default_edit=D.default_edit if len(D.files.keys() - D.ast_unchanged) == 1 else None,
                 precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
                 reasons=" ".join(D.reasons)[:200],
             ))
@@ -406,17 +407,17 @@ def _submap():
     return _SUBMAP
 
 
-def submit_filter(D, cands):
+def submit_filter(lines_by_file, cands):
     """For pool-based tests, which submitted queries can reach the changed lines."""
     out = {}
-    if not D.rt_lines or (1106 not in cands and 1107 not in cands):
+    if not lines_by_file or (1106 not in cands and 1107 not in cands):
         return out
     for t, (n, main, subs) in _submap().items():
         if t not in cands:
             continue
         allow = set()
         ok = True
-        for f, lines in D.rt_lines.items():
+        for f, lines in lines_by_file.items():
             if lines & main.get(f, set()):
                 ok = False
                 break
@@ -1547,6 +1548,19 @@ def overlay_candidates(j, old_mods, nodeids):
             return {"all": True, "note": note + " broad"}
     if delta:
         cands |= untraced & (broad | precise)
+    default_sites = []
+    if j.get("default_edit") and not forced and len(delta) == 1:
+        path, cls, method, arg = j["default_edit"]
+        if delta[0] == ("meth", f"{_modname(path)}:{cls}", method, None):
+            import gzip
+            try:
+                with gzip.open(HERE / "defaults.json.gz", "rt") as fh:
+                    trace = json.load(fh).get(f"{path}:{cls}.{method}:{arg}", {})
+            except (OSError, ValueError):
+                trace = {}
+            cands.difference_update(trace.get("explicit", ()))
+            default_sites = trace.get("groups", [])
+            note += f" explicit={len(trace.get('explicit', ()))}"
     # A generator class's dispatch table is built once per process from TRANSFORMS and the
     # *_sql methods and then reused: the per-input attribute trace only saw those reads
     # for the first input that built it. For such a change every input that creates a
@@ -1571,7 +1585,7 @@ def overlay_candidates(j, old_mods, nodeids):
             break
     except Exception:  # noqa
         disp = True
-    return {"cands": cands, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+    return {"cands": cands, "default_sites": default_sites, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
             "cls_readers": (cls_readers | untraced) if (cls_ok and not unknown and not forced and not disp) else None,
@@ -2131,6 +2145,24 @@ def _child(j, nodeids, ms, runner, modules):
             runner.ITER_FILTER.update(itf)
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
+        # A default-only edit can affect a query or fixture iteration only if it
+        # reaches a call that omitted that argument in this test's baseline run.
+        if res.get("default_sites"):
+            candidate_set = set(cands)
+            for locs, traced in res["default_sites"]:
+                tests = candidate_set.intersection(traced)
+                if not tests:
+                    continue
+                lines = {}
+                for rel, line in locs:
+                    lines.setdefault(rel, set()).add(line)
+                itf = iter_filter(tests, lines)
+                subf = submit_filter(lines, tests)
+                runner.ITER_FILTER.update(itf)
+                runner.SUBMIT_FILTER.update(subf)
+                iter_cpu(itf)
+                CPU_OVR.update(sub_cpu(subf))
+                j["subf"].update(subf)
         runner.MEMO_SKIP.clear()
         if runner.MEMO_DUCK:
             if res.get("fn_only") and ov_lines is not None:
@@ -2173,12 +2205,13 @@ def _child(j, nodeids, ms, runner, modules):
         note += rn
         if HANG[0]:
             return {"failed": [], "unrun": sorted(cands), "note": note}
-        if len(cands) != len(allc) or not j["light"]:
-            if not cands:
-                return {"failed": [], "unrun": [], "note": note}
-            light, heavy, est, static = plan_split(cands, ms, CPU, False, prepared is True)
-            j["light"], j["heavy"] = light, heavy
-            unrun = list(heavy)
+        if not cands:
+            return {"failed": [], "unrun": [], "note": note}
+        # Preparation and replay have already been paid for. Plan the remaining
+        # work with the measured CPU rate even when replay kept every candidate.
+        light, heavy, _, _ = plan_split(cands, ms, CPU, False, prepared is True, overhead=0.0)
+        j["light"], j["heavy"] = light, heavy
+        unrun = list(heavy)
     signal.setitimer(signal.ITIMER_REAL, 0)
     runner.TIMEOUTS[0] = 0
     PROF["marks"].append(("plan", round(time.process_time(), 2)))
@@ -2357,18 +2390,22 @@ def _child(j, nodeids, ms, runner, modules):
                 emp_pass = (max(0, n_or - n_of) + 2.0) / (max(1, n_or) + 4.0)
                 p_pass_other = max(P2_PASS_FAILED, min(P2_PASS, emp_pass))
             p_pass_hit = p_pass_other
+        # With no confirmed failure, clearing the entire tail also avoids the
+        # first worker charge. Include short tests in that joint decision.
+        all_unconfirmed = not failed and not FORCED
+        margin = 0.80 if all_unconfirmed else LATE_MARGIN
         late = []
-        big = [t for t in unrun if ms[t] >= LATE_MIN_MS]
+        big = [t for t in unrun if all_unconfirmed or ms[t] >= LATE_MIN_MS]
         pool_late = []
         for t in big:
             p_pass = p_pass_hit if t in REPLAY_HIT else p_pass_other
             c = cpu_of(t, ms) * mult
-            if c <= budget and (ms[t] / 1000.0 + 2.0) * p_pass > LATE_MARGIN * c + 0.08:
+            if c <= budget and (ms[t] / 1000.0 + 2.0) * p_pass > margin * c + 0.08:
                 pool_late.append(t)
         while pool_late and not runner.TIMEOUTS[0]:
             cur = set(unrun) | failed | FORCED
             cur_cost = schedule_cost(cur, ms)[1]
-            efficient = sorted(pool_late, key=lambda t: cpu_of(t, ms) / ms[t])[:12]
+            efficient = sorted(pool_late, key=lambda t: cpu_of(t, ms) / max(1, ms[t]))[:12]
             longest = sorted(pool_late, key=lambda t: -ms[t])[:12]
             pick = None
             best_net = 0.0
@@ -2380,10 +2417,11 @@ def _child(j, nodeids, ms, runner, modules):
                     if acc_c > budget:
                         break
                     rem.add(t)
-                    acc_w += ms[t]
-                    acc_wp += ms[t] * (p_pass_hit if t in REPLAY_HIT else p_pass_other)
+                    weight = max(1, ms[t])
+                    acc_w += weight
+                    acc_wp += weight * (p_pass_hit if t in REPLAY_HIT else p_pass_other)
                     gain = (cur_cost - schedule_cost(cur - rem, ms)[1]) / 1000.0
-                    net = gain * acc_wp / acc_w - LATE_MARGIN * acc_c - 0.08
+                    net = gain * acc_wp / acc_w - margin * acc_c - 0.08
                     if net > best_net:
                         best_net = net
                         pick = order[0]
@@ -2397,6 +2435,7 @@ def _child(j, nodeids, ms, runner, modules):
             failed |= set(f)
             late.append(pick)
             if f:
+                margin = LATE_MARGIN
                 if not REPLAY_HIT or pick not in REPLAY_HIT:
                     n_or += 1
                     n_of += 1

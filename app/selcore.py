@@ -72,6 +72,7 @@ class Decision:
         self.cands: set[int] = set()
         self.precise: set[int] = set()   # candidates not coming from broad import-time guesses
         self.all = False
+        self.default_edit = None
         self.ast_unchanged = set()
         self.parsed = {}  # patched trees reused when instrumenting this change
         self.must: set[int] = set()      # tests that fail for certain: selected without being run
@@ -423,6 +424,9 @@ def _python(p, old_text, new_text, fp, M, D, repo=None):
         D.all = True
         D.reasons.append(f"cache-fill {p}")
         return
+    if p.startswith("sqlglot/") and all(ch.kind == "signature" for ch in changes):
+        from patchlib import literal_default_edit
+        D.default_edit = literal_default_edit(p, old_text, tree)
     for ch in changes:
         s, e = ch.lines
         e = min(e, n_lines)     # "to the end of the file" is recorded as a huge line number
