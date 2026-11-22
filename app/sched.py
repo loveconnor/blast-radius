@@ -126,3 +126,45 @@ def best_schedule(tests, ms_of, want_workers=True):
         return best_ws, best_c
     ws, _ = lpt(items, best_k, want_workers=True)
     return ws, best_c
+
+
+def verification_prefixes(candidates, durations, verify_ms, fixed=()):
+    """Find promising verification sets for a mix of long and short tests.
+
+    At k workers, removing m milliseconds of work saves at most m/k on a
+    balanced schedule. Long tests can independently determine the makespan.
+    Clear a few such bottlenecks, then buy remaining work by its CPU cost per
+    simulated millisecond. The caller checks proposals against real schedules.
+    """
+    ordered = sorted(candidates, key=durations.__getitem__, reverse=True)
+    cheap = sorted(ordered, key=lambda t: verify_ms[t] / max(1, durations[t]))
+    fixed_load = sum(durations[t] for t in fixed)
+    fixed_peak = max((durations[t] for t in fixed), default=0)
+    total = fixed_load + sum(durations[t] for t in ordered)
+    proposals = {}
+    prefix_cost = 0.0
+    prefix_load = 0
+    for count in range(min(12, len(ordered) - 1) + 1):
+        bottlenecks = frozenset(ordered[:count])
+        peak = max(fixed_peak, durations[ordered[count]])
+        for workers in range(1, 9):
+            cost = prefix_cost
+            load = total - prefix_load
+            stop = 0
+            for stop, t in enumerate(cheap):
+                if t in bottlenecks:
+                    continue
+                if verify_ms[t] * workers >= durations[t] or load <= peak * workers:
+                    break
+                load -= durations[t]
+                cost += verify_ms[t]
+            else:
+                stop = len(cheap)
+            key = (count, stop)
+            estimate = cost + 2000 * workers + max(peak, load / workers)
+            proposals[key] = min(estimate, proposals.get(key, float("inf")))
+        t = ordered[count]
+        prefix_load += durations[t]
+        prefix_cost += verify_ms[t]
+    for count, stop in sorted(proposals, key=proposals.get)[:5]:
+        yield set(ordered[:count]).union(cheap[:stop])

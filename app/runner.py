@@ -1372,11 +1372,18 @@ def _once_fixtures(C):
     try:
         setup = C.setUpClass
         state = [False]
+        error = []
 
         def setUpClass(cls):
+            if error:
+                raise error[0].with_traceback(None)
             if not state[0]:
+                try:
+                    setup()
+                except BaseException as exc:
+                    error.append(exc)
+                    raise
                 state[0] = True
-                setup()
         C.setUpClass = classmethod(setUpClass)
         C.tearDownClass = classmethod(lambda cls: None)
         C._br_once = True

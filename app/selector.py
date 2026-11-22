@@ -1533,6 +1533,17 @@ def plan_split(cands, ms, cpu, overlay, can_diff=False, overhead=None, mult=1.0,
         cost = u_cost + (sum(cpu_of(t, ms) for t in rs) * mult + ovh) * 1000 + 500
         if cost + CHEAP_MARGIN * 1000 < best[0]:
             best = (cost, U)
+    if not can_diff and len(cands) >= 80 and static_cost >= 10000:
+        from sched import verification_prefixes
+        prices = {t: cpu_of(t, ms) * mult * 1000 for t in cands}
+        for verify in verification_prefixes(cands, ms, prices, base):
+            if not verify or len(verify) == len(cands):
+                continue
+            remaining = [t for t in cands if t not in verify]
+            cpu_ms = sum(prices[t] for t in verify)
+            cost = schedule_cost(remaining + base, ms)[1] - floor + cpu_ms + ovh * 1000 + 500
+            if cost + 500 < best[0]:
+                best = (cost, remaining)
     if best[1] is None:
         return [], sorted(cands, key=lambda t: -cpu_of(t, ms)), static_cost, static_cost
     U = list(best[1])
@@ -1890,6 +1901,24 @@ def overlay_candidates(j, old_mods, nodeids):
     cands = set(precise)
     unknown = []
     M = MAP_OBJ
+    if not forced and j.get("pure_src") and all(p.startswith("sqlglot/generators/") for p in j["files"]):
+        import dispatch
+        handlers = dispatch.removed_handlers(j["files"], old_mods, new_mods, delta, M)
+        if handlers:
+            selected = precise | untraced
+            for attr, called in handlers.items():
+                refs = _global_refs(attr, nodeids)
+                if refs is None:
+                    break
+                selected.update(called)
+                selected.update(refs[1])
+                for path, lines in refs[0].items():
+                    for line in lines:
+                        selected.update(M.covering(path, line, line))
+            else:
+                for path in j["files"]:
+                    selected.update(source_observers(path, M))
+                return {"cands": selected, "note": f"removed generator handlers={len(handlers)}"}
     OR = load_outreads() if REPLAY_ON else False
     outside = set(OR[2]) if OR else set()   # tests that touch a change outside parse phases
     fn_lines = {}
@@ -2127,6 +2156,36 @@ def overlay_candidates(j, old_mods, nodeids):
     if j.get("default_edit") and not forced and len(delta) == 1:
         path, cls, method, arg = j["default_edit"]
         if delta[0] == ("meth", f"{_modname(path)}:{cls}", method, None):
+            import ast
+            import equiv
+            module = _modname(path)
+            old_cls, new_cls = vars(old_mods[module]).get(cls), vars(new_mods[module]).get(cls)
+            if type(old_cls) is type and type(new_cls) is type:
+                names = equiv.normalized_default(new_mods[module], ast.parse(j["files"][path]), cls, method, arg,
+                                                vars(old_cls).get(method), vars(new_cls).get(method))
+                if names:
+                    # Keep direct test references (including constructor mocks),
+                    # reflection and source inspectors even when calls normalize.
+                    reflection = {"__defaults__", "__kwdefaults__", "signature", "getfullargspec",
+                                  "getsource", "getmembers", "getdoc", "pydoc"}
+                    refs = {n: _global_refs(n, nodeids) for n in names | reflection}
+                    if all(ref is not None for ref in refs.values()):
+                        external = set(untraced) | source_observers(path, M)
+                        for ref in refs.values():
+                            external.update(ref[1])
+                        external.update(M.tests_in_file("tests/test_docs.py"))
+                        # A raw callable stored by production code can reach an
+                        # inspector even if the test never names the method.
+                        watch = (method, "__defaults__", "__kwdefaults__", "signature", "getfullargspec")
+                        paths = {p for name in watch for p in refs[name][0]}
+                        for p in paths:
+                            tree = equiv._tree(REPO, p)
+                            if tree is None:
+                                external.update(M.file_users(p))
+                                continue
+                            for line in equiv.signature_value_reads(tree, {method}):
+                                external.update(M.covering(p, line, line))
+                        return {"cands": external, "note": "equivalent normalized default"}
             import gzip
             try:
                 with gzip.open(HERE / "defaults.json.gz", "rt") as fh:
@@ -3064,6 +3123,13 @@ def _child(j, nodeids, ms, runner, modules):
         rp["dropped"].update(set(rest) - set(best_keep))
         return best_keep
 
+    # The entry-point tests unconditionally clear the dialect registry in
+    # tearDown. Earlier tests in the pinned suite still see the populated map.
+    writers = [t for t in ordered if nodeids[t].startswith("tests/test_dialect_entry_points.py::")]
+    if writers:
+        first, last = min(writers), max(writers)
+        ordered = ([t for t in ordered if t < first] + sorted(t for t in ordered if first <= t <= last)
+                   + [t for t in ordered if t > last])
     skipped = []
     if os.environ.get("BR_PROFILE"):
         import cProfile, pstats, io

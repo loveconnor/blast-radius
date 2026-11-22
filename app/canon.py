@@ -97,34 +97,39 @@ def valid_links(roots):
     return True
 
 
-def dump_tree(v):
+def dump_tree(v, validate=False, parent=None, key=None, index=None):
     t = type(v)
     if v is None or t is str or t is int or t is bool or t is float:
         return v
     if _is_expr(v):
-        return ("X", t.__module__, t.__qualname__, [(k, dump_tree(x)) for k, x in v.args.items()],
-                dump_tree(v._type), dump_tree(v.comments), dump_tree(v._meta))
+        if validate and parent is not None and (v.parent is not parent or v.arg_key != key or v.index != index):
+            raise Undumpable("inconsistent expression link")
+        return ("X", t.__module__, t.__qualname__,
+                [(k, dump_tree(x, validate, v, k)) for k, x in v.args.items()],
+                dump_tree(v._type, validate), dump_tree(v.comments, validate), dump_tree(v._meta, validate))
     if isinstance(v, _Enum):
         return ("E", t.__module__, t.__qualname__, v.name)
     if isinstance(v, (str, int, float, bool)):
         return v
     if isinstance(v, list):
-        return ("L", [dump_tree(x) for x in v])
+        if validate and parent is not None and index is None:
+            return ("L", [dump_tree(x, True, parent, key, i) for i, x in enumerate(v)])
+        return ("L", [dump_tree(x, validate) for x in v])
     if isinstance(v, tuple):
-        return ("U", [dump_tree(x) for x in v])
+        return ("U", [dump_tree(x, validate) for x in v])
     if isinstance(v, dict):
-        return ("D", [(dump_tree(k), dump_tree(x)) for k, x in v.items()])
+        return ("D", [(dump_tree(k, validate), dump_tree(x, validate)) for k, x in v.items()])
     if isinstance(v, frozenset):
-        return ("F", [dump_tree(x) for x in v])
+        return ("F", [dump_tree(x, validate) for x in v])
     if isinstance(v, set):
-        return ("S", [dump_tree(x) for x in v])
+        return ("S", [dump_tree(x, validate) for x in v])
     raise Undumpable(t.__qualname__)
 
 
 def snapshot_digest(expression):
     """Include empty arguments, container types and exact class names in optimizer comparisons."""
     try:
-        return hashlib.sha256(marshal.dumps(dump_tree(expression), 2)).digest()
+        return hashlib.sha256(marshal.dumps(dump_tree(expression, validate=True), 2)).digest()
     except (Undumpable, ValueError, RecursionError):
         return None
 

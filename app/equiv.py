@@ -620,3 +620,91 @@ def _check_initial_flow(statements, var, truth):
         elif mentions(stmt):
             return None
     return True
+
+
+def normalized_default(module, tree, owner, method, param, old_fn, new_fn):
+    """Check a literal default consumed only by truth tests or a falsey fallback.
+
+    A default can also pass through a keyword to an ordinary constructor in the
+    same module. Return the names of bindings callers could inspect or replace.
+    """
+    import inspect
+    import types
+
+    if not all(type(f) is types.FunctionType and f.__module__ == module.__name__
+               and f.__qualname__ == owner + "." + method for f in (old_fn, new_fn)):
+        return None
+    values = [inspect.signature(fn).parameters[param].default for fn in (old_fn, new_fn)]
+    if not all(v is None or type(v) in (bool, int, float, str, bytes) for v in values):
+        return None
+    truth = bool(values[0])
+    if truth != bool(values[1]):
+        return None
+    classes = {cls.name: cls for cls in tree.body if isinstance(cls, ast.ClassDef)}
+    bindings = {method}
+
+    def consumed(cls, name, arg, forward):
+        if cls not in classes:
+            return False
+        functions = [f for f in classes[cls].body if isinstance(f, ast.FunctionDef) and f.name == name]
+        if len(functions) != 1 or functions[0].decorator_list:
+            return False
+        fn = functions[0]
+        if arg not in {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}:
+            return False
+        parents = {child: n for stmt in fn.body for n in ast.walk(stmt) for child in ast.iter_child_nodes(n)}
+        if any(isinstance(n, ast.Name) and n.id in {"locals", "vars", "eval", "exec", "super"}
+               or isinstance(n, (ast.FunctionDef, ast.Lambda, ast.ClassDef))
+               or isinstance(n, ast.Attribute) and n.attr in {"_getframe", "currentframe", "f_locals"}
+               for stmt in fn.body for n in ast.walk(stmt)):
+            return False
+        for n, parent in parents.items():
+            if not isinstance(n, ast.Name) or n.id != arg:
+                continue
+            if not isinstance(n.ctx, ast.Load):
+                return False
+            if isinstance(parent, (ast.If, ast.IfExp, ast.While)) and parent.test is n:
+                continue
+            if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+                continue
+            if not truth and isinstance(parent, ast.BoolOp) and isinstance(parent.op, ast.Or) and n is not parent.values[-1]:
+                continue
+            if forward and isinstance(parent, ast.keyword) and parent.arg:
+                call = parents.get(parent)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                    target = vars(module).get(call.func.id)
+                    if (type(target) is type and target.__module__ == module.__name__
+                            and target.__name__ == call.func.id and target.__new__ is object.__new__
+                            and type(vars(target).get("__init__")) is types.FunctionType
+                            and consumed(target.__name__, "__init__", parent.arg, False)):
+                        bindings.add(target.__name__)
+                        continue
+            return False
+        return True
+
+    return bindings if consumed(owner, method, param, True) else None
+
+
+def signature_value_reads(tree, names):
+    """Locations where the pinned code can observe a method or its default values."""
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for n, parent in parents.items():
+        if isinstance(n, ast.Attribute) and n.attr in names:
+            if not (isinstance(parent, ast.Call) and parent.func is n):
+                yield n.lineno
+        if not isinstance(n, ast.Attribute):
+            continue
+        if n.attr in ("__defaults__", "__kwdefaults__"):
+            yield n.lineno
+        if n.attr not in ("getfullargspec", "signature"):
+            continue
+        result = parents.get(parent)
+        if isinstance(parent, ast.Call) and parent.func is n and isinstance(result, ast.Attribute):
+            if n.attr == "getfullargspec" and result.attr in ("args", "kwonlyargs", "varargs", "varkw"):
+                continue
+            use = parents.get(result)
+            if n.attr == "signature" and result.attr == "parameters" and isinstance(use, ast.Call):
+                # Iteration over the mapping yields only parameter names.
+                if isinstance(use.func, ast.Name) and use.func.id == "enumerate" and use.args == [result]:
+                    continue
+        yield n.lineno

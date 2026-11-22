@@ -229,3 +229,47 @@ def removed_property(job, module, coverage):
     for names in data["reads"].values():
         readers.update(names.get(owner, ()))
     return owner, cls.name, readers
+
+
+def removed_handlers(files, old_modules, new_modules, delta, coverage):
+    """Bound side-effect-free method removals by the old handlers and their callers."""
+    if not files or not delta or not all(p.startswith("sqlglot/generators/") for p in files):
+        return None
+    rows = {}
+    for kind, owner, attr, key in delta:
+        module, _, cls = owner.partition(":")
+        if kind != "cls" or key is not None or attr.startswith("_") or not attr.endswith("_sql"):
+            return None
+        path = module.replace(".", "/") + ".py"
+        if path not in files or not cls.isidentifier():
+            return None
+        rows.setdefault(path, set()).add((cls, attr))
+    if set(rows) != set(files):
+        return None
+
+    from sqlglot.generator import Generator
+    affected = {}
+    for path, methods in rows.items():
+        module = path[:-3].replace("/", ".")
+        baseline = ast.parse(Path(old_modules[module].__file__).read_text())
+        edited = ast.parse(files[path])
+        found = set()
+        for cls in baseline.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for fn in list(cls.body):
+                if not isinstance(fn, ast.FunctionDef) or (cls.name, fn.name) not in methods:
+                    continue
+                new_cls = vars(new_modules[module]).get(cls.name)
+                if not isinstance(new_cls, type) or not issubclass(new_cls, Generator) or fn.name in vars(new_cls):
+                    return None
+                if fn.decorator_list or fn.args.defaults or any(fn.args.kw_defaults):
+                    return None
+                found.add((cls.name, fn.name))
+                # The pinned body is also reached through super(), preprocess,
+                # and saved bound methods, independently of generator dispatch.
+                affected.setdefault(fn.name, set()).update(coverage.covering(path, fn.lineno, fn.end_lineno))
+                cls.body.remove(fn)
+        if found != methods or ast.dump(baseline) != ast.dump(edited):
+            return None
+    return affected
