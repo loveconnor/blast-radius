@@ -86,13 +86,42 @@ def on_line(code, line):
 
 
 mon.register_callback(TOOL, mon.events.LINE, on_line)
+# Keep a second monitor so the existing outside-phase trace keeps its semantics.
+QUERY_TOOL = 3
+mon.use_tool_id(QUERY_TOOL, "brquery")
+query_maps = {}
+
+
+def switch_query(index, at_parse=False):
+    global current_query
+    current_query = contexts.setdefault((index, at_parse), {})
+    mon.restart_events()
+
+
+def query_line(code, line):
+    path = code.co_filename
+    if path.startswith(REPO + "sqlglot/"):
+        current_query.setdefault(path[len(REPO):], set()).add(line)
+    return mon.DISABLE
+
+
+mon.register_callback(QUERY_TOOL, mon.events.LINE, query_line)
 for i, tid in enumerate(IDS):
+    contexts = {}
+    if i < 2:
+        switch_query(None)
+        runner.QUERY_TRACE = switch_query
+        mon.set_events(QUERY_TOOL, mon.events.LINE)
     cur = {}
     rec["tpch"][tid] = "tpch" in tid
     mon.restart_events()
     mon.set_events(TOOL, mon.events.LINE)
     failed = runner.run_tests([i], IDS, timeouts=[3000.0])
     mon.set_events(TOOL, 0)
+    mon.set_events(QUERY_TOOL, 0)
+    runner.QUERY_TRACE = None
+    if i < 2:
+        query_maps[tid] = contexts
     if failed:
         print("baseline test failed:", tid, file=sys.stderr)
         sys.exit(1)
@@ -203,6 +232,7 @@ base_sqls = {
     False: frozenset((sql, repr(sorted(args.items()))) for args, sql, _ in T.TestExecutor.tpcds_sqls),
 }
 meta = {
+    "parsed": rec.get("parsed", {}),
     "dsql": rec["dsql"],
     "opt": rec["opt"],
     "rlines": rec["rlines"],
@@ -215,7 +245,26 @@ meta = {
 }
 with open(out_pkl, "wb") as fh:
     pickle.dump(meta, fh, protocol=4)
+# setUpClass only ran for the first test. Its outside-query lines apply to both.
+shared = {}
+query_index = {}
+for tid, contexts in query_maps.items():
+    for file, lines in contexts.pop((None, False)).items():
+        shared.setdefault(file, set()).update(lines)
+    # One integer per covered line. Bit i is set when fixture i hits it.
+    by_phase = [{}, {}]
+    indices = set()
+    for (i, at_parse), files in contexts.items():
+        indices.add(i)
+        for file, lines in files.items():
+            masks = by_phase[at_parse].setdefault(file, {})
+            for line in lines:
+                masks[line] = masks.get(line, 0) | (1 << i)
+    if indices == set(range(len(indices))):
+        query_index[tid] = (len(indices), by_phase)
 lite = {
+    "query_shared": shared,
+    "query_index": query_index,
     "opt": {k: bool(v) for k, v in rec["opt"].items()},
     "rlines": rec["rlines"],
     "tpch": rec["tpch"],

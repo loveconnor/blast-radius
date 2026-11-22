@@ -1,0 +1,19 @@
+name: Native AMD64 sample
+on:
+  workflow_dispatch:
+  push:
+    branches: [benchmark-amd64]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and score three fresh containers
+        run: |
+          uname -m
+          make sample

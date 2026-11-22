@@ -262,7 +262,7 @@ def main():
                     n_sites = res[1]
             subf = {}
             if not D.import_change and all(r.split(" ", 1)[0] in ("rt", "ast-same", "annotation") for r in D.reasons):
-                subf = submit_filter(D.rt_lines, cands)
+                subf = submit_filter(D.rt_lines, cands, nodeids)
             CPU_OVR.clear()
             CPU_OVR.update(sub_cpu(subf))
             memo_duck = all((f.startswith("sqlglot/") and f.endswith(".py")) or
@@ -407,10 +407,10 @@ def _submap():
     return _SUBMAP
 
 
-def submit_filter(lines_by_file, cands):
+def submit_filter(lines_by_file, cands, nodeids):
     """For pool-based tests, which submitted queries can reach the changed lines."""
     out = {}
-    if not lines_by_file or (1106 not in cands and 1107 not in cands):
+    if not lines_by_file or not any(t in cands for t in _submap()):
         return out
     for t, (n, main, subs) in _submap().items():
         if t not in cands:
@@ -426,7 +426,63 @@ def submit_filter(lines_by_file, cands):
                 allow.update(sf.get(l, ()))
         if ok and len(allow) < n:
             out[t] = allow
+    complete, _ = query_filter(lines_by_file, cands, nodeids)
+    for t, allow in complete.items():
+        out[t] = allow.intersection(out.get(t, allow))
     return out
+
+
+def query_filter(lines, cands, nodeids):
+    memo = _memo_lite() or {}
+    shared = memo.get("query_shared", {})
+    if any(shared.get(f, set()).intersection(ls) for f, ls in lines.items()):
+        return {}, {}
+    complete, parse_only = {}, {}
+    pos = _nodeid_pos(nodeids)
+    for tid, (n, phases) in memo.get("query_index", {}).items():
+        t = pos.get(tid)
+        if t not in cands or t not in _submap() or n != _submap()[t][0]:
+            continue
+        masks = []
+        for phase in phases:
+            mask = 0
+            for file, changed in lines.items():
+                hits = phase.get(file, {})
+                for line in changed:
+                    mask |= hits.get(line, 0)
+            masks.append(mask)
+        later, initial = masks
+        complete[t] = {i for i in range(n) if (later | initial) & (1 << i)}
+        parse_only[t] = {i for i in range(n) if (initial & ~later) & (1 << i)}
+    return complete, parse_only
+
+
+def setting_queries(delta, changed_lines, cands, nodeids):
+    """Combine runtime-line reach with reads of scalar settings in each TPC query."""
+    if not delta:
+        return {}
+    import pickle
+    try:
+        with open(HERE / "queryattrs.pkl", "rb") as fh:
+            tracked, reads = pickle.load(fh)
+    except OSError:
+        return {}
+    if not tracked.issuperset(delta):
+        return {}
+    reached, _ = query_filter(changed_lines, cands, nodeids)
+    for t in list(reached):
+        table = reads.get(nodeids[t])
+        if table is None:
+            del reached[t]
+            continue
+        mask = 0
+        for key in delta:
+            mask |= table.get(key, 0)
+        if mask & 1:
+            del reached[t]
+            continue
+        reached[t].update(i for i in range(_submap()[t][0]) if mask & (2 << i))
+    return reached
 
 
 def sub_cpu(subf):
@@ -1585,7 +1641,33 @@ def overlay_candidates(j, old_mods, nodeids):
             break
     except Exception:  # noqa
         disp = True
-    return {"cands": cands, "default_sites": default_sites, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+    setting_delta = set()
+    if not unknown and not forced and not disp:
+        for kind, owner, attr, key in delta:
+            if kind in ("methcode", "dictcode"):
+                continue
+            if kind != "cls" or key is not None or not attr.isupper():
+                setting_delta.clear()
+                break
+            mod, _, qual = owner.partition(":")
+            try:
+                values = []
+                for modules in (old_mods, new_mods):
+                    cls = modules[mod]
+                    for part in qual.split("."):
+                        cls = vars(cls)[part]
+                    values.append(vars(cls)[attr])
+                if any(v is not None and type(v) not in (bool, str, int, float) for v in values):
+                    break
+            except (KeyError, TypeError):
+                break
+            setting_delta.add((owner, attr))
+        else:
+            if setting_delta:
+                note += f" settings={len(setting_delta)}"
+        if len(setting_delta) != sum(d[0] == "cls" for d in delta):
+            setting_delta.clear()
+    return {"cands": cands, "default_sites": default_sites, "settings": setting_delta, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
             "cls_readers": (cls_readers | untraced) if (cls_ok and not unknown and not forced and not disp) else None,
@@ -2067,6 +2149,8 @@ def _child(j, nodeids, ms, runner, modules):
     runner.MEMO_SKIP.clear()
     runner.MEMO_SKIP.update(j.get("memo_skip") or [])
     tempfile.tempdir = j["tmp"]
+    if not j["overlay"] and j.get("pure_src") and j.get("ch_lines"):
+        _, runner.PARSE_ONLY = query_filter(j["ch_lines"], j["light"] + j["heavy"], nodeids)
     if not j["overlay"]:
         for r in j["hot"]:
             if r.startswith("sqlglot/") or r.startswith("tests/"):
@@ -2088,6 +2172,8 @@ def _child(j, nodeids, ms, runner, modules):
         except Exception:  # noqa
             pass
         j["overlay"] = True
+        runner.PARSE_ONLY.clear()
+        runner.SUBMIT_FILTER.clear()
         note = f"reimport({e})"
         prepared = runner.prepare(j, modules)
     PROF["prep"] = time.process_time() - c0
@@ -2140,11 +2226,23 @@ def _child(j, nodeids, ms, runner, modules):
                 optmemo.AFFECTED[:] = aff
                 optmemo.set_changed(ov_lines if OPT_PER_CALL else None)
                 opt_cpu(aff, cands)
+            _, runner.PARSE_ONLY = query_filter(ov_lines, cands, nodeids)
+            subf = submit_filter(ov_lines, cands, nodeids)
+            runner.SUBMIT_FILTER.update(subf)
+            j["subf"].update(subf)
+            CPU_OVR.update(sub_cpu(subf))
             itf = iter_filter(cands, ov_lines)
             iter_cpu(itf)
             runner.ITER_FILTER.update(itf)
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
+        if res.get("settings") and ov_lines is not None:
+            subf = setting_queries(res["settings"], ov_lines, cands, nodeids)
+            runner.SUBMIT_FILTER.update(subf)
+            j["subf"].update(subf)
+            CPU_OVR.update(sub_cpu(subf))
+            if subf:
+                note += f" query-counts={ {t: len(v) for t, v in subf.items()} }"
         # A default-only edit can affect a query or fixture iteration only if it
         # reaches a call that omitted that argument in this test's baseline run.
         if res.get("default_sites"):
@@ -2157,7 +2255,7 @@ def _child(j, nodeids, ms, runner, modules):
                 for rel, line in locs:
                     lines.setdefault(rel, set()).add(line)
                 itf = iter_filter(tests, lines)
-                subf = submit_filter(lines, tests)
+                subf = submit_filter(lines, tests, nodeids)
                 runner.ITER_FILTER.update(itf)
                 runner.SUBMIT_FILTER.update(subf)
                 iter_cpu(itf)

@@ -381,6 +381,12 @@ def _memo_duck_same0(n):
         return False
 
 
+# During the image build the hook attributes parsing, execution and comparison
+# to the same fixture index, preserving the original two-pass execution order.
+QUERY_TRACE = None
+PARSE_ONLY = {}  # query indices whose changed lines run only in the initial parse
+
+
 def _memo_mp_execute(orig):
     def _mp_execute(self, schema, tables, sqls, tpch):
         if MEMO_REC is None and FIXTURE_CALLS is not None and MEMO is not None:
@@ -405,6 +411,45 @@ def _memo_mp_execute(orig):
                         if table is not None:
                             self.subtestHelper(i, table, tpch=tpch)
                 return
+        allow = _SUB["allow"]
+        parse_only = PARSE_ONLY.get(_SUB["t"], ())
+        if QUERY_TRACE is not None or allow is not None or parse_only:
+            T = sys.modules[type(self).__module__]
+            with T.ProcessPoolExecutor(
+                mp_context=T.get_context("spawn"), initializer=T.initializer, initargs=(schema, tables),
+            ) as pool:
+                futures = []
+                try:
+                    for i, (args, sql, _) in enumerate(sqls):
+                        if allow is not None and i not in allow:
+                            continue
+                        if QUERY_TRACE:
+                            QUERY_TRACE(i, True)
+                        expression = T.parse_one(sql)
+                        if QUERY_TRACE:
+                            QUERY_TRACE(i)
+                            if MEMO_REC is not None and args.get("execute"):
+                                MEMO_REC.setdefault("parsed", {})[(tpch, i)] = digest(expression)
+                        elif i in parse_only:
+                            if not args.get("execute"):
+                                continue
+                            expected = MEMO.get("parsed", {}).get((tpch, i))
+                            if expected is not None and digest(expression) == expected:
+                                continue
+                        _SUB["n"] = i
+                        futures.append((i, pool.submit(T.mp_execute, expression, args)))
+                    for i, future in futures:
+                        if QUERY_TRACE:
+                            QUERY_TRACE(i)
+                        table = future.result()
+                        if table is not None:
+                            self.subtestHelper(i, table, tpch=tpch)
+                        if _SUB["failed"]:
+                            break
+                finally:
+                    if QUERY_TRACE:
+                        QUERY_TRACE(None)
+            return
         return orig(self, schema, tables, sqls, tpch)
     _mp_execute._br_memo = True
     return _mp_execute
