@@ -176,3 +176,40 @@ def transform_reach(delta, coverage):
         return observed, direct, routes
     except Exception:
         return None
+
+
+def removed_property(job, module, coverage):
+    """Recognize deletion of a declarative Property subclass from the pinned checkout."""
+    path = "sqlglot/expressions/properties.py"
+    files = job["files"]
+    if not files.get(path) or any(p != path and p not in ("sqlglot/parser.py", "sqlglot/generator.py")
+                                  and not p.startswith(("sqlglot/parsers/", "sqlglot/generators/")) for p in files):
+        return None
+    source = Path(module.__file__).read_text()
+    original, edited = ast.parse(source), ast.parse(files[path])
+    remaining = {c.name for c in edited.body if isinstance(c, ast.ClassDef)}
+    removed = [c for c in original.body if isinstance(c, ast.ClassDef) and c.name not in remaining]
+    if len(removed) != 1:
+        return None
+    cls = removed[0]
+    if cls.decorator_list or cls.keywords or [ast.unparse(base) for base in cls.bases] != ["Property"]:
+        return None
+    for stmt in cls.body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and ast.unparse(stmt.targets[0]) == "arg_types"
+                and isinstance(stmt.value, ast.Dict) and all(isinstance(k, ast.Constant) and type(k.value) is str
+                                                            for k in stmt.value.keys)
+                and all(isinstance(v, ast.Constant) and type(v.value) is bool for v in stmt.value.values)):
+            return None
+    original.body.remove(cls)
+    if ast.dump(original) != ast.dump(edited) or vars(module)[cls.name].__subclasses__():
+        return None
+    data = trace()
+    if data["ids"] != coverage.tests or set(map(name, generator_classes())) != set(data["classes"]):
+        return None
+    owner = name(vars(module)[cls.name])
+    readers = set(data["unknown"])
+    for names in data["reads"].values():
+        readers.update(names.get(owner, ()))
+    return owner, cls.name, readers

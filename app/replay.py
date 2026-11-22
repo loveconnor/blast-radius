@@ -27,7 +27,7 @@ import pickle
 import zlib
 
 import runner
-from canon import dump_tree, load_tree
+from canon import dump_tree, load_tree, valid_links
 
 PH = {"depth": 0}
 REC: list = []        # (key string, digest, seconds) of the running test
@@ -300,6 +300,8 @@ def run_key(key, cache_parse=True, tree_record=None):
     res = exc = None
     try:
         res = _parse_key(key)
+        if not valid_links(res):
+            return None
         out = ("OK", runner.canon(res))
     except RecursionError as e:
         exc = e

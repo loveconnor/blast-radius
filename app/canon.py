@@ -4,6 +4,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import importlib
+import marshal
 import operator
 
 _Enum = enum.Enum
@@ -73,6 +74,29 @@ def _is_expr(e):
     return isinstance(getattr(e, "args", None), dict) and hasattr(e, "_meta") and hasattr(e, "arg_key")
 
 
+def valid_links(roots):
+    """Every parsed argument must point back to its actual parent and slot."""
+    pending = [node for node in roots if _is_expr(node)]
+    seen = set()
+    while pending:
+        parent = pending.pop()
+        if id(parent) in seen:
+            return False
+        seen.add(id(parent))
+        for name, value in parent.args.items():
+            if _is_expr(value):
+                if value.parent is not parent or value.arg_key != name or value.index is not None:
+                    return False
+                pending.append(value)
+            elif type(value) is list:
+                for index, item in enumerate(value):
+                    if _is_expr(item):
+                        if item.parent is not parent or item.arg_key != name or item.index != index:
+                            return False
+                        pending.append(item)
+    return True
+
+
 def dump_tree(v):
     t = type(v)
     if v is None or t is str or t is int or t is bool or t is float:
@@ -80,10 +104,10 @@ def dump_tree(v):
     if _is_expr(v):
         return ("X", t.__module__, t.__qualname__, [(k, dump_tree(x)) for k, x in v.args.items()],
                 dump_tree(v._type), dump_tree(v.comments), dump_tree(v._meta))
-    if isinstance(v, (str, int, float, bool)):
-        return v
     if isinstance(v, _Enum):
         return ("E", t.__module__, t.__qualname__, v.name)
+    if isinstance(v, (str, int, float, bool)):
+        return v
     if isinstance(v, list):
         return ("L", [dump_tree(x) for x in v])
     if isinstance(v, tuple):
@@ -95,6 +119,14 @@ def dump_tree(v):
     if isinstance(v, set):
         return ("S", [dump_tree(x) for x in v])
     raise Undumpable(t.__qualname__)
+
+
+def snapshot_digest(expression):
+    """Include empty arguments, container types and exact class names in optimizer comparisons."""
+    try:
+        return hashlib.sha256(marshal.dumps(dump_tree(expression), 2)).digest()
+    except (Undumpable, ValueError, RecursionError):
+        return None
 
 
 _CLS: dict = {}

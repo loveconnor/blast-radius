@@ -167,9 +167,7 @@ class InlineExecutor:
             getattr(fn, "__name__", None),
         ) == ("tests.test_executor", "mp_execute")
         if is_mp_exec and MEMO_REC is None and not PICKLE_TASKS:
-            f._job = (fn, a, k)
             f._nopickle = True
-            return f
         try:
             payload = pickle.dumps((fn, a, k))
             if self.input_digest is not None and is_mp_exec:
@@ -285,7 +283,7 @@ def _memo_get_pool(key):
     return FIXTURE_CALLS.get(key)
 
 
-from canon import canon, digest  # noqa: E402
+from canon import canon, digest, snapshot_digest  # noqa: E402
 import optmemo  # noqa: E402
 
 
@@ -316,8 +314,8 @@ def _memo_optimize(real):
             r = optmemo._tree(r.digest)
         elif cur is not None:
             if MEMO_REC is not None:
-                MEMO_REC["opt"].setdefault(MEMO_IDS.get(t), {})[cur] = digest(r)
-            elif base is not None and base == digest(r):
+                MEMO_REC["opt"].setdefault(MEMO_IDS.get(t), {})[cur] = snapshot_digest(r)
+            elif base is not None and base == snapshot_digest(r):
                 raise _SkipExec()
         return r
     optimize._br_memo = True
@@ -523,12 +521,12 @@ def _memo_mp_execute(orig):
                         if QUERY_TRACE:
                             QUERY_TRACE(i)
                             if MEMO_REC is not None and args.get("execute"):
-                                MEMO_REC.setdefault("parsed", {})[(tpch, i)] = digest(expression)
+                                MEMO_REC.setdefault("parsed", {})[(tpch, i)] = snapshot_digest(expression)
                         elif i in parse_only:
                             if not args.get("execute"):
                                 continue
                             expected = MEMO.get("parsed", {}).get((tpch, i))
-                            if expected is not None and digest(expression) == expected:
+                            if expected is not None and snapshot_digest(expression) == expected:
                                 continue
                         _SUB["n"] = i
                         futures.append((i, pool.submit(T.mp_execute, expression, args)))

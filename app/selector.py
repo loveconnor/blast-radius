@@ -180,6 +180,11 @@ def cold_module_tests(path, coverage, nodeids):
         return None
     selected = set(imports["by_mod"][module]) | coverage.file_users(path)
     selected.update(set(range(len(nodeids))) - imports["known"])
+    return sorted(selected | source_observers(path, coverage))
+
+
+def source_observers(path, coverage):
+    selected = set()
     # Reads and directory enumeration can observe a deletion without importing it.
     for opened, tests in coverage.opened.items():
         if path == opened or (opened.endswith("/") and path.startswith(opened)):
@@ -194,7 +199,7 @@ def cold_module_tests(path, coverage, nodeids):
             for number, line in enumerate((REPO / file).read_text().splitlines(), 1):
                 if "subprocess" in line and number in line_map:
                     selected.update(coverage.sets[line_map[number]])
-    return sorted(selected)
+    return selected
 
 
 def calibrate_cpu():
@@ -1895,8 +1900,35 @@ def overlay_candidates(j, old_mods, nodeids):
     only_aliases = True
     cold_readers = {}
     seen_enums = set()
+    property_leaf = None
+    if "sqlglot/expressions/properties.py" in j["files"] and not forced:
+        import dispatch
+        property_leaf = dispatch.removed_property(j, old_mods["sqlglot.expressions.properties"], M)
     for kind, owner, attr, key in delta:
         if kind == "cls":
+            if attr == "*" and property_leaf and owner == property_leaf[0]:
+                refs = _global_refs(property_leaf[1], nodeids)
+                if refs is not None:
+                    uses = set(refs[1]) | property_leaf[2]
+                    for path, numbers in refs[0].items():
+                        for n in numbers:
+                            uses.update(M.covering(path, n, n))
+                            fn_lines.setdefault(path, set()).add(n)
+                    # Deserialization can resolve the class by a computed name.
+                    # Enumeration can observe its absence without constructing it.
+                    for mod, fn in (("sqlglot.serde", "_load"), ("sqlglot.helper", "subclasses")):
+                        spans = _function_ranges(old_mods, new_mods, mod, fn)
+                        if spans is None:
+                            uses.update(M.file_users(mod.replace(".", "/") + ".py"))
+                        for span in spans or ():
+                            uses.update(M.covering(*span))
+                    uses.update(source_observers("sqlglot/expressions/properties.py", M))
+                    uses.update(M.tests_in_file("tests/test_docs.py"))
+                    uses.update(M.tests_in_file("tests/test_sqlglotc.py"))
+                    cands.update(uses)
+                    outside.update(uses)
+                    cls_readers.update(uses)
+                    continue
             if attr in ("*", "__mro__"):
                 unknown.append((kind, owner, attr))
                 continue
@@ -1908,6 +1940,21 @@ def overlay_candidates(j, old_mods, nodeids):
                 for k2, i in OR[1].get((owner, attr), []):
                     if key is None or k2 == key or k2 == "*":
                         outside |= OR[0][i]
+            if (not attr.startswith("_") and key is None and _is_enum(old_mods, new_mods, owner)):
+                module, _, cls = owner.partition(":")
+                before = vars(old_mods[module]).get(cls)
+                after = vars(new_mods[module]).get(cls)
+                if attr in getattr(before, "__members__", {}) and attr not in getattr(after, "__members__", {}):
+                    refs = _global_refs(attr, nodeids)
+                    import teststate
+                    writers = teststate.cleanup_fields(refs[1] if refs else range(len(nodeids)), nodeids, REPO, owner, attr)
+                    for writer, target, field in writers:
+                        groups = byattr.get((target, field), ())
+                        # Normal pytest order can expose this setting to later
+                        # tests even when they pass in isolated verification.
+                        readers = set().union(*(sets[i] for _, i in groups)) if groups else set(range(len(nodeids)))
+                        forced.update(t for t in readers | untraced if t >= writer)
+                        forced.add(writer)
             if owner not in seen_enums and _is_enum(old_mods, new_mods, owner):
                 seen_enums.add(owner)
                 cls_ok = False
@@ -1995,7 +2042,21 @@ def overlay_candidates(j, old_mods, nodeids):
                     if tests == nodeids:
                         instance_reads = sites.get(attr, {})
                 bare = sourcerefs.global_loads(attr) if owner.startswith("sqlglot") and alias_change else {}
+                registry = (property_leaf and owner == "sqlglot.expressions" and attr == "EXPR_CLASSES"
+                            and key == property_leaf[1].lower())
+                if registry:
+                    import statediff
+                    before = vars(old_mods["sqlglot.generator"])["_build_dispatch"]
+                    after = vars(new_mods["sqlglot.generator"])["_build_dispatch"]
+                    registry = statediff._Cmp().same_code(before.__code__, after.__code__)
                 for f, ls in refs[0].items():
+                    if registry and f == "sqlglot/generator.py":
+                        # Each arbitrary generator class can warm the entire map.
+                        # Only a lookup of this expression key sees the missing route.
+                        spans = _function_ranges(old_mods, new_mods, "sqlglot.generator", "_build_dispatch") or ()
+                        ls = {n for n in ls if not any(lo <= n <= hi for _, lo, hi in spans)}
+                        cands.update(property_leaf[2])
+                        outside.update(property_leaf[2])
                     # LOAD_GLOBAL resolves against this file's own namespace.
                     # An independent global on that line cannot see an alias
                     # appearing or disappearing in another module.

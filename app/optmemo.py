@@ -9,7 +9,7 @@ import pickle
 import sys
 import zlib
 
-from canon import digest, load_tree  # noqa: F401
+from canon import snapshot_digest as digest, load_tree  # noqa: F401
 
 _Enum = enum.Enum
 _sha1 = hashlib.sha1
@@ -30,19 +30,11 @@ def _strict(e, depth=0):
     if t is list or t is tuple:
         d1 = depth + 1
         return ["L" if t is list else "U"] + [_strict(x, d1) for x in e]
-    if hasattr(e, "_meta") and hasattr(e, "_type"):
-        args = getattr(e, "args", None)
-        if type(args) is dict:
-            d1 = depth + 1
-            items = [(k, _strict(v, d1)) for k, v in args.items() if v is not None and v != []]
-            items.sort(key=_item0)
-            et = e._type
-            ec = e.comments
-            em = e._meta
-            return ("X", t.__qualname__, items,
-                    None if et is None else _strict(et, d1),
-                    None if not ec else _strict(ec, d1),
-                    None if not em else _strict(em, d1))
+    if hasattr(e, "_meta") and hasattr(e, "_type") and type(getattr(e, "args", None)) is dict:
+        value = digest(e)
+        if value is None:
+            raise Unkeyable()
+        return ("X", value)
     if isinstance(e, (str, int, float, bool)):
         return e
     if isinstance(e, _Enum):
@@ -60,13 +52,6 @@ def _strict(e, depth=0):
     if isinstance(e, (set, frozenset)):
         d1 = depth + 1
         return ("S", sorted(repr(_strict(x, d1)) for x in e))
-    args = getattr(e, "args", None)
-    if isinstance(args, dict) and hasattr(e, "_meta") and hasattr(e, "_type"):
-        d1 = depth + 1
-        items = [(k, _strict(v, d1)) for k, v in args.items() if v is not None and v != []]
-        items.sort(key=_item0)
-        return ("X", t.__qualname__, items,
-                _strict(e._type, d1), _strict(e.comments or None, d1), _strict(e._meta or None, d1))
     mod = t.__module__
     if mod.startswith("sqlglot.dialects") and hasattr(e, "settings") and hasattr(e, "version"):
         d1 = depth + 1
