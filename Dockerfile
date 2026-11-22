@@ -27,6 +27,7 @@ COPY app /app
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /app/memo.pkl \
     || (rm -f /app/memo.pkl; echo "memo build failed: running without it")
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildqueryattrs.py /app/queryattrs.pkl
+RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildvalidators.py /app/validatorcalls.idx
 RUN BR_DATA=/nonexistent python /app/prep.py || echo "map preparation failed: maps are parsed at run time"
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

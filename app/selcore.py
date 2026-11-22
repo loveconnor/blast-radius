@@ -102,6 +102,8 @@ def analyze(patch_text: str, repo: Path, M: Map) -> Decision:
         return D
     for fp in fps:
         _analyze_file(fp, repo, M, D)
+    if len(fps) == 1 and not D.all:
+        _narrow_tpc_fixture(fps[0], D, repo, M)
     return D
 
 
@@ -385,6 +387,54 @@ def _shadows(p, repo):
         except Exception:  # noqa
             return True
     return False
+
+
+def _tpc_pairs(text):
+    # Match tests.helpers.load_sql_fixture_pairs at the pinned revision.
+    sql = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+    statements = sql.split(";")
+    pairs = []
+    for query, expected in zip(statements[::2], statements[1::2]):
+        lines = query.strip().split("\n")
+        meta = {}
+        first = 0
+        while lines[first].startswith("#"):
+            key, value = lines[first].split(":", 1)
+            meta[key.lstrip("#").strip()] = value.strip()
+            first += 1
+        pairs.append((meta, "\n".join(lines[first:]), expected.strip()))
+    return pairs
+
+
+def _narrow_tpc_fixture(fp, decision, repo, coverage):
+    paths = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tpch",
+             "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tpcds"}
+    path = fp.path
+    if fp.old_path not in paths:
+        return
+    prefix = "tests/test_executor.py::TestExecutor::"
+    if fp.is_deleted or fp.old_path != fp.new_path:
+        decision.must.update(t for t, tid in enumerate(coverage.tests) if tid.startswith(prefix))
+        return
+    try:
+        new = _tpc_pairs(decision.files[path])
+    except (IndexError, ValueError):
+        # setUpClass materializes both files before any TestExecutor method.
+        decision.must.update(t for t, tid in enumerate(coverage.tests) if tid.startswith(prefix))
+        return
+    old = _tpc_pairs(_read(repo, path))
+    if len(old) != len(new):
+        return
+    unchanged = set()
+    if all((sql, bool(meta.get("execute"))) == (sql2, bool(meta2.get("execute")))
+           for (meta, sql, _), (meta2, sql2, _) in zip(old, new)):
+        unchanged.add("test_execute_" + paths[path])
+    if paths[path] == "tpch" and all(a[1:] == b[1:] for a, b in zip(old, new)):
+        unchanged.add("test_optimized_tpch")
+    ids = {prefix + name for name in unchanged}
+    drop = {t for t in decision.cands if t is not None and coverage.tests[t] in ids}
+    decision.cands.difference_update(drop)
+    decision.precise.difference_update(drop)
 
 
 def _fixture(p, fp, M, D):

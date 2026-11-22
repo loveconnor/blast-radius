@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+--- a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
++++ b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+@@ -1,7 +1,7 @@
+ --------------------------------------
+ -- TPC-DS 1
+ --------------------------------------
+-# execute: true
++# invalid metadata
+ WITH customer_total_return
+      AS (SELECT sr_customer_sk     AS ctr_customer_sk,
+                 sr_store_sk        AS ctr_store_sk,

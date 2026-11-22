@@ -155,6 +155,7 @@ def transform_reach(delta, coverage):
             return None
         direct = coverage.covering("tests/dialects/test_dialect.py", 237, 237)
         observed = set(data["unknown"])
+        routes = set()
         for _, owner, _, key in delta:
             if not key.startswith("sqlglot.expressions."):
                 return None
@@ -164,10 +165,11 @@ def transform_reach(delta, coverage):
                 for expr, tests in data["reads"].get(name(cls), {}).items():
                     if key == expr.replace(":", "."):
                         observed.update(tests)
+                        routes.add((name(cls), expr))
         # These paths read TRANSFORMS directly, bypassing Generator.sql.
         for path, line in (("sqlglot/transforms.py", 52), ("sqlglot/generators/postgres.py", 601),
                            ("sqlglot/generator.py", 4100)):
             direct.update(coverage.covering(path, line, line))
-        return observed, direct
+        return observed, direct, routes
     except Exception:
         return None

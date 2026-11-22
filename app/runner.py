@@ -33,6 +33,7 @@ def log(*a):
 import concurrent.futures as _cf
 
 
+VALIDATOR_CALLS = {}
 PICKLE_TASKS = True
 
 
@@ -1326,6 +1327,9 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, 
         for t, meth in items:
             try:
                 case = C(meth)
+                if nodeids[t] in VALIDATOR_CALLS:
+                    import validatorcalls
+                    validatorcalls.apply(case, VALIDATOR_CALLS[nodeids[t]])
             except BaseException:  # noqa
                 failed.add(t)
                 continue

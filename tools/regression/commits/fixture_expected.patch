@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+--- a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
++++ b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+@@ -25,7 +25,7 @@
+ ORDER  BY c_customer_id
+ LIMIT 100;
+ WITH "customer_total_return" AS (
+-  SELECT
++  SELECT 123 AS extra_col,
+     "store_returns"."sr_customer_sk" AS "ctr_customer_sk",
+     "store_returns"."sr_store_sk" AS "ctr_store_sk",
+     SUM("store_returns"."sr_return_amt") AS "ctr_total_return"

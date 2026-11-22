@@ -1738,12 +1738,14 @@ def overlay_candidates(j, old_mods, nodeids):
             return {"all": True, "note": note + " broad"}
     if delta:
         cands |= untraced & (broad | precise)
+    validator_routes = set()
+    direct = set()
     if (delta and not forced and not unknown and j.get("pure_src")
             and all(p.startswith("sqlglot/generators/") for p in j["files"])):
         import dispatch
         reached = dispatch.transform_reach(delta, M)
         if reached is not None:
-            observed, direct = reached
+            observed, direct, validator_routes = reached
             cands = observed | precise | (cands & direct)
             note += f" dispatch={len(cands)}"
     default_sites = []
@@ -1811,7 +1813,7 @@ def overlay_candidates(j, old_mods, nodeids):
                 note += f" settings={len(setting_delta)}"
         if len(setting_delta) != sum(d[0] == "cls" for d in delta):
             setting_delta.clear()
-    return {"cands": cands, "default_sites": default_sites, "settings": setting_delta, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+    return {"cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
             "cls_readers": (cls_readers | untraced) if (cls_ok and not unknown and not forced and not disp) else None,
@@ -2241,6 +2243,20 @@ _REIMPORT_MARK = b"REIMPORT\n"
 FORCED: set = set()   # tests selected without running (they import a module that no longer imports)
 
 
+def filter_validators(runner, cands, nodeids, lines, settings=(), routes=()):
+    if not lines or any(not (p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
+                             or p in ("sqlglot/parser.py", "sqlglot/generator.py")) for p in lines):
+        return
+    import validatorcalls
+    plans = validatorcalls.masks(lines, settings, (nodeids[t] for t in cands), routes)
+    runner.VALIDATOR_CALLS.update(plans)
+    for t in cands:
+        plan = plans.get(nodeids[t])
+        base = CPU["test"].get(str(t))
+        if plan and base is not None:
+            CPU_OVR[t] = min(CPU_OVR.get(t, base), base * (0.2 + 0.8 * plan[2]))
+
+
 def _child(j, nodeids, ms, runner, modules):
     os.environ["TMPDIR"] = j["tmp"]
     try:
@@ -2303,6 +2319,7 @@ def _child(j, nodeids, ms, runner, modules):
         except Exception:  # noqa
             pass
         j["overlay"] = True
+        runner.VALIDATOR_CALLS.clear()
         runner.PARSE_ONLY.clear()
         runner.SUBMIT_FILTER.clear()
         note = f"reimport({e})"
@@ -2353,7 +2370,11 @@ def _child(j, nodeids, ms, runner, modules):
             ov_lines = {f: set(v) for f, v in j["ch_lines"].items()}
             for f, v in (res.get("fn_lines") or {}).items():
                 ov_lines.setdefault(f, set()).update(v)
+        if res.get("validator_routes") and ov_lines is not None:
+            filter_validators(runner, set(cands) - res["direct_dispatch"], nodeids, ov_lines,
+                              routes=res["validator_routes"])
         if res.get("fn_only") and ov_lines is not None:
+            filter_validators(runner, cands, nodeids, ov_lines)
             aff = opt_affected(ov_lines)
             if aff is not None:
                 optmemo.ON[0] = True
@@ -2371,6 +2392,7 @@ def _child(j, nodeids, ms, runner, modules):
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
         if res.get("settings") and ov_lines is not None:
+            filter_validators(runner, cands, nodeids, ov_lines, res["settings"])
             subf = setting_queries(res["settings"], ov_lines, cands, nodeids)
             runner.SUBMIT_FILTER.update(subf)
             j["subf"].update(subf)
@@ -2439,6 +2461,7 @@ def _child(j, nodeids, ms, runner, modules):
             return {"failed": [], "unrun": sorted(cands), "note": note}
         if not cands:
             return {"failed": [], "unrun": [], "note": note}
+        filter_validators(runner, cands, nodeids, j.get("ch_lines"))
         # Preparation and replay have already been paid for. Plan the remaining
         # work with the measured CPU rate even when replay kept every candidate.
         light, heavy, _, _ = plan_split(cands, ms, CPU, False, prepared is True, overhead=0.0)
