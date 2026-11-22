@@ -1893,6 +1893,7 @@ def overlay_candidates(j, old_mods, nodeids):
     n_glob = 0
     alias_readers = set(untraced)
     only_aliases = True
+    cold_readers = {}
     seen_enums = set()
     for kind, owner, attr, key in delta:
         if kind == "cls":
@@ -1965,19 +1966,22 @@ def overlay_candidates(j, old_mods, nodeids):
                 unknown.append((kind, owner, attr))
         else:
             refs = _global_refs(attr, nodeids) if (kind == "mod" and GLOBAL_REFS) else None
-            if refs is None and kind == "mod" and owner in seeds and owner in old_mods and owner in new_mods:
-                # Shared test helpers can mention an alias without ever importing
-                # its owner. Bound the change using cold, per-test imports. Keep
-                # those readers outside replay since helpers may inspect modules.
-                if (attr in vars(old_mods[owner])) != (attr in vars(new_mods[owner])):
+            alias_change = (kind == "mod" and owner in old_mods and owner in new_mods
+                            and ((attr in vars(old_mods[owner])) != (attr in vars(new_mods[owner]))))
+            bound = None
+            if alias_change and owner in seeds:
+                if owner not in cold_readers:
                     file = next(f for f in j["files"] if _modname(f) == owner)
-                    readers = cold_module_tests(file, M, nodeids)
-                    if readers is not None:
-                        cands.update(readers)
-                        outside.update(readers)
-                        cls_readers.update(readers)
-                        only_aliases = False
-                        continue
+                    found = cold_module_tests(file, M, nodeids)
+                    cold_readers[owner] = None if found is None else set(found)
+                bound = cold_readers[owner]
+            if refs is None and bound is not None:
+                # Helpers can inspect this module outside recorded parse phases.
+                cands.update(bound)
+                outside.update(bound)
+                cls_readers.update(bound)
+                only_aliases = False
+                continue
             if refs is None:
                 unknown.append((kind, owner, attr))
             else:
@@ -1990,8 +1994,6 @@ def overlay_candidates(j, old_mods, nodeids):
                     tests, sites = sourcerefs.qualified_readers()
                     if tests == nodeids:
                         instance_reads = sites.get(attr, {})
-                alias_change = (owner in old_mods and owner in new_mods
-                                and ((attr in vars(old_mods[owner])) != (attr in vars(new_mods[owner]))))
                 bare = sourcerefs.global_loads(attr) if owner.startswith("sqlglot") and alias_change else {}
                 for f, ls in refs[0].items():
                     # LOAD_GLOBAL resolves against this file's own namespace.
@@ -2001,6 +2003,10 @@ def overlay_candidates(j, old_mods, nodeids):
                         ls = ls - bare[f]
                     for line in ls:
                         readers = M.covering(f, line, line)
+                        if bound is not None:
+                            readers &= bound
+                            if not readers:
+                                continue
                         traced = instance_reads.get((f, line))
                         if traced and f not in j["files"]:
                             readers = readers - traced
@@ -2008,11 +2014,12 @@ def overlay_candidates(j, old_mods, nodeids):
                                 continue
                         fn_lines.setdefault(f, set()).add(line)
                         cands.update(readers)
-                cands |= refs[1]
-                outside |= refs[1]
-                cls_readers |= refs[1]
+                direct_tests = refs[1] if bound is None else refs[1] & bound
+                cands |= direct_tests
+                outside |= direct_tests
+                cls_readers |= direct_tests
                 n_glob += 1
-                alias_readers.update(refs[1])
+                alias_readers.update(direct_tests)
                 if key is not None or not _stdlib_binding(old_mods, new_mods, owner, attr):
                     only_aliases = False
     note = fail_note + f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]} scope={0 if scope is None else len(scope)}"
