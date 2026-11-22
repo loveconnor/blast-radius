@@ -25,7 +25,7 @@ def index():
 def plan(lines, settings=()):
     global PLAN
     PLAN = None
-    eligible = ("sqlglot/optimizer/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/dialects/")
+    eligible = ("sqlglot/optimizer/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/dialects/", "sqlglot/typing/")
     if not lines or any(not (path.startswith(eligible) or path in ("sqlglot/generator.py", "sqlglot/parser.py"))
                         for path in lines):
         return {}

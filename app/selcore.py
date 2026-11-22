@@ -137,6 +137,7 @@ def separate_source(patch_text, repo, coverage):
     """
     pieces = []
     fixtures = set()
+    mandatory = set()
     data = {}
     files = parse_patch(patch_text)
     if len(files) < 2:
@@ -149,12 +150,13 @@ def separate_source(patch_text, repo, coverage):
         if (not part.all and part.files and not part.import_change
                 and all(path.startswith("tests/fixtures/") and path.endswith(".sql") and content is not None
                         for path, content in part.files.items())):
-            fixtures.update(part.cands | part.must)
+            fixtures.update(part.cands)
+            mandatory.update(part.must)
             data.update(part.files)
         else:
             pieces.append(part)
     if len(pieces) == 1 and all(path.startswith("sqlglot/") for path in pieces[0].files):
-        return pieces[0], fixtures, data
+        return pieces[0], fixtures, mandatory, data
     return None
 
 

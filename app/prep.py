@@ -15,6 +15,10 @@ selector.load_outreads()
 selector._replay()
 selector._itermap()
 selector.load_imports()
+selector._import_graph()
+import sourcerefs
+selector._preload_src_text()
+sourcerefs.build(selector._SRC_TEXT)
 try:
     memo_path = os.path.join(HERE, "memo.pkl")
     lite_path = os.path.join(HERE, "memo_lite.pkl")

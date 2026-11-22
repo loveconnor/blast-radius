@@ -278,17 +278,24 @@ def main():
             fixture_reach = set()
             fixture_edits = {}
             fixture_only_tests = set()
+            overlay_readers = set()
+            mixed_source_tests = set()
             if len(D.files) > 1 and (D.all or D.import_change or any(p.endswith(".sql") for p in D.files)):
                 partition = separate_source(patch_text, REPO, M)
                 if partition is not None:
-                    source, readers, edits = partition
+                    source, readers, mandatory, edits = partition
+                    source.must.update(mandatory)
                     # Keep the dedicated fixture verifier for expensive readers.
                     # Otherwise select them, and use the source-only coverage
                     # proof for every other test. Actual runs see the full edit.
-                    if source.all or sum(ms[t] for t in readers) <= 1200:
+                    if source.all or source.import_change:
+                        D, fixture_reach, fixture_edits = source, readers | mandatory, edits
+                        overlay_readers = readers - source.must
+                    elif sum(ms[t] for t in readers) <= 1200:
                         D, fixture_reach, fixture_edits = source, readers, edits
                         D.must.update(readers)
                     elif not source.import_change:
+                        mixed_source_tests = source.cands - readers - mandatory
                         # These readers never executed the edited source at baseline.
                         # Run their changed fixture rows under the complete patch.
                         fixture_only_tests = {t for t in readers - source.cands - source.must
@@ -301,7 +308,7 @@ def main():
                 D.files = {r: src for r, src in D.files.items() if r not in D.ast_unchanged}
             if D.must:
                 must[cid] = set(D.must)
-            if not D.all and D.parsed and all(r.endswith(".py") for r in D.files):
+            if not D.all and not fixture_edits and D.parsed and all(r.endswith(".py") for r in D.files):
                 # only the cheap screen here; the proof itself runs after the tests
                 try:
                     from equiv import maybe_equivalent
@@ -325,7 +332,7 @@ def main():
                 log(cid, "ALL" if affected is None else f"cold-imports={len(affected)}", " ".join(D.reasons)[:200])
                 continue
             cands = sorted(t for t in D.cands if t is not None)
-            answers[cid] = cands  # static fallback
+            answers[cid] = sorted(set(cands) | overlay_readers)  # static fallback
             hot = [r for r, c in D.files.items() if r.endswith(".py") and c is not None and (REPO / r).exists()]
             olds = {r: (REPO / r).read_text(encoding="utf-8") for r in hot}
             if not cands and not D.import_change:
@@ -364,6 +371,9 @@ def main():
             ch_lines = {f: sorted(v) for f, v in D.ch_lines.items()} if memo_duck else None
             iterf = {}
             opt_aff = None
+            if mixed_source_tests:
+                iterf = iter_filter(mixed_source_tests, D.ch_lines)
+                iter_cpu(iterf)
             if pure_src and not D.import_change:
                 iterf = iter_filter(cands, D.ch_lines)
                 iter_cpu(iterf)
@@ -423,10 +433,10 @@ def main():
                 if not D.import_change:
                     continue
             jobs.append(dict(
-                cid=cid, files=D.files, fixture_edits=fixture_edits, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
+                cid=cid, files=D.files, fixture_edits=fixture_edits, overlay_readers=overlay_readers, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
-                fixture_sql_only=fixture_sql_only, fixture_only_tests=fixture_only_tests, scale_nodes=scale_nodes,
+                fixture_sql_only=fixture_sql_only, fixture_only_tests=fixture_only_tests, mixed_source_tests=mixed_source_tests, scale_nodes=scale_nodes,
                 node_limit_edit=not scale_nodes and any(
                     re.search(r"max_nodes|_node_count|Maximum number of AST nodes", line)
                     for line in patch_text.splitlines() if line.startswith(("+", "-"))
@@ -561,20 +571,36 @@ def query_filter(lines, cands, nodeids):
     return complete, parse_only
 
 
+@lru_cache(maxsize=1)
+def query_attributes():
+    import pickle
+    try:
+        with open(HERE / "queryattrs.pkl", "rb") as fh:
+            return pickle.load(fh)
+    except FileNotFoundError:
+        return None
+
+
+def tracked_query_settings():
+    data = query_attributes()
+    return data[0] if data else set()
+
+
 def setting_queries(delta, changed_lines, cands, nodeids, routes=()):
     """Combine runtime-line reach with reads of scalar settings in each TPC query."""
     if not delta and not routes:
         return {}
-    import pickle
-    try:
-        with open(HERE / "queryattrs.pkl", "rb") as fh:
-            tracked, reads, fixture_reads, owners = pickle.load(fh)
-    except OSError:
+    data = query_attributes()
+    if not data:
         return {}
+    tracked, reads, fixture_reads, owners = data
     if not tracked.issuperset(delta) or any(owner not in owners for owner, _ in routes):
         return {}
     import runner
-    watched = set(delta)
+    import settingtrace
+    watched = settingtrace.query_keys(delta) if delta else set()
+    if not watched <= tracked:
+        watched = set(delta)
     if routes:
         watched.update(routes)
         watched.add((None, None))
@@ -906,9 +932,11 @@ def replay_lookups():
         return None
 
 
-def lookup_keys(watched, count):
+def lookup_keys(watched, count, settings=False):
     data = replay_lookups()
     if not data or data[0] != (count + 7) // 8:
+        return None
+    if settings and not set(watched) <= tracked_query_settings():
         return None
     import zlib
     width, complete, index, masks = data
@@ -978,10 +1006,24 @@ REPLAY_HIT: set = set()  # tests kept specifically because a recorded phase inpu
 
 
 def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False, attrs=None,
-                  disp=False, route_plan=None):
+                  disp=False, route_plan=None, settings=(), scalar_only=False):
     """Replay the recorded phase inputs under the patched code; drop the candidates whose
     inputs all still produce their baseline output. Returns (candidates, note)."""
     REPLAY_HIT.clear()
+    effective_plan = None
+    if scalar_only and settings and REPLAY_ON and not disp:
+        import settingtrace
+        data = _replay()
+        if data:
+            effective = settingtrace.query_keys(settings)
+            if effective != settings and effective <= tracked_query_settings():
+                phase_map = replay_lookups()
+                # Older maps did not distinguish constructor reads from later
+                # uses. Require the derived slot index before narrowing.
+                if phase_map and "generator-slot" in phase_map[2]:
+                    effective_plan = lookup_keys(effective, len(data["dig"]))
+                if effective_plan:
+                    outside0 = (set(outside0 or ()) - effective_plan[1]) | set(load_outreads()[2])
     inside, keys, est = replay_scope(cands, ch_lines, outside0, extra_lines)
     if SIZE_SENSITIVE_TEST[0] is not None:
         inside = [t for t in inside if t != SIZE_SENSITIVE_TEST[0]]
@@ -1048,8 +1090,20 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
         if m1 is not None and m2 is not None:
             mask = m1 | m2 | m3
             bits = mask.to_bytes((len(R["dig"]) + 7) // 8, "little")
-            tkeys = {t: [k for k in ks if bits[k >> 3] & (1 << (k & 7))] for t, ks in tkeys.items()}
-            tkeys = {t: ks for t, ks in tkeys.items() if ks}
+            observed = effective_plan or (lookup_keys(settings, len(R["dig"]), settings=True)
+                                          if settings and not disp else None)
+            complete = set()
+            if observed:
+                observed_mask, complete = observed
+                precise_bits = ((observed_mask | m2) & mask).to_bytes(len(bits), "little")
+            filtered = {}
+            for t, ks in tkeys.items():
+                use = precise_bits if t in complete else bits
+                traced = [k for k in ks if use[k >> 3] & (1 << (k & 7))]
+                if traced or (effective_plan and t in complete and
+                              any(bits[k >> 3] & (1 << (k & 7)) for k in ks)):
+                    filtered[t] = traced
+            tkeys = filtered
             inside = [t for t in inside if t in tkeys]
             keys = sorted({k for ks in tkeys.values() for k in ks})
             est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
@@ -1611,13 +1665,13 @@ def _import_graph():
     """module -> sqlglot modules its source imports, at the pinned commit."""
     global _IMPORT_GRAPH
     if _IMPORT_GRAPH is None:
-        _preload_src_text()
-        mods = {}
-        for rel, text in _SRC_TEXT.items():
-            if rel.startswith("sqlglot/"):
-                mods[_modname(rel)] = (rel.endswith("/__init__.py"), text)
-        known = set(mods)
-        _IMPORT_GRAPH = {m: _static_imports(m, pk, text, known) for m, (pk, text) in mods.items()}
+        def build():
+            _preload_src_text()
+            mods = {_modname(rel): (rel.endswith("/__init__.py"), text) for rel, text in _SRC_TEXT.items()
+                    if rel.startswith("sqlglot/")}
+            known = set(mods)
+            return {m: _static_imports(m, pk, text, known) for m, (pk, text) in mods.items()}
+        _IMPORT_GRAPH = _pkl(HERE / "sourceimports", build)
     return _IMPORT_GRAPH
 
 
@@ -1921,6 +1975,7 @@ def overlay_candidates(j, old_mods, nodeids):
         if len(setting_delta) != sum(d[0] == "cls" for d in delta):
             setting_delta.clear()
     return {"cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+            "scalar_only": bool(setting_delta) and all(d[0] in ("cls", "methcode") for d in delta),
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
             "cls_readers": (cls_readers | untraced) if (cls_ok and not unknown and not forced and not disp) else None,
@@ -1962,6 +2017,17 @@ def _global_refs(name, nodeids):
     try:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not name:
             return None
+        import sourcerefs
+        found = sourcerefs.find(name)
+        if found is not None:
+            source, paths = found
+            tests = set()
+            for path in paths:
+                matched = MAP_OBJ.tests_in_file(path)
+                if not matched:
+                    return None
+                tests.update(matched)
+            return source, tests
         _preload_src_text()
         pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name))
         src, tests = {}, set()
@@ -2103,7 +2169,6 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
         OLD_IMPORT_FAILURES[:] = [failure[0] for failure in _import_all()]
         load_reads()
         load_imports()
-        _preload_src_text()
         _import_graph()
     elif any(j.get("pure_src") and _is_leaf_dialect_edit(j["files"]) for j in jobs):
         _import_graph()
@@ -2465,6 +2530,8 @@ def _child(j, nodeids, ms, runner, modules):
                                     j.get("ch_lines"), sql_only=sql_only)
         if kept:
             note += " preset"
+    if not j["overlay"] and j["mixed_source_tests"]:
+        plan_fixture_workers(j["mixed_source_tests"], j.get("ch_lines") or {})
     if j["overlay"]:
         optmemo.ON[0] = False   # decided again once the state diff is known
         optmemo.set_changed(None)
@@ -2481,10 +2548,13 @@ def _child(j, nodeids, ms, runner, modules):
                 and not res.get("table_changed")
                 and not any(p == "tests/test_executor.py" or p.endswith(".csv.gz") or p == "sqlglot/executor/table.py"
                             for p in j["files"])):
-            runner.OV_EXEC_PRESET[:] = [True, not j.get("pure_src")]
+            runner.OV_EXEC_PRESET[:] = [True, bool(j.get("fixture_edits")) or not j.get("pure_src")]
         forced = set(res.get("forced") or ())
         FORCED.update(forced)
-        cands = sorted(set(res["cands"]) - forced)
+        fixture_readers = j["overlay_readers"] - forced
+        source_readers = set(res["cands"])
+        fixture_only = fixture_readers - source_readers
+        cands = sorted(source_readers - forced - fixture_readers)
         j["unknown"] = res.get("unknown", False)
         route_plan = None
         if res.get("validator_routes") and j.get("pure_src") and REPLAY_ON:
@@ -2495,17 +2565,18 @@ def _child(j, nodeids, ms, runner, modules):
         if route_plan is not None:
             cands, rn = replay_narrow(cands, {}, ms, outside0=res["direct_dispatch"], route_plan=route_plan)
             note += rn
-            if HANG[0] or not cands:
-                return {"failed": [], "unrun": sorted(cands), "note": note}
+            if HANG[0] or not (cands or fixture_readers):
+                return {"failed": [], "unrun": sorted(set(cands) | fixture_readers), "note": note}
         elif res.get("replay_ok") and j.get("pure_src"):
             cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
                                       light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")),
                                       attrs=None if res.get("pure") else res.get("attrs"),
-                                      disp=bool(res.get("disp", True)))
+                                      disp=bool(res.get("disp", True)), settings=res.get("settings"),
+                                      scalar_only=res.get("scalar_only", False))
             note += rn
             if HANG[0]:
-                return {"failed": [], "unrun": sorted(cands), "note": note + " " + res["note"]}
-            if not cands:
+                return {"failed": [], "unrun": sorted(set(cands) | fixture_readers), "note": note + " " + res["note"]}
+            if not cands and not fixture_readers:
                 return {"failed": [], "unrun": [], "note": note}
         aff = None
         ov_lines = None
@@ -2584,6 +2655,18 @@ def _child(j, nodeids, ms, runner, modules):
             memo_cpu(runner.MEMO_SKIP, nodeids, j.get("subf"), aff)
         if runner.GEN_MEM_MODS:
             _gen_mem_cpu(nodeids)
+        if fixture_readers:
+            # Source-only traces cannot clear a test that also reads an edited
+            # fixture. Run it under the complete patch with its own fixture rows.
+            runner.MEMO_SKIP.difference_update(fixture_readers)
+            runner.FIXTURE_ONLY_TESTS.update(fixture_only)
+            for t in fixture_readers:
+                CPU_OVR.pop(t, None)
+            for t in fixture_only:
+                if nodeids[t].split("::", 1)[0] in ("tests/test_optimizer.py", "tests/test_transpile.py",
+                                                    "tests/test_serde.py") or t in memo_ids(nodeids):
+                    CPU_OVR[t] = min(CPU["test"].get(str(t), 1.0), 0.25)
+            cands = sorted(set(cands) | fixture_readers)
         note += " " + res["note"]
         if not cands:
             return {"failed": [], "unrun": [], "note": note}

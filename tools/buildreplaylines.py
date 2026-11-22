@@ -71,7 +71,7 @@ def trace_test(t, tests, data, keys, paths, lookups):
                 outside.add(key)
 
         settingtrace.install_routes(observe)
-        settingtrace.install(observe)
+        settingtrace.install(observe, escaped=True)
     else:
         monitor.use_tool_id(tool, "phase-lines")
         monitor.register_callback(tool, monitor.events.PY_START, start)

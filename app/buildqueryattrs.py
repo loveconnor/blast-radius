@@ -33,7 +33,7 @@ current = 0
 initial_parse = False
 depth = optimizing = 0
 reads, outside, later, in_opt = {}, {}, {}, {}
-tracked = settingtrace.install(record)
+tracked = settingtrace.install(record, escaped=True)
 owners = settingtrace.install_routes(record)
 
 runner.SUBMIT_LAZY = {0, 1}

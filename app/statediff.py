@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import re
+import struct
 import types
 
 _MAX_DEPTH = 80     # deeper than this counts as different (never as equal)
@@ -46,7 +47,11 @@ class _Cmp:
         ta = type(a)
         if ta is str or ta is int or ta is bool or a is None:
             return a == b
-        if isinstance(a, (bytes, float, complex, range)):
+        if ta is float:
+            return struct.pack("!d", a) == struct.pack("!d", b)
+        if ta is complex:
+            return struct.pack("!dd", a.real, a.imag) == struct.pack("!dd", b.real, b.imag)
+        if isinstance(a, (bytes, range)):
             return a == b
         if isinstance(a, enum.Enum):
             return a.name == b.name and self.same(a.value, b.value, depth + 1)
@@ -152,10 +157,12 @@ class _Cmp:
         # CPython compares ordinary unmodified code objects in C. Re-imports
         # change filenames and patches may shift lines, so retain the detailed
         # comparison when the objects differ.
+        if a.co_exceptiontable != b.co_exceptiontable or a.co_qualname != b.co_qualname:
+            return False
         if a == b:
             return True
-        if (a.co_flags, a.co_argcount, a.co_posonlyargcount, a.co_kwonlyargcount, a.co_exceptiontable, a.co_cellvars) != (
-                b.co_flags, b.co_argcount, b.co_posonlyargcount, b.co_kwonlyargcount, b.co_exceptiontable, b.co_cellvars):
+        if (a.co_flags, a.co_argcount, a.co_posonlyargcount, a.co_kwonlyargcount, a.co_cellvars) != (
+                b.co_flags, b.co_argcount, b.co_posonlyargcount, b.co_kwonlyargcount, b.co_cellvars):
             return False
         if a.co_code != b.co_code or a.co_names != b.co_names or a.co_varnames != b.co_varnames \
                 or a.co_freevars != b.co_freevars or len(a.co_consts) != len(b.co_consts):
@@ -164,7 +171,7 @@ class _Cmp:
             if isinstance(x, types.CodeType):
                 if not isinstance(y, types.CodeType) or not self.same_code(x, y):
                     return False
-            elif type(x) is not type(y) or x != y:
+            elif type(x) is not type(y) or not self.same(x, y):
                 return False
         return True
 
@@ -174,9 +181,17 @@ class _Cmp:
             return False
         for x, y in zip(ca, cb):
             try:
-                vx, vy = x.cell_contents, y.cell_contents
+                vx = x.cell_contents
             except ValueError:
-                continue
+                try:
+                    y.cell_contents
+                except ValueError:
+                    continue
+                return False
+            try:
+                vy = y.cell_contents
+            except ValueError:
+                return False
             if not self.same(vx, vy, depth + 1):
                 return False
         return True

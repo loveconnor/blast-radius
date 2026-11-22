@@ -1,0 +1,13 @@
+diff --git a/sqlglot/expressions/query.py b/sqlglot/expressions/query.py
+index 0000000..1111111 100644
+--- a/sqlglot/expressions/query.py
++++ b/sqlglot/expressions/query.py
+@@ -1264,7 +1264,7 @@
+         self,
+         *expressions: ExpOrStr | None,
+         append: bool = True,
+-        dialect: DialectType = None,
++        dialect: DialectType = 0,
+         copy: bool = True,
+         **opts: Unpack[ParserNoDialectArgs],
+     ) -> Select:

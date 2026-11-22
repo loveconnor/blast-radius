@@ -483,7 +483,7 @@ PARSE_ONLY = {}  # query indices whose changed lines run only in the initial par
 
 def _memo_mp_execute(orig):
     def _mp_execute(self, schema, tables, sqls, tpch):
-        if MEMO_REC is None and FIXTURE_CALLS is not None and MEMO is not None:
+        if MEMO_REC is None and (FIXTURE_CALLS is not None or _SUB["t"] in FIXTURE_ONLY_TESTS) and MEMO is not None:
             base = MEMO.get("base_sqls", {}).get(bool(tpch))
             if base is not None:
                 changed = [
@@ -851,7 +851,7 @@ def apply_presets(ok, lines_by_file, sql_only=False):
 
 def apply_overlay_executor_preset(reload_sqls=False):
     """After an overlay re-import where sqlglot.executor.table did not change:
-    reuse the zygote's prebuilt TPC tables/connections by rebinding Table.__class__."""
+    reuse the zygote's prebuilt rows with the currently imported executor classes."""
     try:
         attrs = PRESET_ATTRS.get("tests.test_executor.TestExecutor")
         if not attrs:
@@ -863,12 +863,15 @@ def apply_overlay_executor_preset(reload_sqls=False):
         if C.__dict__.get("_br_ov_preset"):
             return True
         ET = sys.modules.get("sqlglot.executor.table") or importlib.import_module("sqlglot.executor.table")
-        new_Table = ET.Table
         for k, v in attrs.items():
             setattr(C, k, {} if k == "cache" else v)
-        for tdict in (C.tpch_tables, C.tpcds_tables):
-            for tbl in tdict.values():
-                tbl.__class__ = new_Table
+        for group in ("tpch_tables", "tpcds_tables"):
+            # Table owns a RowReader and a RangeReader pointing back to it.
+            # Construct the whole object graph in the overlay, preserving the
+            # original rows. A spawn worker must be able to pickle every class.
+            fresh = {name: ET.Table(table.columns, table.rows, table.column_range)
+                     for name, table in attrs[group].items()}
+            setattr(C, group, fresh)
         if reload_sqls:
             def _reload_sqls(cls, _T=T):
                 cls.cache = {}
