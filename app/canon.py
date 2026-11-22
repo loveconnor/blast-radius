@@ -100,6 +100,11 @@ def dump_tree(v):
 _CLS: dict = {}
 
 
+def clear_classes():
+    """Resolve snapshot classes against the new SQLGlot modules after an overlay import."""
+    _CLS.clear()
+
+
 def _cls(mod, qual):
     c = _CLS.get((mod, qual))
     if c is None:

@@ -1249,6 +1249,8 @@ def build_overlay(root, files):
 
 
 def reimport(root, test_modules):
+    from canon import clear_classes
+    clear_classes()
     for name in list(sys.modules):
         if name == "sqlglot" or name.startswith("sqlglot.") or name == "tests" or name.startswith("tests."):
             del sys.modules[name]
