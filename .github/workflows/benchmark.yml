@@ -9,6 +9,11 @@ on:
         description: Reference selector commit
         required: true
 
+      compare_costs:
+        description: Compare verification cost estimates on one runner
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -19,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        revision: ["${{ inputs.candidate }}", "${{ inputs.reference }}"]
+        revision: ${{ inputs.compare_costs && fromJSON(format('["{0}"]', inputs.candidate)) || fromJSON(format('["{0}","{1}"]', inputs.candidate, inputs.reference)) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,9 +41,25 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD
-          for suite in generated56 upstream20; do
-            path="$GITHUB_WORKSPACE/benchmark/tools/independent/$suite"
-            cp sample/tests.json "$path/tests.json"
-            make sample SAMPLE="$path" | tee "/tmp/$suite.log"
-            if grep -Eq '^Misses: +[1-9]' "/tmp/$suite.log"; then exit 1; fi
+          factors=(auto)
+          if [[ "$COMPARE_COSTS" == true ]]; then factors+=(0.60 0.85); fi
+          for factor in "${factors[@]}"; do
+            image=blast-radius-entry
+            if [[ "$factor" != auto ]]; then
+              image="cost-$factor"
+              printf 'FROM blast-radius-entry\nENV BR_CPU_FACTOR=%s\n' "$factor" | docker build -t "$image" -
+            fi
+            for suite in generated56 upstream20; do
+              path="$GITHUB_WORKSPACE/benchmark/tools/independent/$suite"
+              cp sample/tests.json "$path/tests.json"
+              echo "Benchmark $suite at factor $factor"
+              python3 tools/benchmark.py "$path" /tmp/output.jsonl \
+                --rm --platform linux/amd64 --network none --cpus 2 --memory 4096m --memory-swap 4096m \
+                --pids-limit 256 --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+                --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+                --volume "$path/commits:/data/commits:ro" --volume "$path/tests.json:/data/tests.json:ro" "$image" | tee "/tmp/$suite.log"
+              if grep -Eq '^Misses: +[1-9]' "/tmp/$suite.log"; then exit 1; fi
+            done
           done
+        env:
+          COMPARE_COSTS: ${{ inputs.compare_costs }}
