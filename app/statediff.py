@@ -49,7 +49,7 @@ class _Cmp:
         if isinstance(a, (bytes, float, complex, range)):
             return a == b
         if isinstance(a, enum.Enum):
-            return a.name == b.name and type(a).__qualname__ == type(b).__qualname__
+            return a.name == b.name and self.same(a.value, b.value, depth + 1)
         if isinstance(a, type):
             return a.__qualname__ == b.__qualname__ and a.__module__ == b.__module__
         if isinstance(a, (list, tuple)):
@@ -149,6 +149,14 @@ class _Cmp:
         return ("O", tk.__qualname__, repr(k))
 
     def same_code(self, a, b):
+        # CPython compares ordinary unmodified code objects in C. Re-imports
+        # change filenames and patches may shift lines, so retain the detailed
+        # comparison when the objects differ.
+        if a == b:
+            return True
+        if (a.co_flags, a.co_argcount, a.co_posonlyargcount, a.co_kwonlyargcount, a.co_exceptiontable, a.co_cellvars) != (
+                b.co_flags, b.co_argcount, b.co_posonlyargcount, b.co_kwonlyargcount, b.co_exceptiontable, b.co_cellvars):
+            return False
         if a.co_code != b.co_code or a.co_names != b.co_names or a.co_varnames != b.co_varnames \
                 or a.co_freevars != b.co_freevars or len(a.co_consts) != len(b.co_consts):
             return False
@@ -320,7 +328,7 @@ def _record(cmp, changes, base, a, b):
                     code = va.__code__
                     lines = [l for _, _, l in code.co_lines() if l]
                     if lines:
-                        changes.add(("dictcode", base[1], base[2], (code.co_filename, min(lines), max(lines))))
+                        changes.add(("dictcode", base[1], base[2], (code.co_filename, min(lines), max(lines), _keystr(k))))
                         n += 1
                         continue
                 changes.add(base + (_keystr(k),))

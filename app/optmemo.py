@@ -319,7 +319,25 @@ def optimize(expression, schema=None, db=None, catalog=None, dialect=None, rules
         TIMES[3] += _pt() - t0
         t0 = _pt()
         try:
-            return orig(e.tree, schema, db, catalog, dialect, tuple(RULES[e.i + 1:]), sql, False, **kwargs)
+            suffix = []
+            for i in range(e.i + 1, len(RULES)):
+                rule = RULES[i]
+                suffix.append(rule)
+                # Joins or projections that diverged earlier can disappear before
+                # type annotation. Only skip the tail once every edited rule has
+                # run and the actual intermediate tree matches the pinned one.
+                if i >= aff[-1] and rule.__name__ == "quote_identifiers":
+                    def rejoined(expression, expected=st[i + 1]):
+                        if digest(expression) == expected:
+                            raise _Final()
+                        return expression
+                    suffix.append(rejoined)
+            try:
+                return orig(e.tree, schema, db, catalog, dialect, tuple(suffix), sql, False, **kwargs)
+            except _Final:
+                if _CACHE_OK[0]:
+                    _RUN_SAME.add(key)
+                return Base(st[-1]) if want else _tree(st[-1])
         finally:
             TIMES[5] += _pt() - t0
 

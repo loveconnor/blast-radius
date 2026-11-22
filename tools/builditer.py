@@ -50,9 +50,15 @@ def trace(t):
         cur[0].setdefault(fn[len(REPO):], set()).add(line)
         return mon.DISABLE
 
+    # check_file submits in fixture order and checks results in completion
+    # order. Attribute both halves to the same row, keeping unrelated test code
+    # outside the loop in the original main context.
+    runner.trace_fixture_comparisons(switch)
     runner.ITER_HOOK = (switch, counts)
     mon.register_callback(TOOL, mon.events.LINE, on_line)
-    mon.set_events(TOOL, mon.events.LINE)
+    for event in (mon.events.PY_START, mon.events.PY_RESUME):
+        mon.register_callback(TOOL, event, lambda code, offset: on_line(code, code.co_firstlineno))
+    mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START | mon.events.PY_RESUME)
     failed = runner.run_tests([t], nodeids, timeouts=[3000.0])
     mon.set_events(TOOL, 0)
     its = {}

@@ -16,13 +16,15 @@ DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/",
 
 
 class Map:
-    def __init__(self, path):
+    def __init__(self, path, supplement=True):
         with gzip.open(path, "rt") as fh:
             d = json.load(fh)
         self.tests = d["tests"]
         self.n = len(self.tests)
         self.sets = [frozenset(s) for s in d["sets"]]
         self.lines = {f: {int(l): i for l, i in m.items()} for f, m in d["lines"].items()}
+        if supplement:
+            self._merge_runtime(Path(path).with_name("runtime.json.gz"))
         self.importlines = {f: set(ls) for f, ls in d["importlines"].items()}
         self.opened = {p: set(s) for p, s in d["opened"].items()}
         self.file_of = [t.split("::", 1)[0] for t in self.tests]
@@ -30,6 +32,28 @@ class Map:
         self._tests_by_file = {}
         for i, f in enumerate(self.file_of):
             self._tests_by_file.setdefault(f, set()).add(i)
+
+    def _merge_runtime(self, path):
+        if not path.is_file():
+            return
+        with gzip.open(path, "rt") as fh:
+            extra = json.load(fh)
+        if extra["tests"] != self.tests:
+            return
+        additions = [frozenset(row) for row in extra["sets"]]
+        indices = {tests: i for i, tests in enumerate(self.sets)}
+        for file, lines in extra["lines"].items():
+            target = self.lines.setdefault(file, {})
+            for raw, group in lines.items():
+                number = int(raw)
+                readers = additions[group]
+                if number in target:
+                    readers = readers | self.sets[target[number]]
+                i = indices.get(readers)
+                if i is None:
+                    i = indices[readers] = len(self.sets)
+                    self.sets.append(readers)
+                target[number] = i
 
     def covering(self, f, start, end):
         m = self.lines.get(f)
@@ -102,8 +126,6 @@ def analyze(patch_text: str, repo: Path, M: Map) -> Decision:
         return D
     for fp in fps:
         _analyze_file(fp, repo, M, D)
-    if len(fps) == 1 and not D.all:
-        _narrow_tpc_fixture(fps[0], D, repo, M)
     return D
 
 
@@ -258,7 +280,7 @@ def _analyze_file(fp, repo, M, D):
     if p.endswith(".py"):
         _python(p, old_text, new_text, fp, M, D, repo)
     elif p.startswith("tests/fixtures/") or p.startswith("tests/"):
-        _fixture(p, fp, M, D)
+        _fixture(p, fp, M, D, repo)
     elif p.startswith("sqlglot/"):
         # non-python file inside the package (e.g. data file)
         users = _opened_users(p, M)
@@ -406,7 +428,7 @@ def _tpc_pairs(text):
     return pairs
 
 
-def _narrow_tpc_fixture(fp, decision, repo, coverage):
+def _narrow_tpc_fixture(fp, decision, repo, coverage, users):
     paths = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tpch",
              "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tpcds"}
     path = fp.path
@@ -432,13 +454,12 @@ def _narrow_tpc_fixture(fp, decision, repo, coverage):
     if paths[path] == "tpch" and all(a[1:] == b[1:] for a, b in zip(old, new)):
         unchanged.add("test_optimized_tpch")
     ids = {prefix + name for name in unchanged}
-    drop = {t for t in decision.cands if t is not None and coverage.tests[t] in ids}
-    decision.cands.difference_update(drop)
-    decision.precise.difference_update(drop)
+    users.difference_update(t for t in tuple(users) if t is not None and coverage.tests[t] in ids)
 
 
-def _fixture(p, fp, M, D):
+def _fixture(p, fp, M, D, repo):
     users = _opened_users(p, M)
+    _narrow_tpc_fixture(fp, D, repo, M, users)
     if users:
         D.add(users, f"fixture {p}")
     else:
@@ -450,7 +471,7 @@ def _fixture(p, fp, M, D):
 # The same goes for the lazy loaders: the dialect registry (a dialect is imported by name
 # the first time anything asks for it) and the packages that resolve attributes on demand.
 CACHE_FILL = {"sqlglot/generator.py": [(71, 92), (1003, 1009)],
-              "sqlglot/dialects/dialect.py": [(98, 185), (214, 305)],   # the Dialects enum and the registry built from it
+              "sqlglot/dialects/dialect.py": [(98, 134), (214, 305)],   # the Dialects enum and the registry built from it
               "sqlglot/dialects/__init__.py": [(1, 10 ** 6)],
               "sqlglot/optimizer/__init__.py": [(1, 10 ** 6)]}
 

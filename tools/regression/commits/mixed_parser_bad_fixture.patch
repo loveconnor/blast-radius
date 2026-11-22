@@ -1,0 +1,25 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 0000000..1111111 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -7418,7 +7418,7 @@
+                     field = self._parse_column_ops(field)
+             else:
+                 dot = self._is_connected() and self._prev.token_type == TokenType.DOT
+-                field = self._parse_field(any_token=True, anonymous_func=True)
++                field = self._parse_field(any_token=False, anonymous_func=True)
+ 
+                 # In t.true, t.null we should produce an Identifier node
+                 if dot and isinstance(field, (exp.Null, exp.Boolean)):
+diff --git a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+--- a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
++++ b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+@@ -1,7 +1,7 @@
+ --------------------------------------
+ -- TPC-DS 1
+ --------------------------------------
+-# execute: true
++# invalid metadata
+ WITH customer_total_return
+      AS (SELECT sr_customer_sk     AS ctr_customer_sk,
+                 sr_store_sk        AS ctr_store_sk,

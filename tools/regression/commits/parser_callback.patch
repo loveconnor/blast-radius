@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -682,7 +682,7 @@
+         "TRY_TO_BINARY": lambda args: exp.ToBinary(
+             this=seq_get(args, 0), format=seq_get(args, 1), safe=True
+         ),
+-        "TRY_TO_BOOLEAN": lambda args: exp.ToBoolean(this=seq_get(args, 0), safe=True),
++        "TRY_TO_BOOLEAN": lambda args: exp.ToBoolean(this=seq_get(args, 1), safe=True),
+         "TRY_TO_DATE": _build_datetime("TRY_TO_DATE", exp.DType.DATE, safe=True),
+         **dict.fromkeys(
+             ("TRY_TO_DECIMAL", "TRY_TO_NUMBER", "TRY_TO_NUMERIC"),

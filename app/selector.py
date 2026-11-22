@@ -39,7 +39,7 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 
 from sched import best_schedule  # noqa: E402
-from functools import partial
+from functools import lru_cache, partial
 
 schedule_cost = partial(best_schedule, want_workers=False)
 from selcore import Map, analyze, separate_source  # noqa: E402
@@ -277,6 +277,7 @@ def main():
                 continue
             fixture_reach = set()
             fixture_edits = {}
+            fixture_only_tests = set()
             if len(D.files) > 1 and (D.all or D.import_change or any(p.endswith(".sql") for p in D.files)):
                 partition = separate_source(patch_text, REPO, M)
                 if partition is not None:
@@ -287,6 +288,13 @@ def main():
                     if source.all or sum(ms[t] for t in readers) <= 1200:
                         D, fixture_reach, fixture_edits = source, readers, edits
                         D.must.update(readers)
+                    elif not source.import_change:
+                        # These readers never executed the edited source at baseline.
+                        # Run their changed fixture rows under the complete patch.
+                        fixture_only_tests = {t for t in readers - source.cands - source.must
+                                              if nodeids[t].split("::", 1)[0] in
+                                              ("tests/test_optimizer.py", "tests/test_serde.py",
+                                               "tests/test_transpile.py")}
             # Keep the complete patch for reimports. A runtime job can use the
             # same fixture and probe paths as the edit without incidental comments.
             if not D.import_change and not D.all and D.ast_unchanged:
@@ -302,13 +310,12 @@ def main():
                 except Exception as e:  # noqa
                     log(cid, "equiv screen failed", repr(e))
             guard_tests = None
+            guard_routes = guard_direct = None
             if D.all and not STATIC_ONLY[0] and D.reasons == ["cache-fill sqlglot/generator.py"]:
                 import dispatch
-                guard_tests = dispatch.guard_reach(D, M, REPO)
-                if guard_tests is not None:
-                    if fixture_reach:
-                        answers[cid] = sorted(set(guard_tests) | fixture_reach)
-                        continue
+                guard = dispatch.guard_reach(D, M, REPO)
+                if guard is not None:
+                    guard_tests, guard_routes, guard_direct = guard
                     D.all = False
                     D.import_change = True
                     D.cands = set(guard_tests)
@@ -373,9 +380,9 @@ def main():
                     memo_skip = memo_skippable(ch_lines, nodeids)
                 memo_cpu(memo_skip, nodeids, subf, opt_aff,
                          fixture_sql_only=(not D.import_change and not any((ch_lines or {}).values())))
-            if fixture_sql_only:
+            if fixture_sql_only or fixture_only_tests:
                 mids = memo_ids(nodeids)
-                for t in cands:
+                for t in (cands if fixture_sql_only else fixture_only_tests):
                     if t not in mids:
                         cur = CPU_OVR.get(t, CPU["test"].get(str(t), 1.0))
                         CPU_OVR[t] = min(cur, 0.08)
@@ -416,10 +423,10 @@ def main():
                 if not D.import_change:
                     continue
             jobs.append(dict(
-                cid=cid, files=D.files, fixture_edits=fixture_edits, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests,
+                cid=cid, files=D.files, fixture_edits=fixture_edits, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
-                fixture_sql_only=fixture_sql_only, scale_nodes=scale_nodes,
+                fixture_sql_only=fixture_sql_only, fixture_only_tests=fixture_only_tests, scale_nodes=scale_nodes,
                 node_limit_edit=not scale_nodes and any(
                     re.search(r"max_nodes|_node_count|Maximum number of AST nodes", line)
                     for line in patch_text.splitlines() if line.startswith(("+", "-"))
@@ -554,22 +561,26 @@ def query_filter(lines, cands, nodeids):
     return complete, parse_only
 
 
-def setting_queries(delta, changed_lines, cands, nodeids):
+def setting_queries(delta, changed_lines, cands, nodeids, routes=()):
     """Combine runtime-line reach with reads of scalar settings in each TPC query."""
-    if not delta:
+    if not delta and not routes:
         return {}
     import pickle
     try:
         with open(HERE / "queryattrs.pkl", "rb") as fh:
-            tracked, reads, fixture_reads = pickle.load(fh)
+            tracked, reads, fixture_reads, owners = pickle.load(fh)
     except OSError:
         return {}
-    if not tracked.issuperset(delta):
+    if not tracked.issuperset(delta) or any(owner not in owners for owner, _ in routes):
         return {}
     import runner
+    watched = set(delta)
+    if routes:
+        watched.update(routes)
+        watched.add((None, None))
     def observed(index):
         mask = 0
-        for key in delta:
+        for key in watched:
             mask |= index.get(key, 0)
         return mask
 
@@ -586,7 +597,7 @@ def setting_queries(delta, changed_lines, cands, nodeids):
             fixtures[t] = indices
     runner.ITER_FILTER.update(fixtures)
     iter_cpu(fixtures)
-    reached, _ = query_filter(changed_lines, cands, nodeids)
+    reached, initial_only = query_filter(changed_lines, cands, nodeids)
     skippable = set(memo_skippable(changed_lines, nodeids))
     unchanged_pipeline = opt_affected(changed_lines) == []
     for t in list(reached):
@@ -602,15 +613,15 @@ def setting_queries(delta, changed_lines, cands, nodeids):
         if unchanged_pipeline and not (in_opt & 1):
             runner.UNCHANGED_OPT_QUERIES[t] = {i for i in range(count) if not in_opt & (2 << i)}
         after_parse = observed(later)
-        if t in runner.PARSE_ONLY:
-            runner.PARSE_ONLY[t] = {i for i in runner.PARSE_ONLY[t]
-                                    if not after_parse & (1 | (2 << i))}
         if t in skippable and not (post & 1):
             runner.MEMO_QUERIES[t] = {i for i in range(count) if not post & (2 << i)}
         if mask & 1:
             del reached[t]
             continue
+        later_lines = reached[t] - initial_only[t]
         reached[t].update(i for i in range(count) if mask & (2 << i))
+        runner.PARSE_ONLY[t] = {i for i in reached[t] - later_lines
+                                if not after_parse & (1 | (2 << i))}
     return reached
 
 
@@ -754,8 +765,8 @@ def iter_filter(cands, lines, raw=False):
     import pickle
     for f, ls in lines.items():
         if f not in _ITERMAP_CACHE:
-            raw = by_file_raw.get(f)
-            _ITERMAP_CACHE[f] = pickle.loads(raw) if raw else {}
+            packed = by_file_raw.get(f)
+            _ITERMAP_CACHE[f] = pickle.loads(packed) if packed else {}
         flines = _ITERMAP_CACHE[f]
         if flines:
             for l in ls:
@@ -875,6 +886,61 @@ def _key_mask(R, lines_by_file):
     return mask
 
 
+@lru_cache(maxsize=1)
+def replay_lines():
+    import pickle
+    try:
+        with REPLAY_PATH.with_suffix("").with_suffix(".lines").open("rb") as fh:
+            return pickle.load(fh)
+    except FileNotFoundError:
+        return None
+
+
+@lru_cache(maxsize=1)
+def replay_lookups():
+    import pickle
+    try:
+        with REPLAY_PATH.with_suffix("").with_suffix(".lookups").open("rb") as fh:
+            return pickle.load(fh)
+    except FileNotFoundError:
+        return None
+
+
+def lookup_keys(watched, count):
+    data = replay_lookups()
+    if not data or data[0] != (count + 7) // 8:
+        return None
+    import zlib
+    width, complete, index, masks = data
+    def union(ids):
+        bits = 0
+        for i in ids:
+            bits |= int.from_bytes(zlib.decompress(masks[i]), "little")
+        return bits
+    inside = union({index[owner][key] for owner, key in watched if key in index.get(owner, {})})
+    outside = index.get("!outside", {})
+    external = union({outside[key] for key in watched if key in outside})
+    return inside, {t for t in complete if not external & (1 << t)}
+
+
+def traced_keys(lines, count):
+    """Keys seen on these lines in the original tests, and the fully traced tests."""
+    data = replay_lines()
+    if not data or data[0] != (count + 7) // 8:
+        return None
+    width, tests, paths, masks = data
+    if not lines or not paths.keys() >= lines.keys():
+        return None
+    import zlib
+    ids = {paths[path][n] for path, numbers in lines.items() for n in numbers if n in paths[path]}
+    if not ids:
+        return None
+    mask = 0
+    for i in ids:
+        mask |= int.from_bytes(zlib.decompress(masks[i]), "little")
+    return mask.to_bytes(width, "little"), tests
+
+
 _AK = None
 GEN_INIT_LINE = 1005    # sqlglot/generator.py at the pinned commit: inside Generator.__init__
 
@@ -912,7 +978,7 @@ REPLAY_HIT: set = set()  # tests kept specifically because a recorded phase inpu
 
 
 def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=None, pure=False, attrs=None,
-                  disp=False):
+                  disp=False, route_plan=None):
     """Replay the recorded phase inputs under the patched code; drop the candidates whose
     inputs all still produce their baseline output. Returns (candidates, note)."""
     REPLAY_HIT.clear()
@@ -923,7 +989,24 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
         return cands, ""
     R = _replay()
     tkeys = {t: R["tests"][t] for t in inside}
-    if pure:
+    likely = None
+    if route_plan is not None:
+        mask, eligible = route_plan
+        bits = mask.to_bytes((len(R["dig"]) + 7) // 8, "little")
+        filtered = {}
+        for t in inside:
+            if t in eligible:
+                ks = [k for k in tkeys[t] if bits[k >> 3] & (1 << (k & 7))]
+                if ks:
+                    filtered[t] = ks
+        # Leave candidates whose route is unexplained for ordinary verification.
+        inside = list(filtered)
+        if not inside:
+            return cands, ""
+        tkeys = filtered
+        keys = sorted({k for ks in tkeys.values() for k in ks})
+        est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
+    elif pure:
         # only function bodies changed: an input that never enters a changed function
         # runs exactly the old code, so only the inputs that do are replayed. (The tests
         # here run the changed lines inside phases only; one with no such input never
@@ -932,9 +1015,20 @@ def replay_narrow(cands, ch_lines, ms, outside0=None, extra_lines=None, light0=N
         for f, v in (extra_lines or {}).items():
             allines.setdefault(f, set()).update(v)
         mask = _key_mask(R, allines) if os.environ.get("BR_REPLAY_FK", "1") == "1" else None
+        likely = traced_keys(allines, len(R["dig"]))
         if mask is not None:
             bits = mask.to_bytes((len(R["dig"]) + 7) // 8, "little")
-            tkeys = {t: [k for k in ks if bits[k >> 3] & (1 << (k & 7))] for t, ks in tkeys.items()}
+            if likely:
+                traced, complete_tests = likely
+                narrowed = bytes(x & y for x, y in zip(bits, traced))
+            else:
+                complete_tests = ()
+                narrowed = bits
+            filtered = {}
+            for t, ks in tkeys.items():
+                use = narrowed if t in complete_tests else bits
+                filtered[t] = [k for k in ks if use[k >> 3] & (1 << (k & 7))]
+            tkeys = filtered
             keys = sorted({k for ks in tkeys.values() for k in ks})
             est = sum(R["ms"][k] for k in keys) / 1000.0 * REPLAY_FACTOR + 0.05
     elif attrs is not None and os.environ.get("BR_REPLAY_AK", "1") == "1":
@@ -1656,6 +1750,7 @@ def overlay_candidates(j, old_mods, nodeids):
     cls_readers = set()
     cls_ok = True
     n_glob = 0
+    seen_enums = set()
     for kind, owner, attr, key in delta:
         if kind == "cls":
             if attr in ("*", "__mro__"):
@@ -1669,7 +1764,8 @@ def overlay_candidates(j, old_mods, nodeids):
                 for k2, i in OR[1].get((owner, attr), []):
                     if key is None or k2 == key or k2 == "*":
                         outside |= OR[0][i]
-            if _is_enum(old_mods, new_mods, owner):
+            if owner not in seen_enums and _is_enum(old_mods, new_mods, owner):
+                seen_enums.add(owner)
                 cls_ok = False
                 # members are also reached by iterating the class or looking a value up,
                 # which no attribute read shows: everything that names the enum counts
@@ -1705,7 +1801,17 @@ def overlay_candidates(j, old_mods, nodeids):
                 cls_ok = False
         elif kind == "dictcode":
             try:
-                co_file, lo, hi = key
+                co_file, lo, hi, entry_key = key
+                # Single-line callbacks in class dictionaries can execute on a
+                # line also visited at import. The concrete lookup independently
+                # identifies tests that reached the changed callback.
+                for lookup, i in byattr.get((owner, attr), ()):
+                    if lookup == entry_key:
+                        cands.update(sets[i])
+                if OR:
+                    for lookup, i in OR[1].get((owner, attr), ()):
+                        if lookup == entry_key:
+                            outside.update(OR[0][i])
                 rel = os.path.relpath(co_file, str(REPO))
                 if rel.startswith("..") or not rel.startswith("sqlglot/"):
                     unknown.append((kind, owner, attr))
@@ -1747,6 +1853,7 @@ def overlay_candidates(j, old_mods, nodeids):
         if reached is not None:
             observed, direct, validator_routes = reached
             cands = observed | precise | (cands & direct)
+            direct |= precise
             note += f" dispatch={len(cands)}"
     default_sites = []
     if j.get("default_edit") and not forced and len(delta) == 1:
@@ -2243,8 +2350,30 @@ _REIMPORT_MARK = b"REIMPORT\n"
 FORCED: set = set()   # tests selected without running (they import a module that no longer imports)
 
 
+def plan_fixture_workers(cands, lines, settings=()):
+    import poolmemo
+    for t, fraction in poolmemo.plan(lines, settings).items():
+        base = CPU["test"].get(str(t))
+        if t in cands and base is not None:
+            CPU_OVR[t] = min(CPU_OVR.get(t, base), base * fraction)
+
+
+def plan_scope_check(runner, cands, nodeids, lines, attrs=()):
+    import scopeblocks
+    t = _nodeid_pos(nodeids).get(scopeblocks.TEST)
+    if t is None or t not in cands:
+        return
+    skip = scopeblocks.unaffected(lines, attrs)
+    if skip:
+        runner.SCOPE_SKIP = skip
+        # Most of the pinned test is the two large set-operation chains.
+        base = CPU["test"].get(str(t), 1.0)
+        reduction = sum((0.65, 0.20)[i] for i in skip)
+        CPU_OVR[t] = min(CPU_OVR.get(t, base), base * (1 - reduction))
+
+
 def filter_validators(runner, cands, nodeids, lines, settings=(), routes=()):
-    if not lines or any(not (p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
+    if (not lines and not routes) or any(not (p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
                              or p in ("sqlglot/parser.py", "sqlglot/generator.py")) for p in lines):
         return
     import validatorcalls
@@ -2286,6 +2415,7 @@ def _child(j, nodeids, ms, runner, modules):
     runner.ITER_FILTER.clear()
     runner.ITER_FILTER.update({int(t): set(v) for t, v in (j.get("iterf") or {}).items()})
     runner.MEMO_DUCK = bool(j.get("memo_duck")) and runner.MEMO is not None
+    runner.FIXTURE_ONLY_TESTS = j.get("fixture_only_tests", set()) if not j["overlay"] else set()
     runner.FIXTURE_SQL_ONLY = bool(j.get("fixture_sql_only")) and not j["overlay"]
     if runner.MEMO_DUCK and not j["overlay"] and not j["hot"] and not any((j.get("ch_lines") or {}).values()):
         runner.FIXTURE_CALLS = True
@@ -2319,6 +2449,7 @@ def _child(j, nodeids, ms, runner, modules):
         except Exception:  # noqa
             pass
         j["overlay"] = True
+        runner.FIXTURE_ONLY_TESTS.clear()
         runner.VALIDATOR_CALLS.clear()
         runner.PARSE_ONLY.clear()
         runner.SUBMIT_FILTER.clear()
@@ -2339,7 +2470,8 @@ def _child(j, nodeids, ms, runner, modules):
         optmemo.set_changed(None)
         c0 = time.process_time()
         if j.get("guard_tests") is not None:
-            res = {"cands": j["guard_tests"], "note": f"dispatch={len(j['guard_tests'])}"}
+            res = {"cands": j["guard_tests"], "validator_routes": j["guard_routes"],
+                   "direct_dispatch": j["guard_direct"], "note": f"dispatch={len(j['guard_tests'])}"}
         else:
             res = overlay_candidates(j, old_mods, nodeids)
         PROF["ovc"] = time.process_time() - c0
@@ -2354,7 +2486,18 @@ def _child(j, nodeids, ms, runner, modules):
         FORCED.update(forced)
         cands = sorted(set(res["cands"]) - forced)
         j["unknown"] = res.get("unknown", False)
-        if res.get("replay_ok") and j.get("pure_src"):
+        route_plan = None
+        if res.get("validator_routes") and j.get("pure_src") and REPLAY_ON:
+            data = _replay()
+            if data:
+                watched = res["validator_routes"] | {("*", "*")}
+                route_plan = lookup_keys(watched, len(data["dig"]))
+        if route_plan is not None:
+            cands, rn = replay_narrow(cands, {}, ms, outside0=res["direct_dispatch"], route_plan=route_plan)
+            note += rn
+            if HANG[0] or not cands:
+                return {"failed": [], "unrun": sorted(cands), "note": note}
+        elif res.get("replay_ok") and j.get("pure_src"):
             cands, rn = replay_narrow(cands, j.get("ch_lines"), ms, res.get("outside"), res.get("fn_lines"),
                                       light0=() if len(cands) > 300 else None, pure=bool(res.get("pure")),
                                       attrs=None if res.get("pure") else res.get("attrs"),
@@ -2371,9 +2514,20 @@ def _child(j, nodeids, ms, runner, modules):
             for f, v in (res.get("fn_lines") or {}).items():
                 ov_lines.setdefault(f, set()).update(v)
         if res.get("validator_routes") and ov_lines is not None:
-            filter_validators(runner, set(cands) - res["direct_dispatch"], nodeids, ov_lines,
-                              routes=res["validator_routes"])
+            readers = set(cands) - res["direct_dispatch"]
+            routes = res["validator_routes"]
+            # The guarded builder writes only to its local dictionary. Its
+            # callers observe changes via the concrete routes compared above.
+            route_lines = {} if j.get("guard_tests") is not None else ov_lines
+            filter_validators(runner, readers, nodeids, route_lines, routes=routes)
+            subf = setting_queries((), route_lines, readers, nodeids, routes=routes)
+            runner.SUBMIT_FILTER.update(subf)
+            j["subf"].update(subf)
+            CPU_OVR.update(sub_cpu(subf))
         if res.get("fn_only") and ov_lines is not None:
+            if res.get("pure"):
+                plan_fixture_workers(cands, ov_lines)
+            plan_scope_check(runner, cands, nodeids, ov_lines)
             filter_validators(runner, cands, nodeids, ov_lines)
             aff = opt_affected(ov_lines)
             if aff is not None:
@@ -2392,6 +2546,8 @@ def _child(j, nodeids, ms, runner, modules):
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
         if res.get("settings") and ov_lines is not None:
+            plan_fixture_workers(cands, ov_lines, res["settings"])
+            plan_scope_check(runner, cands, nodeids, ov_lines, res["settings"])
             filter_validators(runner, cands, nodeids, ov_lines, res["settings"])
             subf = setting_queries(res["settings"], ov_lines, cands, nodeids)
             runner.SUBMIT_FILTER.update(subf)
@@ -2461,6 +2617,8 @@ def _child(j, nodeids, ms, runner, modules):
             return {"failed": [], "unrun": sorted(cands), "note": note}
         if not cands:
             return {"failed": [], "unrun": [], "note": note}
+        plan_fixture_workers(cands, j["ch_lines"])
+        plan_scope_check(runner, cands, nodeids, j["ch_lines"])
         filter_validators(runner, cands, nodeids, j.get("ch_lines"))
         # Preparation and replay have already been paid for. Plan the remaining
         # work with the measured CPU rate even when replay kept every candidate.

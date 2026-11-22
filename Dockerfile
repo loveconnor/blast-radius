@@ -19,7 +19,7 @@ PY
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
 
 # baseline memo of the optimizer pipeline (its own layer: it only depends on these files)
-COPY app/canon.py app/optmemo.py app/buildopt.py /app/
+COPY app/lineevents.py app/canon.py app/optmemo.py app/buildopt.py /app/
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildopt.py /app/optmemo \
     || (rm -f /app/optmemo.idx /app/optmemo.bin; echo "optimizer memo build failed: running without it")
 COPY app /app
@@ -28,6 +28,8 @@ RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /app
     || (rm -f /app/memo.pkl; echo "memo build failed: running without it")
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildqueryattrs.py /app/queryattrs.pkl
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildvalidators.py /app/validatorcalls.idx
+RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildscope.py
+RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildpoolmemo.py
 RUN BR_DATA=/nonexistent python /app/prep.py || echo "map preparation failed: maps are parsed at run time"
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

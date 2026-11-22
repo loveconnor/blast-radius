@@ -85,7 +85,8 @@ def on_line(code, line):
     return mon.DISABLE
 
 
-mon.register_callback(TOOL, mon.events.LINE, on_line)
+import lineevents
+outer_events = lineevents.register(mon, TOOL, on_line)
 # Keep a second monitor so the existing outside-phase trace keeps its semantics.
 QUERY_TOOL = 3
 mon.use_tool_id(QUERY_TOOL, "brquery")
@@ -105,17 +106,17 @@ def query_line(code, line):
     return mon.DISABLE
 
 
-mon.register_callback(QUERY_TOOL, mon.events.LINE, query_line)
+query_events = lineevents.register(mon, QUERY_TOOL, query_line)
 for i, tid in enumerate(IDS):
     contexts = {}
     if i < 2:
         switch_query(None)
         runner.QUERY_TRACE = switch_query
-        mon.set_events(QUERY_TOOL, mon.events.LINE)
+        mon.set_events(QUERY_TOOL, query_events)
     cur = {}
     rec["tpch"][tid] = "tpch" in tid
     mon.restart_events()
-    mon.set_events(TOOL, mon.events.LINE)
+    mon.set_events(TOOL, outer_events)
     failed = runner.run_tests([i], IDS, timeouts=[3000.0])
     mon.set_events(TOOL, 0)
     mon.set_events(QUERY_TOOL, 0)

@@ -125,18 +125,21 @@ def _compare(writer, code, repo, data, coverage):
             return None
         ns = vars(gen).copy()
         exec(code, ns)
-        reached = set(data["unknown"]) | coverage.covering("tests/dialects/test_dialect.py", 237, 237)
+        direct = set(data["unknown"]) | coverage.covering("tests/dialects/test_dialect.py", 237, 237)
+        reached = set(direct)
+        routes = set()
         for cls in classes:
             old, new = gen._build_dispatch(cls), ns["_build_dispatch"](cls)
             reads = data["reads"].get(name(cls), {})
             for expr in old.keys() | new.keys():
                 if old.get(expr) is not new.get(expr):
+                    routes.add((name(cls), name(expr)))
                     reached.update(reads.get(name(expr), ()))
         # This test warms each builtin generator before measuring repeat
         # construction. The edited guard only runs on the first cache fill.
         reached.difference_update(i for i in reached.copy()
                                   if data["ids"][i] == "tests/test_generator.py::TestGenerator::test_generator_memory")
-        writer.send(sorted(reached))
+        writer.send((sorted(reached), routes, direct))
     finally:
         writer.close()
 

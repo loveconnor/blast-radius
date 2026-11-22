@@ -6,25 +6,18 @@ import pickle
 import sys
 
 import runner
+import settingtrace
 sys.path.insert(0, runner.REPO)
-from sqlglot import exp
-from sqlglot.dialects.dialect import Dialect
 
 
-class Setting:
-    def __init__(self, key, value):
-        self.key = key
-        self.value = value
-
-    def __get__(self, obj, owner):
-        reads[self.key] = reads.get(self.key, 0) | current
-        if optimizing:
-            in_opt[self.key] = in_opt.get(self.key, 0) | current
-        if depth == 0:
-            outside[self.key] = outside.get(self.key, 0) | current
-        if not initial_parse:
-            later[self.key] = later.get(self.key, 0) | current
-        return self.value
+def record(key):
+    reads[key] = reads.get(key, 0) | current
+    if optimizing:
+        in_opt[key] = in_opt.get(key, 0) | current
+    if depth == 0:
+        outside[key] = outside.get(key, 0) | current
+    if not initial_parse:
+        later[key] = later.get(key, 0) | current
 
 
 def switch(index, at_parse=False):
@@ -36,17 +29,12 @@ def switch(index, at_parse=False):
 ids = ["tests/test_executor.py::TestExecutor::test_execute_" + suffix for suffix in ("tpcds", "tpch")]
 runner.zygote_import({"tests.test_executor"})
 # Force dialect registration before installing descriptors on the concrete owners.
-classes = set(Dialect.classes.values()) | {Dialect}
-generators = {base for dialect in classes for base in dialect.generator_class.__mro__
-              if base.__module__.startswith("sqlglot.")}
-classes.update(generators)
-tracked = set()
-for cls in classes:
-    for name, value in list(vars(cls).items()):
-        if name.isupper() and (value is None or type(value) in (bool, str, int, float) or isinstance(value, exp.Expr)):
-            key = (f"{cls.__module__}:{cls.__qualname__}", name)
-            setattr(cls, name, Setting(key, value))
-            tracked.add(key)
+current = 0
+initial_parse = False
+depth = optimizing = 0
+reads, outside, later, in_opt = {}, {}, {}, {}
+tracked = settingtrace.install(record)
+owners = settingtrace.install_routes(record)
 
 runner.SUBMIT_LAZY = {0, 1}
 runner.MEMO_IDS = dict(enumerate(ids))
@@ -117,6 +105,7 @@ for number, record in candidates.items():
         switch(None)
         runner.zygote_import({"tests.test_optimizer"})
         counts = {}
+        runner.trace_fixture_comparisons(switch)
         runner.ITER_HOOK = (switch, counts)
         runner.install_iter_wrappers()
         failed = runner.run_tests([0], [tid], timeouts=[180.0])
@@ -132,5 +121,5 @@ for number, record in candidates.items():
         os.unlink(path)
 print("optimizer fixture traces", len(iteration_reads))
 with open(sys.argv[1], "wb") as fh:
-    pickle.dump((tracked, out, iteration_reads), fh)
+    pickle.dump((tracked, out, iteration_reads, owners), fh)
 print("TPC scalar-setting trace", len(tracked), {k: len(v[0]) for k, v in out.items()})

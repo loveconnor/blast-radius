@@ -111,8 +111,9 @@ def switch(c):
     mon.restart_events()
 
 
-mon.register_callback(TOOL, mon.events.LINE, on_line)
-mon.set_events(TOOL, mon.events.LINE)
+import lineevents
+events = lineevents.register(mon, TOOL, on_line)
+mon.set_events(TOOL, events)
 
 keys = {}                      # call key -> tuple of stage digests (len NCTX: before each rule, final)
 blobs = {}                     # digest -> compressed pickle

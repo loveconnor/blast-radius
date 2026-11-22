@@ -77,7 +77,8 @@ def line(code, number):
         by_line[number] = by_line.get(number, 0) | active
     return monitor.DISABLE
 
-monitor.register_callback(tool, monitor.events.LINE, line)
+import lineevents
+events = lineevents.register(monitor, tool, line)
 def traced(name, method):
     def run(*args, **kwargs):
         global active
@@ -110,7 +111,7 @@ for mod in modules:
             case = cls(method)
             calls = []
             coverage, settings, routes, costs = {}, {}, {}, []
-            monitor.set_events(tool, monitor.events.LINE)
+            monitor.set_events(tool, events)
             try:
                 result = unittest.TestSuite([case]).run(unittest.TestResult())
             finally:

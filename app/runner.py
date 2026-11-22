@@ -33,8 +33,83 @@ def log(*a):
 import concurrent.futures as _cf
 
 
+import poolmemo
+
 VALIDATOR_CALLS = {}
 PICKLE_TASKS = True
+
+
+def _worker_result(payload, fixture):
+    raw = poolmemo.result(payload) if fixture else None
+    if raw is None:
+        fn, args, kwargs = pickle.loads(payload)
+        raw = pickle.dumps(fn(*args, **kwargs))
+    return pickle.loads(raw)
+
+
+_DEFER_FIXTURES = False
+
+
+class _FixtureFuture(_cf.Future):
+    """Serialize at submission and execute when the original assertion needs the result."""
+
+    def __init__(self, fn, args, kwargs):
+        super().__init__()
+        try:
+            self.payload = pickle.dumps((fn, args, kwargs))
+        except Exception as error:
+            self.set_exception(error)
+
+    def result(self, timeout=None):
+        if not self.done():
+            _rearm()
+            try:
+                self.set_result(_worker_result(self.payload, True))
+            except BaseException as error:
+                self.set_exception(error)
+            finally:
+                del self.payload
+                _rearm(done=True)
+        return super().result(timeout)
+
+
+def install_fixture_workers():
+    mod = sys.modules["tests.test_optimizer"]
+    owner = mod.TestOptimizer
+    original = owner.check_file
+    if getattr(original, "_br_deferred", False):
+        return
+    wait, completed = mod.wait, mod.as_completed
+
+    def check_file(*args, **kwargs):
+        global _DEFER_FIXTURES
+        previous, _DEFER_FIXTURES = _DEFER_FIXTURES, True
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _DEFER_FIXTURES = previous
+
+    def wait_for(futures, *args, **kwargs):
+        if _DEFER_FIXTURES and isinstance(futures, dict) and all(isinstance(f, _FixtureFuture) for f in futures):
+            # The pinned check_file discards wait's return and immediately calls as_completed.
+            return None
+        if _DEFER_FIXTURES:
+            for future in futures:
+                if isinstance(future, _FixtureFuture):
+                    try:
+                        future.result()
+                    except Exception:
+                        pass  # The future retains the error for the caller.
+        return wait(futures, *args, **kwargs)
+
+    def in_order(futures, *args, **kwargs):
+        if _DEFER_FIXTURES and isinstance(futures, dict) and all(isinstance(f, _FixtureFuture) for f in futures):
+            return iter(futures)
+        return completed(futures, *args, **kwargs)
+
+    check_file._br_deferred = True
+    owner.check_file = check_file
+    mod.wait, mod.as_completed = wait_for, in_order
 
 
 class InlineExecutor:
@@ -71,11 +146,15 @@ class InlineExecutor:
             f.set_result(None)  # query not reaching the changed code: skip its comparison
             return f
         if not _SUB["lazy"]:
+            fixture = (poolmemo.PLAN is not None and getattr(fn, "__module__", None) == "tests.test_optimizer"
+                       and getattr(fn, "__name__", None) == "parse_and_optimize")
+            if fixture and _DEFER_FIXTURES:
+                return _FixtureFuture(fn, a, k)
             f = _cf.Future()
             _rearm()
             try:
-                fn, a, k = pickle.loads(pickle.dumps((fn, a, k)))
-                f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                payload = pickle.dumps((fn, a, k))
+                f.set_result(_worker_result(payload, fixture))
             except BaseException as e:  # noqa
                 f.set_exception(e)
             finally:
@@ -590,6 +669,32 @@ def install_iter_wrappers():
                 setattr(mod, ln, _iter_wrap(base))
 
 
+def trace_fixture_comparisons(switch):
+    """Image-build hook for check_file's second, completion-ordered loop."""
+    optimizer_tests = sys.modules.get("tests.test_optimizer")
+    if optimizer_tests is None:
+        return
+    submit = InlineExecutor.submit
+    completed = optimizer_tests.as_completed
+
+    def tag(pool, fn, *args, **kwargs):
+        future = submit(pool, fn, *args, **kwargs)
+        if fn is optimizer_tests.parse_and_optimize:
+            future._br_fixture = _ITER["n"] - 1
+        return future
+
+    def compare(futures):
+        try:
+            for future in completed(futures):
+                switch(getattr(future, "_br_fixture", None))
+                yield future
+        finally:
+            switch(None)
+
+    InlineExecutor.submit = tag
+    optimizer_tests.as_completed = compare
+
+
 # ------------------------------------------------- shared class fixtures
 # TestExecutor.setUpClass parses the TPC csv files into tables (over a second of cpu).
 # It is run once in the zygote; a child reuses the result when its patch cannot have
@@ -779,12 +884,13 @@ def apply_overlay_executor_preset(reload_sqls=False):
 
 
 FIXTURE_SQL_ONLY = False
+FIXTURE_ONLY_TESTS = set()
+SCOPE_SKIP = ()
+_FILTER_FIXTURE_ROWS = False
 
 
 def install_fixture_sql_filter(mod):
     """When only existing tests/fixtures/*.sql changed, skip entries unchanged from baseline."""
-    if not FIXTURE_SQL_ONLY:
-        return
     m = sys.modules.get(mod)
     H = sys.modules.get("tests.helpers")
     if m is None or H is None:
@@ -792,6 +898,9 @@ def install_fixture_sql_filter(mod):
     orig_pairs = getattr(m, "load_sql_fixture_pairs", None)
     if orig_pairs is not None and not getattr(orig_pairs, "_br_fx", False):
         def filtered_pairs(filename, _orig=orig_pairs, _H=H):
+            if not FIXTURE_SQL_ONLY and not _FILTER_FIXTURE_ROWS:
+                yield from _orig(filename)
+                return
             p = os.path.realpath(os.path.join(_H.FIXTURES_DIR, filename))
             if p not in _redirect:
                 return
@@ -811,6 +920,9 @@ def install_fixture_sql_filter(mod):
     orig_single = getattr(m, "load_sql_fixtures", None)
     if orig_single is not None and not getattr(orig_single, "_br_fx", False):
         def filtered_single(filename, _orig=orig_single, _H=H):
+            if not FIXTURE_SQL_ONLY and not _FILTER_FIXTURE_ROWS:
+                yield from _orig(filename)
+                return
             p = os.path.realpath(os.path.join(_H.FIXTURES_DIR, filename))
             if p not in _redirect:
                 return
@@ -1212,6 +1324,7 @@ def _timed(run, seconds, t=None, gate=None):
     def wrapped(*a, **k):
         if gate is not None and not gate(t):
             return None     # dropped by a re-plan: stays selected, unrun
+        global _FILTER_FIXTURE_ROWS
         _SUB["n"] = 0
         _SUB["failed"] = False
         _SUB["abort"] = False
@@ -1232,6 +1345,7 @@ def _timed(run, seconds, t=None, gate=None):
         signal.setitimer(signal.ITIMER_REAL, seconds, 1.0)
         _SUB["deadline"] = time.time() + seconds
         c0 = time.process_time()
+        _FILTER_FIXTURE_ROWS = t in FIXTURE_ONLY_TESTS
         try:
             if FAST_PROJECTIONS and t in SUBMIT_LAZY:
                 import rowprojection
@@ -1241,6 +1355,7 @@ def _timed(run, seconds, t=None, gate=None):
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             _SUB["deadline"] = None
+            _FILTER_FIXTURE_ROWS = False
             _ITER["allow"] = None   # class fixtures of the next test load everything
             TEST_CPU[t] = TEST_CPU.get(t, 0.0) + time.process_time() - c0
     return wrapped
@@ -1316,17 +1431,22 @@ def run_tests(test_ids, nodeids, timeouts=None, should_stop=None, skipped=None, 
             continue
         if mod == "tests.test_optimizer":
             install_opt_duck_memo()
+            if poolmemo.PLAN is not None:
+                install_fixture_workers()
         elif mod == "tests.test_executor" and OV_EXEC_PRESET[0]:
             apply_overlay_executor_preset(OV_EXEC_PRESET[1])
         elif mod == "tests.test_generator" and GEN_MEM_MODS:
             install_gen_mem_filter()
-        if FIXTURE_SQL_ONLY and mod in ("tests.test_optimizer", "tests.test_serde", "tests.test_transpile"):
+        if (FIXTURE_SQL_ONLY or FIXTURE_ONLY_TESTS) and mod in ("tests.test_optimizer", "tests.test_serde", "tests.test_transpile"):
             install_fixture_sql_filter(mod)
         _once_fixtures(C)
         suite = unittest.TestSuite()
         for t, meth in items:
             try:
                 case = C(meth)
+                if SCOPE_SKIP and mod == "tests.test_optimizer" and meth == "test_scope":
+                    import scopeblocks
+                    scopeblocks.apply(case, SCOPE_SKIP)
                 if nodeids[t] in VALIDATOR_CALLS:
                     import validatorcalls
                     validatorcalls.apply(case, VALIDATOR_CALLS[nodeids[t]])
