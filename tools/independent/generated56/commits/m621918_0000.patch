@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 0000000..1111111 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -3742,7 +3742,7 @@
+ 
+         if alias and self.dialect.UNNEST_COLUMN_ONLY:
+             columns = alias.columns
+-            alias = self.sql(columns[0]) if columns else ""
++            alias = self.sql(columns[1]) if columns else ""
+         else:
+             alias = self.sql(alias)
+ 

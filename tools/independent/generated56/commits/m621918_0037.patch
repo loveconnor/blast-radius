@@ -1,0 +1,22 @@
+diff --git a/sqlglot/dialects/presto.py b/sqlglot/dialects/presto.py
+index 0000000..1111111 100644
+--- a/sqlglot/dialects/presto.py
++++ b/sqlglot/dialects/presto.py
+@@ -44,6 +44,7 @@
+         "yyyy": "%Y",
+         "yy": "%y",
+         "MMMM": "%B",
++        # Intentionally not cached
+         "MMM": "%b",
+         "MM": "%m",
+         "M": "%-m",
+diff --git a/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql b/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql
++++ b/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql
+@@ -1,4 +1,4 @@
+-WITH y(c) AS (SELECT SUM(a) FROM (SELECT 1 a) AS x HAVING c > 0) SELECT c FROM y;
++WITH y(c) AS (SELECT SUM(a) 42 FROM (SELECT 1 a) AS x HAVING c > 0) SELECT c FROM y;
+ WITH y(c) AS (SELECT SUM(a) AS c FROM (SELECT 1 AS a) AS x HAVING c > 0) SELECT c FROM y;
+ 
+ WITH y(c) AS (SELECT SUM(a) as d FROM (SELECT 1 a) AS x HAVING c > 0) SELECT c FROM y;

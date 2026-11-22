@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generators/tsql.py b/sqlglot/generators/tsql.py
+index 0000000..1111111 100644
+--- a/sqlglot/generators/tsql.py
++++ b/sqlglot/generators/tsql.py
+@@ -564,7 +564,7 @@
+                 assert table
+                 where = exp.and_(
+                     exp.column("TABLE_NAME").eq(table.name),
+-                    exp.column("TABLE_SCHEMA").eq(table.db) if table.db else None,
++                    exp.column("TABLE_SCHEM").eq(table.db) if table.db else None,
+                     exp.column("TABLE_CATALOG").eq(table.catalog) if table.catalog else None,
+                 )
+                 return f"""IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE {where}) EXEC({sql_literal})"""

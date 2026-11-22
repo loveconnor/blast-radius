@@ -1,23 +1,44 @@
-name: Native AMD64 sample
+name: Independent AMD64 comparison
 on:
   workflow_dispatch:
-  push:
-    branches: [benchmark-amd64]
+    inputs:
+      candidate:
+        description: Selector commit
+        required: true
+      reference:
+        description: Reference selector commit
+        required: true
 
 permissions:
   contents: read
 
 jobs:
-  benchmark:
+  score:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: ["${{ inputs.candidate }}", "${{ inputs.reference }}"]
     steps:
       - uses: actions/checkout@v4
-      - name: Build and score three fresh containers
+        with:
+          path: benchmark
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.revision }}
+          path: entry
+      - name: Build the specified entry
+        working-directory: entry
+        run: make build
+      - name: Score independent patches in three fresh containers per set
+        working-directory: entry
         run: |
-          uname -m
-          set -o pipefail
-          make sample | tee /tmp/public-score
-          grep -Eq '^Misses: +[1-9]' /tmp/public-score && exit 1
-          make sample SAMPLE="$PWD/tools/regression" | tee /tmp/regression-score
-          if grep -Eq '^Misses: +[1-9]' /tmp/regression-score; then exit 1; fi
+          set -euo pipefail
+          git rev-parse HEAD
+          for suite in generated56 upstream20; do
+            path="$GITHUB_WORKSPACE/benchmark/tools/independent/$suite"
+            cp sample/tests.json "$path/tests.json"
+            make sample SAMPLE="$path" | tee "/tmp/$suite.log"
+            if grep -Eq '^Misses: +[1-9]' "/tmp/$suite.log"; then exit 1; fi
+          done

@@ -1,0 +1,47 @@
+diff --git a/sqlglot/generators/duckdb.py b/sqlglot/generators/duckdb.py
+index a0fa169..e84f0c8 100644
+--- a/sqlglot/generators/duckdb.py
++++ b/sqlglot/generators/duckdb.py
+@@ -1989,42 +1989,6 @@ class DuckDBGenerator(generator.Generator):
+         "show",
+         "summarize",
+         "unpivot",
+-        "anti",
+-        "asof",
+-        "at",
+-        "authorization",
+-        "binary",
+-        "by",
+-        "collation",
+-        "columns",
+-        "concurrently",
+-        "cross",
+-        "freeze",
+-        "full",
+-        "generated",
+-        "glob",
+-        "ilike",
+-        "inner",
+-        "is",
+-        "isnull",
+-        "join",
+-        "left",
+-        "like",
+-        "map",
+-        "natural",
+-        "notnull",
+-        "outer",
+-        "overlaps",
+-        "positional",
+-        "right",
+-        "semi",
+-        "similar",
+-        "struct",
+-        "tablesample",
+-        "try_cast",
+-        "tuple",
+-        "unpack",
+-        "verbose",
+     }
+ 
+     UNWRAPPED_INTERVAL_VALUES = (exp.Literal, exp.Paren)

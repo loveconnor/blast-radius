@@ -1,0 +1,13 @@
+diff --git a/sqlglot/optimizer/scope.py b/sqlglot/optimizer/scope.py
+index 0000000..1111111 100644
+--- a/sqlglot/optimizer/scope.py
++++ b/sqlglot/optimizer/scope.py
+@@ -166,7 +166,7 @@
+         sources: dict[str, exp.Table | Scope] | None = None,
+         cte_sources: dict[str, exp.Table | Scope] | None = None,
+         lateral_sources: dict[str, exp.Table | Scope] | None = None,
+-        outer_columns: list[str] | None = None,
++        outer_columns: list[str] | None = 0,
+     ) -> Scope:
+         """Branch from the current scope to a new, inner scope"""
+         return Scope(

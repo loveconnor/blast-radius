@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 0000000..1111111 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -3999,7 +3999,7 @@
+         return args
+ 
+     def concat_sql(self, expression: exp.Concat) -> str:
+-        if self.dialect.CONCAT_COALESCE and not expression.args.get("coalesce"):
++        if not self.dialect.CONCAT_COALESCE and not expression.args.get("coalesce"):
+             # Dialect's CONCAT function coalesces NULLs to empty strings, but the expression does not.
+             # Transpile to double pipe operators, which typically returns NULL if any args are NULL
+             # instead of coalescing them to empty string.

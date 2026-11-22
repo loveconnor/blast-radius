@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
++++ b/tests/fixtures/optimizer/tpc-ds/tpc-ds.sql
+@@ -12125,7 +12125,7 @@
+ )
+ SELECT
+   COUNT(*) AS "_col_0"
+-FROM "cool_cust" AS "cool_cust";
++FRO "cool_cust" AS "cool_cust";
+ 
+ --------------------------------------
+ -- TPC-DS 88

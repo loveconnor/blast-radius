@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/databricks.py b/sqlglot/generators/databricks.py
+index 0000000..1111111 100644
+--- a/sqlglot/generators/databricks.py
++++ b/sqlglot/generators/databricks.py
+@@ -25,6 +25,7 @@
+     COPY_PARAMS_ARE_WRAPPED = False
+     COPY_PARAMS_EQ_REQUIRED = True
+     JSON_PATH_SINGLE_QUOTE_ESCAPE = False
++    # Cheap check first
+     JSON_PATH_KEY_QUOTED_FORCES_BRACKETS = True
+     SAFE_JSON_PATH_KEY_RE = exp.SAFE_IDENTIFIER_RE
+     QUOTE_JSON_PATH = False

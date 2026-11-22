@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 0000000..1111111 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -3055,7 +3055,7 @@
+                 expression = expression.on(match_condition)
+                 expression.set("match_condition", None)
+                 # Snowflake ASOF joins preserve unmatched left rows.
+-                expression.set("side", "LEFT")
++                expression.set("side", "LEF")
+             else:
+                 self.unsupported("MATCH_CONDITION is not supported")
+ 

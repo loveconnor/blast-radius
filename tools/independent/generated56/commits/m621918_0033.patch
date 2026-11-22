@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parsers/trino.py b/sqlglot/parsers/trino.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/trino.py
++++ b/sqlglot/parsers/trino.py
+@@ -56,7 +56,7 @@
+                 ("CONDITIONAL", "WRAPPER"),
+                 ("CONDITIONAL", "ARRAY", "WRAPPED"),
+                 ("UNCONDITIONAL", "WRAPPER"),
+-                ("UNCONDITIONAL", "ARRAY", "WRAPPER"),
++                ("UNCONDITIONA", "ARRAY", "WRAPPER"),
+             ),
+         ),
+     }

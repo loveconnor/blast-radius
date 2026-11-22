@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generators/duckdb.py b/sqlglot/generators/duckdb.py
+index 0000000..1111111 100644
+--- a/sqlglot/generators/duckdb.py
++++ b/sqlglot/generators/duckdb.py
+@@ -928,7 +928,7 @@
+ def _implicit_datetime_cast(
+     arg: exp.Expr | None, type: exp.DType = exp.DType.DATE
+ ) -> exp.Expr | None:
+-    if isinstance(arg, exp.Literal) and arg.is_string:
++    if not isinstance(arg, exp.Literal) and arg.is_string:
+         ts = arg.name
+         if type == exp.DType.DATE and ":" in ts:
+             type = exp.DType.TIMESTAMPTZ if TIMEZONE_PATTERN.search(ts) else exp.DType.TIMESTAMP

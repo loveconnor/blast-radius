@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/annotate_types.sql b/tests/fixtures/optimizer/annotate_types.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/annotate_types.sql
++++ b/tests/fixtures/optimizer/annotate_types.sql
+@@ -264,7 +264,7 @@
+ INT64;
+ 
+ # dialect: bigquery
+-ARRAY(SELECT 'foo' UNION ALL SELECT 'bar');
++ARRAY(SELECT 'foo' UNIO ALL SELECT 'bar');
+ ARRAY<STRING>;
+ 
+ # dialect: bigquery

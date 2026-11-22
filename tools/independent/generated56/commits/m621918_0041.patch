@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/pushdown_predicates.sql b/tests/fixtures/optimizer/pushdown_predicates.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/pushdown_predicates.sql
++++ b/tests/fixtures/optimizer/pushdown_predicates.sql
+@@ -172,7 +172,7 @@
+ -- ANY matches must not be changed by prefiltering the RHS
+ # dialect: clickhouse
+ SELECT a.id, b.val FROM a ANY JOIN b ON a.id = b.id WHERE b.val > 10;
+-SELECT a.id, b.val FROM a ANY JOIN b ON a.id = b.id WHERE b.val > 10;
++SELECT a.id, b.val FROM a ANY JOIN b ON a.id = b.id WHERE b.val  10;
+ 
+ # dialect: clickhouse
+ SELECT a.id, b.val FROM a ANY JOIN (SELECT id, val FROM b) AS b ON a.id = b.id WHERE (a.id = 1 AND b.val > 10) OR (a.id = 2 AND b.val > 20);

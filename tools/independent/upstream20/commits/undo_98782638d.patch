@@ -1,0 +1,62 @@
+diff --git a/sqlglot/expressions/datatypes.py b/sqlglot/expressions/datatypes.py
+index 2697438..26d82a7 100644
+--- a/sqlglot/expressions/datatypes.py
++++ b/sqlglot/expressions/datatypes.py
+@@ -117,7 +117,6 @@ class DType(AutoName):
+     NVARCHAR = auto()
+     OBJECT = auto()
+     RANGE = auto()
+-    REF = auto()
+     ROWVERSION = auto()
+     SERIAL = auto()
+     SET = auto()
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 456314b..a84cedb 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -646,7 +646,6 @@ class Parser:
+         TokenType.VOID,
+         TokenType.OBJECT,
+         TokenType.OBJECT_IDENTIFIER,
+-        TokenType.REF,
+         TokenType.INET,
+         TokenType.IPADDRESS,
+         TokenType.IPPREFIX,
+@@ -6938,13 +6937,6 @@ class Parser:
+                     return this
+             elif type_token in self.ENUM_TYPE_TOKENS:
+                 expressions = self._parse_csv(self._parse_equality)
+-            elif type_token == TokenType.REF:
+-                # REF(schema.customer) names a target; REF(1) can still be a function call.
+-                target = self._try_parse(lambda: self._parse_table_parts(schema=True))
+-                if target is None:
+-                    self._retreat(index)
+-                    return None
+-                expressions = [target]
+             elif type_token == TokenType.JSON:
+                 # ClickHouse JSON type supports arguments: JSON(col Type, SKIP col, param=value)
+                 # https://clickhouse.com/docs/sql-reference/data-types/newjson
+diff --git a/sqlglot/tokenizer_core.py b/sqlglot/tokenizer_core.py
+index b5f0828..fcbf688 100644
+--- a/sqlglot/tokenizer_core.py
++++ b/sqlglot/tokenizer_core.py
+@@ -219,7 +219,6 @@ class TokenType(IntEnum):
+     IMAGE = auto()
+     VARIANT = auto()
+     OBJECT = auto()
+-    REF = auto()
+     INET = auto()
+     IPADDRESS = auto()
+     IPPREFIX = auto()
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+index 7806999..d3d211a 100644
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -352,7 +352,6 @@ class Tokenizer(_TokenizerBase):
+         "NOTNULL": TokenType.NOTNULL,
+         "NULL": TokenType.NULL,
+         "OBJECT": TokenType.OBJECT,
+-        "REF": TokenType.REF,
+         "OFFSET": TokenType.OFFSET,
+         "ON": TokenType.ON,
+         "OR": TokenType.OR,

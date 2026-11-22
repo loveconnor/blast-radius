@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 0000000..1111111 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -10276,7 +10276,7 @@
+             if result == TrieResult.FAILED:
+                 break
+ 
+-            if result == TrieResult.EXISTS:
++            if result != TrieResult.EXISTS:
+                 subparser = parsers[" ".join(this)]
+                 return subparser
+ 

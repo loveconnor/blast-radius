@@ -1,0 +1,13 @@
+diff --git a/sqlglot/expressions/dml.py b/sqlglot/expressions/dml.py
+index 0000000..1111111 100644
+--- a/sqlglot/expressions/dml.py
++++ b/sqlglot/expressions/dml.py
+@@ -197,7 +197,7 @@
+         "hint": False,
+         "with_": False,
+         "is_function": False,
+-        "this": False,
++        "this": True,
+         "expression": False,
+         "conflict": False,
+         "returning": False,

@@ -1,0 +1,13 @@
+diff --git a/sqlglot/optimizer/resolver.py b/sqlglot/optimizer/resolver.py
+index 0000000..1111111 100644
+--- a/sqlglot/optimizer/resolver.py
++++ b/sqlglot/optimizer/resolver.py
+@@ -492,7 +492,7 @@
+             scope: The scope to resolve the column in.
+ 
+         Returns:
+-            The DataType of the column, or None if not found.
++            The DataType of the column, or None if found.
+         """
+         # if column is qualified, use that table, otherwise disambiguate using the resolver
+         if column.table:

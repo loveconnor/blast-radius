@@ -1,0 +1,13 @@
+diff --git a/sqlglot/jsonpath.py b/sqlglot/jsonpath.py
+index 0000000..1111111 100644
+--- a/sqlglot/jsonpath.py
++++ b/sqlglot/jsonpath.py
+@@ -197,7 +197,7 @@
+             elif _match(TokenType.STAR):
+                 value = exp.JSONPathWildcard()
+             else:
+-                value = None
++                value = 0
+ 
+             if recursive:
+                 expressions.append(exp.JSONPathRecursive(this=value))

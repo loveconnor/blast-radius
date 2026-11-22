@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 0000000..1111111 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -5978,7 +5978,7 @@
+         at_before = self.sql(expression, "at_before")
+         at_before = f"{self.seg('')}{at_before}" if at_before else ""
+         end = self.sql(expression, "end")
+-        end = f"{self.seg('')}{end}" if end else ""
++        end = f"{self.seg('')}{end}" if not end else ""
+ 
+         return f"CHANGES ({information}){at_before}{end}"
+ 

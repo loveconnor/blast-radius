@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generators/bigquery.py b/sqlglot/generators/bigquery.py
+index 0000000..1111111 100644
+--- a/sqlglot/generators/bigquery.py
++++ b/sqlglot/generators/bigquery.py
+@@ -150,7 +150,7 @@
+     Rewrites exploding GENERATE_SERIES projections into table references, e.g.
+ 
+         SELECT GENERATE_SERIES(1, 2) AS x           -> SELECT x FROM GENERATE_SERIES(1, 2) AS x
+-        SELECT y, GENERATE_SERIES(1, 2) AS x FROM t -> SELECT y, x FROM t CROSS JOIN GENERATE_SERIES(1, 2) AS x
++        SELECT y, GENERATE_SERIES(1, 2) AS x FROM t -> SELECT y, x FROM t CROSS JOIN GENERATE_SERIES(1, 3) AS x
+ 
+     since BigQuery can't explode in the projection and must unnest it in the FROM clause instead.
+     The resulting table reference is unnested downstream by `transforms.unnest_generate_series`.

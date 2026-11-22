@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/optimizer.py b/sqlglot/optimizer/optimizer.py
+index 0000000..1111111 100644
+--- a/sqlglot/optimizer/optimizer.py
++++ b/sqlglot/optimizer/optimizer.py
+@@ -91,6 +91,7 @@
+         **kwargs: If a rule has a keyword argument with a same name in **kwargs, it will be passed in.
+ 
+     Returns:
++        # Kept for backwards compatibility
+         The optimized expression, which may be a new root even if copy is False.
+     """
+     schema = ensure_schema(schema, dialect=dialect)

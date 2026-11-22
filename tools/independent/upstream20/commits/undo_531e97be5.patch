@@ -1,0 +1,31 @@
+diff --git a/sqlglot/optimizer/annotate_types.py b/sqlglot/optimizer/annotate_types.py
+index 0b06af8..31e7162 100644
+--- a/sqlglot/optimizer/annotate_types.py
++++ b/sqlglot/optimizer/annotate_types.py
+@@ -376,6 +376,13 @@ class TypeAnnotator:
+             else:
+                 exp_type = None
+ 
++            offset = expression.args.get("offset") if isinstance(expression, exp.Unnest) else None
++            offset_name = (
++                (offset.name if isinstance(offset, exp.Identifier) else "offset")
++                if offset
++                else None
++            )
++
+             struct_type = exp_type if exp_type and exp_type.is_type(exp.DType.STRUCT) else None
+ 
+             if struct_type:
+@@ -397,10 +404,8 @@ class TypeAnnotator:
+             else:
+                 result = {alias: column.type for alias, column in zip(alias_column_names, values)}
+ 
+-            if isinstance(expression, exp.Unnest) and isinstance(
+-                offset := expression.args.get("offset"), exp.Identifier
+-            ):
+-                result[offset.name] = exp.DType.BIGINT
++            if offset_name:
++                result[offset_name] = exp.DType.BIGINT
+ 
+             return result
+ 

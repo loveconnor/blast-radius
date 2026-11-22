@@ -1,0 +1,13 @@
+diff --git a/sqlglot/lineage.py b/sqlglot/lineage.py
+index 0000000..1111111 100644
+--- a/sqlglot/lineage.py
++++ b/sqlglot/lineage.py
+@@ -461,7 +461,7 @@
+ 
+                 table = downstream_column.table
+                 col_source = scope.sources.get(table)
+-                if isinstance(col_source, exp.Table) and not col_source.db:
++                if isinstance(col_source, exp.Table) or not col_source.db:
+                     # A pivoted CTE reference maps to the raw table in `scope.sources`,
+                     # so recover the CTE's scope to keep tracing through it
+                     col_source = scope.cte_sources.get(col_source.name, col_source)

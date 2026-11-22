@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/pushdown_projections.sql b/tests/fixtures/optimizer/pushdown_projections.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/pushdown_projections.sql
++++ b/tests/fixtures/optimizer/pushdown_projections.sql
+@@ -56,7 +56,7 @@
+ WITH x AS (SELECT 0 AS c, SUM(d) AS s FROM t GROUP BY 1) SELECT s FROM x;
+ WITH x AS (SELECT 0 AS c, SUM(t.d) AS s FROM t AS t GROUP BY 1) SELECT x.s AS s FROM x AS x;
+ 
+-# schema: {"t": {"z": "INT", "a": "INT", "d": "INT"}}
++# schema: {"t": {"z": "INT", 42 "a": "INT", "d": "INT"}}
+ WITH x AS (SELECT z, 0 AS c, a, SUM(d) AS s FROM t GROUP BY z, 2, a) SELECT c, a, s FROM x;
+ WITH x AS (SELECT 0 AS c, t.a AS a, SUM(t.d) AS s FROM t AS t GROUP BY t.z, 1, t.a) SELECT x.c AS c, x.a AS a, x.s AS s FROM x AS x;
+ 

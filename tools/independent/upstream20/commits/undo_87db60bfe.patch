@@ -1,0 +1,81 @@
+diff --git a/sqlglot/expressions/query.py b/sqlglot/expressions/query.py
+index 9f28e1c..f103455 100644
+--- a/sqlglot/expressions/query.py
++++ b/sqlglot/expressions/query.py
+@@ -1115,27 +1115,15 @@ class SetOperation(Expression, Query):
+ 
+     @property
+     def named_selects(self) -> list[str]:
+-        names = []
+-        stack: list[Expr] = [self]
+-        by_name = False
+-
+-        while stack:
+-            expr = stack.pop()
+-            if not isinstance(expr, SetOperation):
+-                names.extend(t.cast(Selectable, expr).named_selects)
+-                continue
+-
+-            while isinstance(expr, SetOperation):
+-                if expr.args.get("by_name"):
+-                    by_name = True
+-                    stack.append(expr.expression.unnest())
+-                    stack.append(expr.this.unnest())
+-                    break
+-                expr = expr.this.unnest()
+-            else:
+-                names.extend(_named_selects(expr))
+-
+-        return list(dict.fromkeys(names)) if by_name else names
++        expr: Expr = self
++        while isinstance(expr, SetOperation):
++            if expr.args.get("by_name"):
++                left = t.cast(Selectable, expr.this.unnest()).named_selects
++                right = t.cast(Selectable, expr.expression.unnest()).named_selects
++                return list(dict.fromkeys(left + right))
++
++            expr = expr.this.unnest()
++        return _named_selects(expr)
+ 
+     @property
+     def is_star(self) -> bool:
+diff --git a/sqlglot/optimizer/scope.py b/sqlglot/optimizer/scope.py
+index 0d2c8fa..72efcc1 100644
+--- a/sqlglot/optimizer/scope.py
++++ b/sqlglot/optimizer/scope.py
+@@ -812,34 +812,14 @@ def _traverse_set_operation(scope: Scope) -> Iterator[Scope]:
+     # Access the args directly instead of the left/right properties, because set operation
+     # operands aren't guaranteed to be Query nodes, e.g. in VALUES (1) UNION ALL SELECT 1
+     expression_stack: list[exp.Expr] = [set_op.expression, set_op.this]
+-    by_name_col_map: dict[str, str] | None = None
+ 
+     while expression_stack:
+         expression = expression_stack.pop()
+         set_op_scope = set_op_scope_stack[-1]
+ 
+-        outer = set_op_scope.outer_columns
+-        set_op_expr = set_op_scope.expression
+-        # all arms need their outer aliases reordered for BY NAME
+-        if (
+-            outer
+-            and prev_scope is not None
+-            and isinstance(set_op_expr, exp.SetOperation)
+-            and set_op_expr.args.get("by_name")
+-        ):
+-            if by_name_col_map is None:
+-                names = set_op.named_selects
+-                by_name_col_map = {} if "*" in names else dict(zip(names, scope.outer_columns))
+-
+-            if by_name_col_map:
+-                arm_node = expression.unnest()
+-                outer = [
+-                    by_name_col_map.get(name, "") for name in getattr(arm_node, "named_selects", [])
+-                ]
+-
+         new_scope = set_op_scope.branch(
+             expression,
+-            outer_columns=outer,
++            outer_columns=set_op_scope.outer_columns,
+             scope_type=ScopeType.SET_OPERATION,
+         )
+ 

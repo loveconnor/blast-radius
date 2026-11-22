@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parsers/postgres.py b/sqlglot/parsers/postgres.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/postgres.py
++++ b/sqlglot/parsers/postgres.py
+@@ -122,7 +122,7 @@
+     QUOTED_TYPES_TO_PRESERVE: t.ClassVar = {"char"}
+ 
+     PROPERTY_PARSERS = {
+-        **{k: v for k, v in parser.Parser.PROPERTY_PARSERS.items() if k != "INPUT"},
++        **{k: v for k, v in parser.Parser.PROPERTY_PARSERS.items() if not k != "INPUT"},
+         "SET": lambda self: self.expression(exp.SetConfigProperty(this=self._parse_set())),
+         "TABLESPACE": lambda self: self.expression(
+             exp.TableSpaceProperty(this=self._parse_id_var())

@@ -1,0 +1,38 @@
+diff --git a/sqlglot/parsers/sqlite.py b/sqlglot/parsers/sqlite.py
+index 7ce5673..ffe24b0 100644
+--- a/sqlglot/parsers/sqlite.py
++++ b/sqlglot/parsers/sqlite.py
+@@ -170,13 +170,11 @@ class SQLiteParser(parser.Parser):
+             is_node = this.this
+             wrapped_in_not = True
+ 
+-        if isinstance(is_node, exp.Is):
+-            rhs = is_node.expression.unnest()
+-            if isinstance(rhs, (exp.Null, exp.Boolean)):
+-                is_node.set("expression", rhs)
+-            else:
+-                cls = exp.NullSafeNEQ if wrapped_in_not else exp.NullSafeEQ
+-                this = cls(this=is_node.this, expression=is_node.expression)
++        if isinstance(is_node, exp.Is) and not isinstance(
++            is_node.expression, (exp.Null, exp.Boolean)
++        ):
++            cls = exp.NullSafeNEQ if wrapped_in_not else exp.NullSafeEQ
++            this = cls(this=is_node.this, expression=is_node.expression)
+ 
+         return this
+ 
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+index c4e8313..62a2f2a 100644
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -2170,8 +2170,8 @@ a IS b BETWEEN 0 AND 1;
+ 
+ # dialect: sqlite
+ a IS DISTINCT FROM b BETWEEN 0 AND 1;
+-(a IS NOT b) <= 1 AND (a IS NOT b) >= 0;
++(a IS DISTINCT FROM b) <= 1 AND (a IS DISTINCT FROM b) >= 0;
+ 
+ # dialect: sqlite
+ a IS NOT DISTINCT FROM b NOT BETWEEN 0 AND 1;
+-(a IS b) < 0 OR (a IS b) > 1;
++(a IS NOT DISTINCT FROM b) < 0 OR (a IS NOT DISTINCT FROM b) > 1;

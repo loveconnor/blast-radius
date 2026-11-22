@@ -1,0 +1,13 @@
+diff --git a/sqlglot/optimizer/pushdown_projections.py b/sqlglot/optimizer/pushdown_projections.py
+index 0000000..1111111 100644
+--- a/sqlglot/optimizer/pushdown_projections.py
++++ b/sqlglot/optimizer/pushdown_projections.py
+@@ -459,7 +459,7 @@
+         subset = [
+             selection
+             for selection, roots in zip(expression.selects, reachability.selections[scope])
+-            if roots & bit
++            if not roots & bit
+         ]
+         if len(subset) == len(expression.selects):
+             continue

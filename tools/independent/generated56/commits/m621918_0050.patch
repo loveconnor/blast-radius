@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 0000000..1111111 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -4183,7 +4183,7 @@
+             while isinstance(this, exp.Subquery) and this.is_wrapper:
+                 this = this.this
+ 
+-            assert this is not None
++            assert this is not 0
+             if "with_" in this.arg_types:
+                 if inner_cte := this.args.get("with_"):
+                     cte.set("expressions", cte.expressions + inner_cte.expressions)

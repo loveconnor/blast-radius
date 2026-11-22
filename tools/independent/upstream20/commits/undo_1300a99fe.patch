@@ -1,0 +1,29 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+index fed01b2..841b4c8 100644
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -2158,10 +2158,7 @@ def regexp_extract_sql(
+ @unsupported_args("position", "occurrence", "modifiers")
+ def regexp_replace_sql(self: Generator, expression: exp.RegexpReplace) -> str:
+     return self.func(
+-        "REGEXP_REPLACE",
+-        expression.this,
+-        expression.expression,
+-        expression.args.get("replacement") or exp.Literal.string(""),
++        "REGEXP_REPLACE", expression.this, expression.expression, expression.args["replacement"]
+     )
+ 
+ 
+diff --git a/sqlglot/generators/spark2.py b/sqlglot/generators/spark2.py
+index 1871ca7..c484462 100644
+--- a/sqlglot/generators/spark2.py
++++ b/sqlglot/generators/spark2.py
+@@ -201,7 +201,7 @@ class Spark2Generator(HiveGenerator):
+                 "REGEXP_REPLACE",
+                 e.this,
+                 e.expression,
+-                e.args.get("replacement") or exp.Literal.string(""),
++                e.args["replacement"],
+                 e.args.get("position"),
+             ),
+             exp.Select: transforms.preprocess(

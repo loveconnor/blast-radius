@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 0000000..1111111 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -4711,7 +4711,7 @@
+ 
+     def altersession_sql(self, expression: exp.AlterSession) -> str:
+         items_sql = self.expressions(expression, flat=True)
+-        keyword = "UNSET" if expression.args.get("unset") else "SET"
++        keyword = "UNSET" if not expression.args.get("unset") else "SET"
+         return f"{keyword} {items_sql}"
+ 
+     def add_column_sql(self, expression: exp.Expr) -> str:

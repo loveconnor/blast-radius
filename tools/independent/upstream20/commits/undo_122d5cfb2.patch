@@ -1,0 +1,71 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+index fed01b2..8cd76bb 100644
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -841,12 +841,6 @@ class Dialect(metaclass=_Dialect):
+     REGEXP_EXTRACT_POSITION_OVERFLOW_RETURNS_NULL = True
+     """Whether REGEXP_EXTRACT returns NULL when the position arg exceeds the string length."""
+ 
+-    REGEXP_EXTRACT_NO_MATCH_RETURNS_NULL = True
+-    """Whether REGEXP_EXTRACT returns NULL rather than an empty string when the pattern does not match."""
+-
+-    REGEXP_EXTRACT_MISSING_GROUP_RETURNS_EMPTY = False
+-    """Whether REGEXP_EXTRACT returns an empty string for a non-participating capture group."""
+-
+     SET_OP_DISTINCT_BY_DEFAULT: dict[Type[exp.Expr], bool | None] = {
+         exp.Except: True,
+         exp.Intersect: True,
+diff --git a/sqlglot/dialects/duckdb.py b/sqlglot/dialects/duckdb.py
+index 9b28e54..a94442b 100644
+--- a/sqlglot/dialects/duckdb.py
++++ b/sqlglot/dialects/duckdb.py
+@@ -36,8 +36,6 @@ class DuckDB(Dialect):
+     NUMBERS_CAN_BE_UNDERSCORE_SEPARATED = True
+     UUID_IS_STRING_TYPE = False
+     USING_COLUMN_ORDER = UsingColumnOrder.IN_PLACE
+-    REGEXP_EXTRACT_NO_MATCH_RETURNS_NULL = False
+-    REGEXP_EXTRACT_MISSING_GROUP_RETURNS_EMPTY = True
+ 
+     # https://duckdb.org/docs/sql/introduction.html#creating-a-new-table
+     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE
+diff --git a/sqlglot/dialects/snowflake.py b/sqlglot/dialects/snowflake.py
+index b7438ed..20024b2 100644
+--- a/sqlglot/dialects/snowflake.py
++++ b/sqlglot/dialects/snowflake.py
+@@ -41,7 +41,6 @@ class Snowflake(Dialect):
+     LEAST_GREATEST_IGNORES_NULLS = False
+     UUID_IS_STRING_TYPE = True
+     STAR_ILIKE_BACKSLASH_ESCAPE = True
+-    REGEXP_EXTRACT_MISSING_GROUP_RETURNS_EMPTY = True
+ 
+     # https://docs.snowflake.com/en/sql-reference/functions/split_to_table
+     DEFAULT_FUNCTIONS_COLUMN_NAMES = {
+diff --git a/sqlglot/parsers/bigquery.py b/sqlglot/parsers/bigquery.py
+index 6f01aa9..5892332 100644
+--- a/sqlglot/parsers/bigquery.py
++++ b/sqlglot/parsers/bigquery.py
+@@ -135,8 +135,7 @@ def _build_regexp_extract(expr_type: type[E], default_group: exp.Expr | None = N
+             **(
+                 {
+                     "null_if_pos_overflow": dialect.REGEXP_EXTRACT_POSITION_OVERFLOW_RETURNS_NULL,
+-                    "null_if_no_match": dialect.REGEXP_EXTRACT_NO_MATCH_RETURNS_NULL,
+-                    "empty_if_group_missing": dialect.REGEXP_EXTRACT_MISSING_GROUP_RETURNS_EMPTY,
++                    "null_if_no_match": True,
+                 }
+                 if expr_type is exp.RegexpExtract
+                 else {}
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+index 493d1b7..13beeaf 100644
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -258,8 +258,8 @@ def _build_regexp_extract(expr_type: type[E]) -> t.Callable[[list, Dialect], E]:
+             **(
+                 {
+                     "null_if_pos_overflow": dialect.REGEXP_EXTRACT_POSITION_OVERFLOW_RETURNS_NULL,
+-                    "null_if_no_match": dialect.REGEXP_EXTRACT_NO_MATCH_RETURNS_NULL,
+-                    "empty_if_group_missing": dialect.REGEXP_EXTRACT_MISSING_GROUP_RETURNS_EMPTY,
++                    "null_if_no_match": True,
++                    "empty_if_group_missing": True,
+                 }
+                 if expr_type is exp.RegexpExtract
+                 else {}

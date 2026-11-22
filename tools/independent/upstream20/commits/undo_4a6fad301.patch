@@ -1,0 +1,73 @@
+diff --git a/sqlglot/generators/duckdb.py b/sqlglot/generators/duckdb.py
+index a0fa169..49124a1 100644
+--- a/sqlglot/generators/duckdb.py
++++ b/sqlglot/generators/duckdb.py
+@@ -3885,11 +3885,6 @@ class DuckDBGenerator(generator.Generator):
+         length = expression.expression
+         is_binary = _is_binary(arg)
+ 
+-        if expression.args.get("negative_length_returns_empty"):
+-            # A negative length returns an empty string. Clamping it to 0 instead of
+-            # returning '' directly keeps the result NULL when the input is NULL.
+-            length = exp.If(this=length < 0, true=exp.Literal.number(0), false=length)
+-
+         if is_binary:
+             # LEFT/RIGHT(blob, n) becomes UNHEX(LEFT/RIGHT(HEX(blob), n * 2))
+             # Each byte becomes 2 hex chars, so multiply length by 2
+@@ -3901,6 +3896,12 @@ class DuckDBGenerator(generator.Generator):
+         else:
+             result = exp.Anonymous(this=func_name, expressions=[arg, length])
+ 
++        if expression.args.get("negative_length_returns_empty"):
++            empty: exp.Expression = exp.Literal.string("")
++            if is_binary:
++                empty = exp.Unhex(this=empty)
++            result = exp.case().when(length < exp.Literal.number(0), empty).else_(result)
++
+         return self.sql(result)
+ 
+     def left_sql(self, expression: exp.Left) -> str:
+diff --git a/sqlglot/parsers/mysql.py b/sqlglot/parsers/mysql.py
+index 3ba279a..5b6b60b 100644
+--- a/sqlglot/parsers/mysql.py
++++ b/sqlglot/parsers/mysql.py
+@@ -141,9 +141,6 @@ class MySQLParser(parser.Parser):
+         "FORMAT": exp.NumberToStr.from_arg_list,
+         "FROM_UNIXTIME": build_formatted_time(exp.UnixToTime),
+         "ISNULL": isnull_to_is_null,
+-        "LEFT": lambda args: exp.Left(
+-            this=seq_get(args, 0), expression=seq_get(args, 1), negative_length_returns_empty=True
+-        ),
+         "LENGTH": lambda args: exp.Length(this=seq_get(args, 0), binary=True),
+         "MAKETIME": exp.TimeFromParts.from_arg_list,
+         "MONTH": lambda args: exp.Month(this=exp.TsOrDsToDate(this=seq_get(args, 0))),
+@@ -151,9 +148,6 @@ class MySQLParser(parser.Parser):
+             this=exp.TsOrDsToDate(this=seq_get(args, 0)),
+             format=exp.Literal.string("%B"),
+         ),
+-        "RIGHT": lambda args: exp.Right(
+-            this=seq_get(args, 0), expression=seq_get(args, 1), negative_length_returns_empty=True
+-        ),
+         "SCHEMA": exp.CurrentSchema.from_arg_list,
+         "DATABASE": exp.CurrentSchema.from_arg_list,
+         "STD": exp.StddevPop.from_arg_list,
+diff --git a/sqlglot/parsers/spark2.py b/sqlglot/parsers/spark2.py
+index 8a8af86..9f974a8 100644
+--- a/sqlglot/parsers/spark2.py
++++ b/sqlglot/parsers/spark2.py
+@@ -72,15 +72,9 @@ class Spark2Parser(HiveParser):
+             ),
+             zone=seq_get(args, 1),
+         ),
+-        "LEFT": lambda args: exp.Left(
+-            this=seq_get(args, 0), expression=seq_get(args, 1), negative_length_returns_empty=True
+-        ),
+         "LTRIM": lambda args: build_trim(args, reverse_args=True),
+         "INT": build_as_cast("int"),
+         "MAP_FROM_ARRAYS": exp.Map.from_arg_list,
+-        "RIGHT": lambda args: exp.Right(
+-            this=seq_get(args, 0), expression=seq_get(args, 1), negative_length_returns_empty=True
+-        ),
+         "RLIKE": exp.RegexpLike.from_arg_list,
+         "RTRIM": lambda args: build_trim(args, is_left=False, reverse_args=True),
+         "SHIFTLEFT": binary_from_function(exp.BitwiseLeftShift),

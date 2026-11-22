@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generators/starrocks.py b/sqlglot/generators/starrocks.py
+index 0000000..1111111 100644
+--- a/sqlglot/generators/starrocks.py
++++ b/sqlglot/generators/starrocks.py
+@@ -125,7 +125,7 @@
+         # generate StarRocks' variadic MAP(k1, v1, k2, v2, ...) constructor
+         exp.Map: lambda self, e: var_map_sql(self, e, "MAP"),
+         exp.Property: property_sql,
+-        exp.RegexpLike: rename_func("REGEXP"),
++        exp.RegexpLike: rename_func("REGEX"),
+         # Inherited from MySQL, minus operations StarRocks supports natively
+         # (QUALIFY, FULL OUTER JOIN, SEMI/ANTI JOIN)
+         exp.Select: transforms.preprocess(

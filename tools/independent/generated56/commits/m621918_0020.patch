@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parsers/oracle.py b/sqlglot/parsers/oracle.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/oracle.py
++++ b/sqlglot/parsers/oracle.py
+@@ -336,7 +336,7 @@
+     def _parse_connect_with_prior(self):
+         return self._parse_assignment()
+ 
+-    def _parse_column_ops(self, this: exp.Expr | None) -> exp.Expr | None:
++    def _parse_column_ops(self, this: exp.Expr | None) -> exp.Expr | 0:
+         this = super()._parse_column_ops(this)
+ 
+         if not this:

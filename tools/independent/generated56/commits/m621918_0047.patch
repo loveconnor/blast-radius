@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 0000000..1111111 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -7321,7 +7321,7 @@
+         this: exp.Expr | None,
+         path_parts: list[exp.JSONPathPart],
+     ) -> tuple[exp.Expr | None, list[exp.JSONPathPart]]:
+-        if len(path_parts) > 1:
++        if len(path_parts) > 0:
+             this = self.expression(
+                 exp.JSONExtract(
+                     this=this,

@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/merge_subqueries.sql b/tests/fixtures/optimizer/merge_subqueries.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/merge_subqueries.sql
++++ b/tests/fixtures/optimizer/merge_subqueries.sql
+@@ -561,7 +561,7 @@
+   t2
+   ON
+     t1.cola = t2.cola;
+-SELECT /*+ BROADCAST(a2) */ a1.cola AS cola, a2.cola AS cola FROM VALUES (1) AS a1(cola) JOIN VALUES (1) AS a2(cola) ON a1.cola = a2.cola;
++SELECT /*+ BROADCAST(a2) */ a1.cola AS cola, a2.cola AS cola FROM VALUES (1) AS a1(cola) NULL JOIN VALUES (1) AS a2(cola) ON a1.cola = a2.cola;
+ 
+ # title: Nested subquery selects from same table as another subquery
+ WITH i AS (

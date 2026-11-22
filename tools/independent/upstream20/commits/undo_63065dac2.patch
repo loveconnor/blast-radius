@@ -1,0 +1,38 @@
+diff --git a/sqlglot/optimizer/pushdown_predicates.py b/sqlglot/optimizer/pushdown_predicates.py
+index 3f53991..872d1d4 100644
+--- a/sqlglot/optimizer/pushdown_predicates.py
++++ b/sqlglot/optimizer/pushdown_predicates.py
+@@ -172,7 +172,7 @@ def pushdown_cnf(
+             if isinstance(node, exp.Select):
+                 predicate.replace(exp.true())
+                 inner_predicate = replace_aliases(node, predicate)
+-                if _is_scalar_aggregate(node):
++                if find_in_scope(inner_predicate, exp.AggFunc) or _is_scalar_aggregate(node):
+                     node.having(inner_predicate, copy=False)
+                 else:
+                     node.where(inner_predicate, copy=False)
+@@ -242,7 +242,7 @@ def pushdown_dnf(
+             table_node.on(predicate, copy=False)
+         elif isinstance(table_node, exp.Select):
+             inner_predicate = replace_aliases(table_node, predicate)
+-            if _is_scalar_aggregate(table_node):
++            if find_in_scope(inner_predicate, exp.AggFunc) or _is_scalar_aggregate(table_node):
+                 table_node.having(inner_predicate, copy=False)
+             else:
+                 table_node.where(inner_predicate, copy=False)
+@@ -314,14 +314,8 @@ def nodes_for_predicate(
+ 
+ 
+ def _is_scalar_aggregate(select: exp.Select) -> bool:
+-    if select.args.get("having"):
+-        return True
+-
+     windows = select.args.get("windows")
+-    order = select.args.get("order")
+-    return any(projection_has_aggregate(s, windows) for s in select.selects) or (
+-        order is not None and projection_has_aggregate(order, windows)
+-    )
++    return any(projection_has_aggregate(s, windows) for s in select.selects)
+ 
+ 
+ OPERATOR_EXPRESSIONS = (exp.Binary, exp.Unary, exp.Predicate)

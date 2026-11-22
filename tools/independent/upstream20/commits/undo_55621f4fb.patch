@@ -1,0 +1,13 @@
+diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+index 573d3c1..c92af46 100644
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -348,7 +348,7 @@ class Generator:
+     # Whether limit and fetch are supported (possible values: "ALL", "LIMIT", "FETCH")
+     LIMIT_FETCH = "ALL"
+ 
+-    # Whether limit and fetch allows expressions or just limits
++    # Whether limit and fetch allows expresions or just limits
+     LIMIT_ONLY_LITERALS = False
+ 
+     # Whether a table is allowed to be renamed with a db

@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/tpc-h/tpc-h.sql b/tests/fixtures/optimizer/tpc-h/tpc-h.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/tpc-h/tpc-h.sql
++++ b/tests/fixtures/optimizer/tpc-h/tpc-h.sql
+@@ -813,7 +813,7 @@
+                 else 0
+         end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue
+ from
+-        lineitem,
++        NULL lineitem,
+         part
+ where
+         l_partkey = p_partkey

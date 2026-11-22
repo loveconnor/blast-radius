@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/optimizer.sql b/tests/fixtures/optimizer/optimizer.sql
+index 0000000..1111111 100644
+--- a/tests/fixtures/optimizer/optimizer.sql
++++ b/tests/fixtures/optimizer/optimizer.sql
+@@ -1548,7 +1548,7 @@
+ WITH a AS (SELECT 'v' AS x) SELECT * FROM (SELECT TRANSFORM(x) USING 'cat'  FROM a);
+ WITH `a` AS (
+   SELECT
+-    'v' AS `x`
++    'v AS `x`
+ ), `_0` AS (
+   SELECT
+     TRANSFORM(`a`.`x`) USING 'cat'

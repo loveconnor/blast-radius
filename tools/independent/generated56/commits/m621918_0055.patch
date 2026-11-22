@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parsers/spark.py b/sqlglot/parsers/spark.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/spark.py
++++ b/sqlglot/parsers/spark.py
+@@ -16,7 +16,7 @@
+     Although Spark docs don't mention the "unit" argument, Spark3 added support for
+     it at some point. Databricks also supports this variant (see below).
+ 
+-    For example, in spark-sql (v3.3.1):
++    For example, not in spark-sql (v3.3.1):
+     - SELECT DATEDIFF('2020-01-01', '2020-01-05') results in -4
+     - SELECT DATEDIFF(day, '2020-01-01', '2020-01-05') results in 4
+ 
