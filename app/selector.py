@@ -42,7 +42,7 @@ from sched import best_schedule  # noqa: E402
 from functools import partial
 
 schedule_cost = partial(best_schedule, want_workers=False)
-from selcore import Map, analyze  # noqa: E402
+from selcore import Map, analyze, separate_source  # noqa: E402
 
 HEAVY_SECONDS = float(os.environ.get("BR_HEAVY", "1.5"))
 SECONDS_PER_COMMIT = float(os.environ.get("BR_WALL_PER_COMMIT", "4.6"))
@@ -275,6 +275,18 @@ def main():
                 log(cid, "analyze failed", repr(e))
                 answers[cid] = sorted(all_tests)
                 continue
+            fixture_reach = set()
+            fixture_edits = {}
+            if len(D.files) > 1 and (D.all or D.import_change or any(p.endswith(".sql") for p in D.files)):
+                partition = separate_source(patch_text, REPO, M)
+                if partition is not None:
+                    source, readers, edits = partition
+                    # Keep the dedicated fixture verifier for expensive readers.
+                    # Otherwise select them, and use the source-only coverage
+                    # proof for every other test. Actual runs see the full edit.
+                    if source.all or sum(ms[t] for t in readers) <= 1200:
+                        D, fixture_reach, fixture_edits = source, readers, edits
+                        D.must.update(readers)
             # Keep the complete patch for reimports. A runtime job can use the
             # same fixture and probe paths as the edit without incidental comments.
             if not D.import_change and not D.all and D.ast_unchanged:
@@ -294,12 +306,15 @@ def main():
                 import dispatch
                 guard_tests = dispatch.guard_reach(D, M, REPO)
                 if guard_tests is not None:
+                    if fixture_reach:
+                        answers[cid] = sorted(set(guard_tests) | fixture_reach)
+                        continue
                     D.all = False
                     D.import_change = True
                     D.cands = set(guard_tests)
             if D.all:
                 affected = broken_leaf_tests(D, M, nodeids)
-                answers[cid] = sorted(all_tests) if affected is None else affected
+                answers[cid] = sorted(all_tests) if affected is None else sorted(set(affected) | fixture_reach)
                 log(cid, "ALL" if affected is None else f"cold-imports={len(affected)}", " ".join(D.reasons)[:200])
                 continue
             cands = sorted(t for t in D.cands if t is not None)
@@ -401,7 +416,7 @@ def main():
                 if not D.import_change:
                     continue
             jobs.append(dict(
-                cid=cid, files=D.files, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests,
+                cid=cid, files=D.files, fixture_edits=fixture_edits, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
                 fixture_sql_only=fixture_sql_only, scale_nodes=scale_nodes,
@@ -546,24 +561,56 @@ def setting_queries(delta, changed_lines, cands, nodeids):
     import pickle
     try:
         with open(HERE / "queryattrs.pkl", "rb") as fh:
-            tracked, reads = pickle.load(fh)
+            tracked, reads, fixture_reads = pickle.load(fh)
     except OSError:
         return {}
     if not tracked.issuperset(delta):
         return {}
-    reached, _ = query_filter(changed_lines, cands, nodeids)
-    for t in list(reached):
-        table = reads.get(nodeids[t])
-        if table is None:
-            del reached[t]
-            continue
+    import runner
+    def observed(index):
         mask = 0
         for key in delta:
-            mask |= table.get(key, 0)
+            mask |= index.get(key, 0)
+        return mask
+
+    fixture_ids = [t for t in cands if nodeids[t] in fixture_reads]
+    allowed = iter_filter(fixture_ids, changed_lines, raw=True)
+    fixtures = {}
+    for t, indices in allowed.items():
+        mask = observed(fixture_reads[nodeids[t]])
+        if mask & 1:
+            continue
+        n = _itermap()[0][t][0]
+        indices.update(i for i in range(n) if mask & (2 << i))
+        if len(indices) <= ITER_MAXFRAC * n:
+            fixtures[t] = indices
+    runner.ITER_FILTER.update(fixtures)
+    iter_cpu(fixtures)
+    reached, _ = query_filter(changed_lines, cands, nodeids)
+    skippable = set(memo_skippable(changed_lines, nodeids))
+    unchanged_pipeline = opt_affected(changed_lines) == []
+    for t in list(reached):
+        phases = reads.get(nodeids[t])
+        if not isinstance(phases, tuple) or len(phases) != 4:
+            del reached[t]
+            continue
+        table, outside, later, optimizer = phases
+        mask = observed(table)
+        post = observed(outside)
+        count = _submap()[t][0]
+        in_opt = observed(optimizer)
+        if unchanged_pipeline and not (in_opt & 1):
+            runner.UNCHANGED_OPT_QUERIES[t] = {i for i in range(count) if not in_opt & (2 << i)}
+        after_parse = observed(later)
+        if t in runner.PARSE_ONLY:
+            runner.PARSE_ONLY[t] = {i for i in runner.PARSE_ONLY[t]
+                                    if not after_parse & (1 | (2 << i))}
+        if t in skippable and not (post & 1):
+            runner.MEMO_QUERIES[t] = {i for i in range(count) if not post & (2 << i)}
         if mask & 1:
             del reached[t]
             continue
-        reached[t].update(i for i in range(_submap()[t][0]) if mask & (2 << i))
+        reached[t].update(i for i in range(count) if mask & (2 << i))
     return reached
 
 
@@ -578,7 +625,7 @@ def sub_cpu(subf):
 
 OPT_PREFIX = os.environ.get("BR_OPT", str(HERE / "optmemo"))
 OPT_ON = os.environ.get("BR_OPT_ON", "1") == "1"
-OPT_PER_CALL = os.environ.get("BR_OPT_PER_CALL", "0") == "1"   # needs per-call line sets in the memo (not built)
+OPT_PER_CALL = os.environ.get("BR_OPT_PER_CALL", "1") == "1"
 _OPT_LOADED = [False]
 
 
@@ -687,10 +734,10 @@ def _itermap():
 ITER_TEST_IDS = {1082, 1083, 1084, 1085, 1086, 1087, 1088, 1089, 1090, 1091, 1092, 1093, 1094, 1095, 1096, 1097, 1098, 1099, 1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110, 1111, 1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119, 1120, 1121, 1122, 1123, 1124, 1125, 1126, 1127, 1128, 1129, 1130, 1131, 1132, 1133, 1134, 1135, 1136, 1137, 1138, 1139, 1140, 1141, 1295, 1302, 1313, 1314, 1324, 1325, 1327, 1335, 1343, 1352, 1353, 1355, 1362, 1375, 1377, 1378, 1382, 1383, 1384, 1417, 1420, 1434, 1440, 1441, 1454, 1561, 1599, 1606, 1607}
 
 
-def iter_filter(cands, lines):
+def iter_filter(cands, lines, raw=False):
     """For fixture-driven candidates: the iterations that reach a changed line. Only
     valid when nothing but function bodies changed. Returns {test: set of iterations}."""
-    if not ITER_ON or not lines:
+    if not ITER_ON or (not lines and not raw):
         return {}
     cs = set(cands)
     if not cs.intersection(ITER_TEST_IDS):
@@ -718,6 +765,8 @@ def iter_filter(cands, lines):
                         if t in per_test:
                             per_test[t].update(ks)
     out = {}
+    if raw:
+        return per_test
     for t, allow in per_test.items():
         n = tests_meta[t][0]
         if allow and len(allow) <= ITER_MAXFRAC * n:
@@ -2210,6 +2259,9 @@ def _child(j, nodeids, ms, runner, modules):
         path.startswith(("sqlglot/optimizer/", "sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
         or path in {"sqlglot/parser.py", "sqlglot/generator.py"} for path in j["files"]
     )
+    # Expressions cross a real process boundary in TPC tests. In particular
+    # serde and expression edits can fail during transport before SQL executes.
+    runner.PICKLE_TASKS = not runner.FAST_PROJECTIONS and not j.get("fixture_sql_only")
     import optmemo
     optmemo.ON[0] = j.get("opt_aff") is not None and not j["overlay"]
     optmemo.AFFECTED[:] = j.get("opt_aff") or []

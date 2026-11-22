@@ -77,6 +77,18 @@ TOOL = 4
 mon.use_tool_id(TOOL, "bropt")
 cov = {}                       # (file, line) -> bitmask of contexts
 ctx = [None]
+# Track per-input coverage only in leaf optimizer rules. Other modules include
+# process caches, dynamic dispatch and setup code shared by unrelated calls.
+LEAVES = {
+    "sqlglot/optimizer/" + stem + ".py" for stem in (
+        "eliminate_joins", "eliminate_ctes", "eliminate_subqueries", "merge_subqueries",
+        "optimize_joins", "pushdown_predicates", "pushdown_projections", "unnest_subqueries",
+    )
+}
+line_ids = {}
+per_key = {}
+active = [None]
+
 
 
 def on_line(code, line):
@@ -88,6 +100,9 @@ def on_line(code, line):
         return None            # not inside a recorded optimize(): keep listening
     k = (fn[len(ROOT):], line)
     cov[k] = cov.get(k, 0) | (1 << c)
+    if active[0] is not None and k[0] in LEAVES:
+        index = line_ids.setdefault(k, len(line_ids))
+        active[0][c] |= 1 << index
     return mon.DISABLE
 
 
@@ -118,14 +133,14 @@ def recorder(expression, schema=None, db=None, catalog=None, dialect=None, rules
     except optmemo.Unkeyable:
         stats["unkeyable"] += 1
         return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
-    if key in keys:
-        return orig(expression, schema, db, catalog, dialect, rules, sql, copy, **kwargs)
+    repeated = key in keys
+    visits = [0] * NCTX
     stages = []
 
     def mark(i):
         def rec(expression):
             d = optmemo.digest(expression)
-            if d is not None and d not in blobs:
+            if not repeated and d is not None and d not in blobs:
                 try:
                     blobs[d] = zlib.compress(pickle.dumps(dump_tree(expression), protocol=4), 6)
                 except (Undumpable, RecursionError):
@@ -140,6 +155,7 @@ def recorder(expression, schema=None, db=None, catalog=None, dialect=None, rules
         seq += [mark(i), r]
     seq.append(mark(len(RULES)))
     depth[0] += 1
+    active[0] = visits
     switch(0)
     try:
         out = orig(expression, schema, db, catalog, dialect, tuple(seq), sql, copy, **kwargs)
@@ -148,8 +164,15 @@ def recorder(expression, schema=None, db=None, catalog=None, dialect=None, rules
         raise
     finally:
         depth[0] -= 1
+        active[0] = None
         switch(None)
     if len(stages) == NCTX and None not in stages:
+        if repeated and tuple(stages) != keys[key]:
+            per_key.pop(key, None)
+        elif not repeated:
+            per_key[key] = visits
+        elif key in per_key:
+            per_key[key] = [a | b for a, b in zip(per_key[key], visits)]
         keys[key] = tuple(stages)
         stats["recorded"] += 1
     return out
@@ -181,7 +204,12 @@ with open(sys.argv[1] + ".bin", "wb") as fh:
 lines = {}
 for (f, l), m in cov.items():
     lines.setdefault(f, {})[l] = m
+lineid = {}
+for (path, line), number in line_ids.items():
+    lineid.setdefault(path, {})[line] = number
+sets = {}
+kcov = {key: tuple(sets.setdefault(mask, len(sets)) for mask in stages) for key, stages in per_key.items()}
 with open(sys.argv[1] + ".idx", "wb") as fh:
-    pickle.dump({"keys": keys, "blobs": index, "cov": lines, "rules": [r.__name__ for r in RULES],
+    pickle.dump({"keys": keys, "blobs": index, "lineid": lineid, "ksets": tuple(sets), "kcov": kcov, "cov": lines, "rules": [r.__name__ for r in RULES],
                  "args": [inspect.getfullargspec(r).args for r in RULES]}, fh, protocol=4)
 print("keys", len(keys), "trees", len(index), "bytes", off, file=sys.stderr)

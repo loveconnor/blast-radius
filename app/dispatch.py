@@ -19,37 +19,64 @@ def trace():
 
 
 def guard_only(before, after):
-    """Accept changes only to pure tests inside the pinned dispatch builder."""
+    """Compile a pure map builder whose only writes are to its local copy.
+
+    Compare the returned dictionaries on the actual generator classes. Changes
+    to the function signature or any other code still use the whole-suite path.
+    """
     old, new = ast.parse(before), ast.parse(after)
     def builder(tree):
         return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_build_dispatch")
     orig, edited = builder(old), builder(new)
-    checks = [n for n in ast.walk(edited) if isinstance(n, ast.If)]
-    base = [n for n in ast.walk(orig) if isinstance(n, ast.If)]
-    if len(checks) != len(base):
+    body = edited.body
+    edited.body = orig.body
+    if ast.dump(old) != ast.dump(new):
         return None
-    code = compile(ast.Module(body=[edited], type_ignores=[]), "<dispatch>", "exec", dont_inherit=True,
-                   flags=__future__.annotations.compiler_flag)
-    for current, previous in zip(checks, base):
-        if ast.dump(current.test) == ast.dump(previous.test):
-            continue
-        for node in ast.walk(current.test):
-            if isinstance(node, ast.Name):
-                if node.id not in {"attr_name", "expr_cls", "expr_key", "dispatch"}:
-                    return None
-            elif isinstance(node, ast.Call):
-                if not (isinstance(node.func, ast.Attribute) and not node.keywords and len(node.args) == 1
-                        and isinstance(node.args[0], ast.Constant) and type(node.args[0].value) is str):
-                    return None
-            elif isinstance(node, ast.Attribute):
-                if not (isinstance(node.value, ast.Name) and node.value.id == "attr_name"
-                        and node.attr in ("startswith", "endswith")):
-                    return None
-            elif not isinstance(node, (ast.Load, ast.Constant, ast.Compare, ast.BoolOp, ast.UnaryOp,
-                                       ast.Not, ast.And, ast.Or, ast.In, ast.NotIn, ast.Is, ast.IsNot, ast.Eq, ast.NotEq)):
+    edited.body = body
+    # Start with a fresh dictionary and keep it local. Do not allow reads from
+    # arbitrary descriptors: only the pinned lookup through dir(cls) can fetch
+    # handlers, just as it does in the original function.
+    if not body or ast.dump(body[0]) != ast.dump(orig.body[0]):
+        return None
+    locals_ = {"expr_cls", "attr_name", "expr_key", "dispatch"}
+    for stmt in body[1:]:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and node.id not in locals_ | {"dir", "cls", "exp", "getattr"}:
                 return None
-        current.test = previous.test
-    return code if ast.dump(old) == ast.dump(new) else None
+            if isinstance(node, ast.Assign):
+                if len(node.targets) != 1:
+                    return None
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    if target.id not in ("expr_cls", "expr_key"):
+                        return None
+                elif not (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                          and target.value.id == "dispatch"):
+                    return None
+            if isinstance(node, ast.For) and not (
+                    ast.dump(node.target) == ast.dump(ast.Name("attr_name", ast.Store()))
+                    and ast.unparse(node.iter) == "dir(cls)"):
+                return None
+            if isinstance(node, ast.Return) and ast.unparse(node.value) != "dispatch":
+                return None
+            if isinstance(node, ast.Call):
+                fn = ast.unparse(node.func)
+                if fn == "getattr" and ast.unparse(node) != "getattr(cls, attr_name)":
+                    return None
+                if fn not in ("dir", "getattr", "exp.EXPR_CLASSES.get", "attr_name.startswith",
+                               "attr_name.endswith", "attr_name.lower", "attr_name.upper"):
+                    return None
+            if isinstance(node, ast.Attribute) and ast.unparse(node) not in (
+                    "exp.EXPR_CLASSES", "exp.EXPR_CLASSES.get", "attr_name.startswith",
+                    "attr_name.endswith", "attr_name.lower", "attr_name.upper"):
+                return None
+            if not isinstance(node, (ast.Assign, ast.For, ast.If, ast.Return, ast.Continue, ast.Break,
+                                     ast.Name, ast.Load, ast.Store, ast.Call, ast.Attribute, ast.Subscript,
+                                     ast.Slice, ast.Constant, ast.Compare, ast.BoolOp, ast.UnaryOp,
+                                     ast.Not, ast.USub, ast.And, ast.Or, ast.IfExp, ast.cmpop)):
+                return None
+    return compile(ast.Module(body=[edited], type_ignores=[]), "<dispatch>", "exec", dont_inherit=True,
+                   flags=__future__.annotations.compiler_flag)
 
 
 def generator_classes():

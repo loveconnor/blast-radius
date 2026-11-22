@@ -105,6 +105,35 @@ def analyze(patch_text: str, repo: Path, M: Map) -> Decision:
     return D
 
 
+def separate_source(patch_text, repo, coverage):
+    """Separate one library edit from unchanged Python syntax and SQL fixtures.
+
+    Each test outside the union of their baseline reaches sees neither edit.
+    Preserve that union when multiple files have observable changes.
+    """
+    pieces = []
+    fixtures = set()
+    data = {}
+    files = parse_patch(patch_text)
+    if len(files) < 2:
+        return None
+    for file in files:
+        part = Decision()
+        _analyze_file(file, repo, coverage, part)
+        if part.ast_unchanged and set(part.files) == part.ast_unchanged:
+            continue
+        if (not part.all and part.files and not part.import_change
+                and all(path.startswith("tests/fixtures/") and path.endswith(".sql") and content is not None
+                        for path, content in part.files.items())):
+            fixtures.update(part.cands | part.must)
+            data.update(part.files)
+        else:
+            pieces.append(part)
+    if len(pieces) == 1 and all(path.startswith("sqlglot/") for path in pieces[0].files):
+        return pieces[0], fixtures, data
+    return None
+
+
 @functools.lru_cache(maxsize=256)
 def _read(repo, rel):
     p = repo / rel

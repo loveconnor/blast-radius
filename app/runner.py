@@ -33,6 +33,9 @@ def log(*a):
 import concurrent.futures as _cf
 
 
+PICKLE_TASKS = True
+
+
 class InlineExecutor:
     """Runs submitted work synchronously, with a pickle round trip like a real pool."""
 
@@ -45,7 +48,7 @@ class InlineExecutor:
                 getattr(initializer, "__name__", None),
             ) == ("tests.test_executor", "initializer")
             self._is_exec = is_exec_init
-            if is_exec_init and MEMO_REC is None:
+            if is_exec_init and MEMO_REC is None and not PICKLE_TASKS:
                 # tests.test_executor.initializer only stores read-only schema/tables refs
                 initializer(*initargs)
             else:
@@ -83,7 +86,7 @@ class InlineExecutor:
             getattr(fn, "__module__", None),
             getattr(fn, "__name__", None),
         ) == ("tests.test_executor", "mp_execute")
-        if is_mp_exec and MEMO_REC is None:
+        if is_mp_exec and MEMO_REC is None and not PICKLE_TASKS:
             f._job = (fn, a, k)
             f._nopickle = True
             return f
@@ -136,6 +139,8 @@ FIXTURE_CALLS = None  # pool_idx or pool_results dict from the unmodified checko
 MEMO_IDS: dict = {}     # test number -> test id
 MEMO_DUCK = False       # reuse reference dataframes / duckdb results when sql is unchanged
 MEMO_SKIP: set = set()  # tests whose queries may skip execution when their plan is unchanged
+UNCHANGED_OPT_QUERIES = {}
+MEMO_QUERIES = {}       # query indices with unchanged downstream setting reads
 FAST_PROJECTIONS = False
 MEMO_STAT = [0, 0]      # queries skipped, queries re-run after a reference mismatch
 MEMO_REC = None         # build time: record instead of use
@@ -208,11 +213,19 @@ def _memo_optimize(real):
     def optimize(*a, **k):
         cur, t = _SUB["cur"], _SUB["t"]
         base = None
-        if cur is not None and MEMO_REC is None and t in MEMO_SKIP and MEMO is not None:
+        if cur is not None and MEMO_REC is None and (t in MEMO_SKIP or cur in MEMO_QUERIES.get(t, ())) and MEMO is not None:
             base = MEMO["opt"].get(MEMO_IDS.get(t), {}).get(cur)
         t0 = time.process_time()
         optmemo.WANT[0] = base is not None      # a digest is enough when it is the baseline's
         try:
+            query = (MEMO_IDS.get(t), cur)
+            previous = MEMO.get("executor_keys", {}).get(query) if MEMO is not None else None
+            if MEMO_REC is not None and cur is not None:
+                key = optmemo.executor_key(*a, **k)
+                MEMO_REC.setdefault("executor_keys", {})[query] = key
+            if (base is not None and previous is not None and cur in UNCHANGED_OPT_QUERIES.get(t, ())
+                    and optmemo.executor_key(*a, **k) == previous):
+                raise _SkipExec()
             r = real(*a, **k)
         finally:
             optmemo.WANT[0] = False
@@ -1381,7 +1394,7 @@ def prepare(job, modules):
     """Apply a commit inside this (child) process."""
     files = job["files"]
     tmp = job["tmp"]
-    for rel, content in files.items():
+    for rel, content in (files | job.get("fixture_edits", {})).items():
         if rel.endswith(".py"):
             continue
         dst = os.path.join(tmp, "fx", rel.replace("/", "__"))

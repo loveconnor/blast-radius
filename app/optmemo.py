@@ -185,10 +185,20 @@ class Base:
         self.digest = d
 
 
+def executor_key(expression, schema=None, db=None, catalog=None, dialect=None, rules=None, sql=None,
+                 copy=True, **kwargs):
+    if rules is not None or not copy:
+        return None
+    try:
+        return call_key(expression, schema, db, catalog, dialect, sql, kwargs)
+    except Unkeyable:
+        return None
+
+
 def set_changed(lines_by_file):
     """Tell the stand-in which lines the patch changed (function bodies only)."""
     _RUN_SAME.clear()
-    if IDX is None or not IDX.get("lineid") or lines_by_file is None:
+    if IDX is None or not IDX.get("lineid") or not lines_by_file or not set(lines_by_file) <= IDX["lineid"].keys():
         CH_MASK[0] = None
         _CACHE_OK[0] = False
         return

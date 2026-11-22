@@ -233,6 +233,7 @@ base_sqls = {
 }
 meta = {
     "parsed": rec.get("parsed", {}),
+    "executor_keys": rec.get("executor_keys", {}),
     "dsql": rec["dsql"],
     "opt": rec["opt"],
     "rlines": rec["rlines"],

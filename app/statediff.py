@@ -265,6 +265,8 @@ def diff_state(old_mods: dict, new_mods: dict, only=None):
                     if x.__qualname__ != y.__qualname__:
                         changes.add(("cls", f"{name}:{q}", k, None))
                     continue
+                if type(x) is type(y) and type(x) in (staticmethod, classmethod):
+                    x, y = x.__func__, y.__func__
                 if isinstance(x, types.FunctionType) and isinstance(y, types.FunctionType):
                     # body changes are line-covered; defaults/closures are import-time data
                     if not cmp.same(x, y):
