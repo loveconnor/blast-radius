@@ -83,10 +83,16 @@ LEAVES = {
     "sqlglot/optimizer/" + stem + ".py" for stem in (
         "eliminate_joins", "eliminate_ctes", "eliminate_subqueries", "merge_subqueries",
         "optimize_joins", "pushdown_predicates", "pushdown_projections", "unnest_subqueries",
+        "qualify_columns", "simplify", "annotate_types",
     )
 }
 line_ids = {}
 per_key = {}
+ambiguous = set()
+reference = None
+if len(sys.argv) > 2:
+    with open(sys.argv[2] + ".idx", "rb") as fh:
+        reference = pickle.load(fh)
 active = [None]
 
 
@@ -141,7 +147,7 @@ def recorder(expression, schema=None, db=None, catalog=None, dialect=None, rules
     def mark(i):
         def rec(expression):
             d = optmemo.digest(expression)
-            if not repeated and d is not None and d not in blobs:
+            if d is not None and d not in blobs and reference is None:
                 try:
                     blobs[d] = zlib.compress(pickle.dumps(dump_tree(expression), protocol=4), 6)
                 except (Undumpable, RecursionError):
@@ -169,6 +175,7 @@ def recorder(expression, schema=None, db=None, catalog=None, dialect=None, rules
         switch(None)
     if len(stages) == NCTX and None not in stages:
         if repeated and tuple(stages) != keys[key]:
+            ambiguous.add(key)
             per_key.pop(key, None)
         elif not repeated:
             per_key[key] = visits
@@ -186,6 +193,15 @@ for name in ("tests.test_optimizer", "tests.test_executor", "tests.test_lineage"
         suite.addTests(unittest.defaultTestLoader.loadTestsFromName(name))
     except Exception as e:  # noqa
         print("cannot load", name, repr(e), file=sys.stderr)
+if reference is not None:
+    # Reverse method order as well as changing the interpreter hash seed.
+    def leaves(group):
+        for test in group:
+            if isinstance(test, unittest.TestSuite):
+                yield from leaves(test)
+            else:
+                yield test
+    suite = unittest.TestSuite(reversed(list(leaves(suite))))
 res = unittest.TestResult()
 suite.run(res)
 mon.set_events(TOOL, 0)
@@ -193,15 +209,48 @@ print("tests", res.testsRun, "failures", len(res.failures), "errors", len(res.er
 if res.failures or res.errors:
     for _, tb in (res.failures + res.errors)[:3]:
         print(tb[-600:], file=sys.stderr)
+    raise RuntimeError("baseline optimizer suite failed")
 
-used = {d for st in keys.values() for d in st}
-index, off = {}, 0
-with open(sys.argv[1] + ".bin", "wb") as fh:
-    for d in sorted(used):
-        b = blobs[d]
-        fh.write(b)
-        index[d] = (off, len(b))
-        off += len(b)
+for key in ambiguous:
+    keys.pop(key, None)
+    per_key.pop(key, None)
+if reference is None:
+    used = {d for st in keys.values() for d in st}
+    index, off = {}, 0
+    with open(sys.argv[1] + ".bin", "wb") as fh:
+        for d in sorted(used):
+            b = blobs[d]
+            fh.write(b)
+            index[d] = (off, len(b))
+            off += len(b)
+else:
+    # The binary only stores snapshots from the first run. Keys must have
+    # reproduced every stage in both runs before an original snapshot is used.
+    keys = {key: steps for key, steps in keys.items() if steps == reference["keys"].get(key)}
+    index = reference["blobs"]
+    prior_lines = {i: (path, line) for path, table in reference["lineid"].items() for line, i in table.items()}
+    def remap(mask):
+        result = 0
+        while mask:
+            bit = mask & -mask
+            old = bit.bit_length() - 1
+            new = line_ids.setdefault(prior_lines[old], len(line_ids))
+            result |= 1 << new
+            mask ^= bit
+        return result
+    previous_masks = [remap(mask) for mask in reference["ksets"]]
+    cold = 0
+    merged = {}
+    for key in keys.keys() & per_key.keys() & reference["kcov"].keys():
+        stages = per_key[key]
+        earlier = [previous_masks[i] for i in reference["kcov"][key]]
+        for before, after in zip(earlier, stages):
+            cold |= before ^ after
+        merged[key] = [before | after for before, after in zip(earlier, stages)]
+    per_key = merged
+    for path, table in reference["cov"].items():
+        for line, mask in table.items():
+            cov[path, line] = cov.get((path, line), 0) | mask
 lines = {}
 for (f, l), m in cov.items():
     lines.setdefault(f, {})[l] = m
@@ -211,6 +260,6 @@ for (path, line), number in line_ids.items():
 sets = {}
 kcov = {key: tuple(sets.setdefault(mask, len(sets)) for mask in stages) for key, stages in per_key.items()}
 with open(sys.argv[1] + ".idx", "wb") as fh:
-    pickle.dump({"keys": keys, "blobs": index, "lineid": lineid, "ksets": tuple(sets), "kcov": kcov, "cov": lines, "rules": [r.__name__ for r in RULES],
+    pickle.dump({"keys": keys, "blobs": index, "cold": cold if reference is not None else 0, "lineid": lineid, "ksets": tuple(sets), "kcov": kcov, "cov": lines, "rules": [r.__name__ for r in RULES],
                  "args": [inspect.getfullargspec(r).args for r in RULES]}, fh, protocol=4)
-print("keys", len(keys), "trees", len(index), "bytes", off, file=sys.stderr)
+print("keys", len(keys), "trees", len(index), "per-input traces", len(kcov), file=sys.stderr)

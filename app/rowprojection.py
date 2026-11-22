@@ -71,6 +71,7 @@ def project_rows(context, stream, columns, iterator_type):
 
 @contextmanager
 def enabled():
+    from equalityjoin import indexed
     from sqlglot.executor.context import Context
     from sqlglot.executor.python import PythonExecutor
 
@@ -112,12 +113,15 @@ def enabled():
             sink.rows = rows
         return sink
 
+    nested = PythonExecutor.nested_loop_join
+    PythonExecutor.nested_loop_join = indexed(nested)
     PythonExecutor._project_and_filter = project_and_filter
     PythonExecutor.generate_tuple = generate_tuple
     Context.eval_tuple = eval_tuple
     try:
         yield
     finally:
+        PythonExecutor.nested_loop_join = nested
         PythonExecutor._project_and_filter = project
         Context.eval_tuple = evaluate
         PythonExecutor.generate_tuple = generate

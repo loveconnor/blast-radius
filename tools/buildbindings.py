@@ -1,4 +1,4 @@
-"""Index class-field reads that share a name with a SQLGlot module dictionary.
+"""Index dialect and standard-library reads that share a name with a module binding.
 
 Run in the entry image with this tools directory mounted. Pass an output path
 and, optionally, the previous hash-seed run to intersect the two observations.
@@ -26,17 +26,30 @@ classes = set(Dialect.classes.values()) | {Dialect}
 dicts = {k for c in classes for k, v in vars(c).items() if k.isupper() and type(v) is dict}
 names = {k for mod, obj in tuple(sys.modules.items()) if mod.startswith("sqlglot.")
          for k, v in vars(obj).items() if k in dicts and type(v) is dict}
+paths = sorted((root / "sqlglot").rglob("*.py"))
+external_names = set()
+for path in paths:
+    for node in ast.walk(ast.parse(path.read_bytes())):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in sys.stdlib_module_names:
+            external_names.update(alias.asname or alias.name for alias in node.names)
+
 sites = {}
 participants = set()
 index = []
-for path in sorted((root / "sqlglot").rglob("*.py")):
+for path in paths:
     src = path.read_text()
     rel = str(path.relative_to(root))
     lines = src.splitlines()
-    for expr in ast.walk(ast.parse(src)):
+    tree = ast.parse(src)
+    imports = {alias.asname or alias.name: alias.name for stmt in tree.body
+               if isinstance(stmt, ast.Import) for alias in stmt.names if alias.name in sys.stdlib_module_names}
+    for expr in ast.walk(tree):
         if (not isinstance(expr, ast.Attribute) or not isinstance(expr.ctx, ast.Load)
-                or expr.attr not in names or not isinstance(expr.value, ast.Name)
+                or not isinstance(expr.value, ast.Name)
                 or expr.lineno != expr.end_lineno):
+            continue
+        stdlib = imports.get(expr.value.id) if expr.attr in external_names else None
+        if not stdlib and expr.attr not in names:
             continue
         if re.findall(r"\b" + expr.attr + r"\b", lines[expr.lineno - 1]) != [expr.attr]:
             continue
@@ -44,7 +57,7 @@ for path in sorted((root / "sqlglot").rglob("*.py")):
         if not covered:
             continue
         participants.update(covered)
-        sites.setdefault(rel, {})[f"{expr.lineno}|{expr.attr}"] = len(index)
+        sites.setdefault(rel, {})[f"{expr.lineno}|{expr.attr}"] = [len(index), stdlib]
         index.append((rel, expr.lineno, expr.attr))
 
 plugin = """

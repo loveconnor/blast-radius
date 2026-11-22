@@ -169,6 +169,11 @@ def broken_leaf_tests(decision, coverage, nodeids):
         return None
     if content is not None and f"syntax-error {path}" not in decision.reasons:
         return None
+    return cold_module_tests(path, coverage, nodeids)
+
+
+def cold_module_tests(path, coverage, nodeids):
+    """Tests that imported a module, inspected its source, or started another interpreter."""
     imports = load_imports()
     module = _modname(path)
     if not imports or module not in imports["by_mod"]:
@@ -1777,6 +1782,26 @@ def _diff_scope(old_mods, new_mods, seeds, files=None):
     return scope | reached
 
 
+def _stdlib_binding(old_modules, new_modules, owner, name):
+    """An import alias appeared or disappeared, with a canonical stdlib object."""
+    import types
+    if owner not in old_modules or owner not in new_modules:
+        return False
+    old = vars(old_modules[owner])
+    new = vars(new_modules[owner])
+    if (name in old) == (name in new):
+        return False
+    value = old[name] if name in old else new[name]
+    if type(value) not in (type, types.BuiltinFunctionType, types.FunctionType):
+        return False
+    module = value.__module__
+    actual = value.__name__
+    if not isinstance(module, str) or module.partition(".")[0] not in sys.stdlib_module_names:
+        return False
+    source = sys.modules.get(module)
+    return source is not None and vars(source).get(actual) is value
+
+
 def _body_line_changes(job, delta, old_modules, new_modules):
     """Limit a reimported method to its edited lines when only its own body changed."""
     if not job.get("runtime_lines_only") or not delta:
@@ -1866,6 +1891,8 @@ def overlay_candidates(j, old_mods, nodeids):
     cls_readers = set()
     cls_ok = True
     n_glob = 0
+    alias_readers = set(untraced)
+    only_aliases = True
     seen_enums = set()
     for kind, owner, attr, key in delta:
         if kind == "cls":
@@ -1938,6 +1965,19 @@ def overlay_candidates(j, old_mods, nodeids):
                 unknown.append((kind, owner, attr))
         else:
             refs = _global_refs(attr, nodeids) if (kind == "mod" and GLOBAL_REFS) else None
+            if refs is None and kind == "mod" and owner in seeds and owner in old_mods and owner in new_mods:
+                # Shared test helpers can mention an alias without ever importing
+                # its owner. Bound the change using cold, per-test imports. Keep
+                # those readers outside replay since helpers may inspect modules.
+                if (attr in vars(old_mods[owner])) != (attr in vars(new_mods[owner])):
+                    file = next(f for f in j["files"] if _modname(f) == owner)
+                    readers = cold_module_tests(file, M, nodeids)
+                    if readers is not None:
+                        cands.update(readers)
+                        outside.update(readers)
+                        cls_readers.update(readers)
+                        only_aliases = False
+                        continue
             if refs is None:
                 unknown.append((kind, owner, attr))
             else:
@@ -1945,12 +1985,20 @@ def overlay_candidates(j, old_mods, nodeids):
                 # name. Only discard a module read when the upstream test
                 # actually resolved that lookup through a builtin dialect.
                 instance_reads = {}
-                if key is not None and type(vars(old_mods[owner]).get(attr)) is dict and type(vars(new_mods[owner]).get(attr)) is dict:
+                if owner.startswith("sqlglot"):
                     import sourcerefs
-                    tests, sites = sourcerefs.dialect_readers()
+                    tests, sites = sourcerefs.qualified_readers()
                     if tests == nodeids:
                         instance_reads = sites.get(attr, {})
+                alias_change = (owner in old_mods and owner in new_mods
+                                and ((attr in vars(old_mods[owner])) != (attr in vars(new_mods[owner]))))
+                bare = sourcerefs.global_loads(attr) if owner.startswith("sqlglot") and alias_change else {}
                 for f, ls in refs[0].items():
+                    # LOAD_GLOBAL resolves against this file's own namespace.
+                    # An independent global on that line cannot see an alias
+                    # appearing or disappearing in another module.
+                    if f in bare and _modname(f) != owner:
+                        ls = ls - bare[f]
                     for line in ls:
                         readers = M.covering(f, line, line)
                         traced = instance_reads.get((f, line))
@@ -1964,6 +2012,9 @@ def overlay_candidates(j, old_mods, nodeids):
                 outside |= refs[1]
                 cls_readers |= refs[1]
                 n_glob += 1
+                alias_readers.update(refs[1])
+                if key is not None or not _stdlib_binding(old_mods, new_mods, owner, attr):
+                    only_aliases = False
     note = fail_note + f"delta={len(delta)} {[d[1].split(':')[-1] + '.' + str(d[2]) for d in delta][:3]} scope={0 if scope is None else len(scope)}"
     if n_glob:
         note += f" globals={n_glob}"
@@ -2062,7 +2113,9 @@ def overlay_candidates(j, old_mods, nodeids):
             note += f" schema-attributes={len(schema)}"
         else:
             schema.clear()
-    return {"cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "schema": schema, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+    alias_rows = (n_glob and only_aliases and not unknown and not forced
+                  and all(d[0] in ("mod", "methcode", "meth") for d in delta))
+    return {"alias_readers": alias_readers if alias_rows else None, "cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "schema": schema, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
             "scalar_only": bool(setting_delta) and all(d[0] in ("cls", "methcode") for d in delta),
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
@@ -2698,6 +2751,19 @@ def _child(j, nodeids, ms, runner, modules):
             runner.ITER_FILTER.update(itf)
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
+        if res.get("alias_readers") is not None and ov_lines is not None:
+            # Keep tests that inspected the name directly on their original
+            # verification path. Inside a pinned query, code must reach the
+            # changed method or read the changed binding to observe this edit.
+            query_readers = set(cands) - res["alias_readers"]
+            plan_scope_check(runner, query_readers, nodeids, ov_lines)
+            subf = submit_filter(ov_lines, query_readers, nodeids)
+            runner.SUBMIT_FILTER.update(subf)
+            j["subf"].update(subf)
+            CPU_OVR.update(sub_cpu(subf))
+            itf = iter_filter(query_readers, ov_lines)
+            runner.ITER_FILTER.update(itf)
+            iter_cpu(itf)
         query_settings = res.get("settings") or res.get("schema")
         if query_settings and ov_lines is not None:
             plan_fixture_workers(cands, ov_lines, query_settings)

@@ -237,7 +237,7 @@ def diff_state(old_mods: dict, new_mods: dict, only=None):
                     continue  # lazily resolved module attribute
                 v = og.get(k, ng.get(k))
                 # lazily populated package attributes (module __getattr__ caches)
-                if isinstance(v, (type, types.ModuleType, types.FunctionType)) and \
+                if "__path__" in og and isinstance(v, (type, types.ModuleType, types.FunctionType)) and \
                         getattr(v, "__module__", getattr(v, "__name__", "")).startswith("sqlglot"):
                     continue
                 changes.add(("mod", name, k, None))

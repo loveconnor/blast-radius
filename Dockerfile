@@ -20,7 +20,9 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R 
 
 # baseline memo of the optimizer pipeline (its own layer: it only depends on these files)
 COPY app/lineevents.py app/canon.py app/optmemo.py app/buildopt.py /app/
-RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildopt.py /app/optmemo \
+RUN PYTHONHASHSEED=59 PYTHONDONTWRITEBYTECODE=1 python /app/buildopt.py /app/optmemo \
+    && PYTHONHASHSEED=157 PYTHONDONTWRITEBYTECODE=1 python /app/buildopt.py /tmp/opt-verified /app/optmemo \
+    && mv /tmp/opt-verified.idx /app/optmemo.idx \
     || (rm -f /app/optmemo.idx /app/optmemo.bin; echo "optimizer memo build failed: running without it")
 COPY app /app
 # baseline memo for the TPC executor tests, computed from the pinned checkout

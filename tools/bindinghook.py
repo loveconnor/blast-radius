@@ -1,4 +1,4 @@
-"""Observe dialect attribute receivers in an upstream pytest process and its workers."""
+"""Observe dialect and standard-library attribute receivers in an upstream pytest process and its workers."""
 import dis
 import json
 import mmap
@@ -32,8 +32,8 @@ def install(directory, repo):
                     if ins.opname == "LOAD_ATTR":
                         site = f"{ins.positions.lineno}|{ins.argval}"
                         if (site in wanted and previous is not None and
-                                previous.opname in ("LOAD_FAST", "LOAD_FAST_CHECK")):
-                            targets[ins.offset] = wanted[site], previous.argval, ins.argval
+                                previous.opname in ("LOAD_FAST", "LOAD_FAST_CHECK", "LOAD_GLOBAL")):
+                            targets[ins.offset] = (*wanted[site], previous.argval, ins.argval, previous.opname)
                     previous = ins
                 if targets:
                     offsets[code] = targets
@@ -44,21 +44,24 @@ def install(directory, repo):
         target = offsets[code].get(offset)
         if target is None:
             return mon.DISABLE
-        site, local, attr = target
-        obj = sys._getframe(1).f_locals.get(local)
+        site, stdlib, local, attr, opname = target
+        frame = sys._getframe(1)
+        obj = (frame.f_globals if opname == "LOAD_GLOBAL" else frame.f_locals).get(local)
         cls = type(obj)
         dialect_module = sys.modules.get("sqlglot.dialects.dialect")
         base = vars(dialect_module).get("Dialect") if dialect_module else None
         module = sys.modules.get(cls.__module__)
         valid = (base and issubclass(cls, base) and cls.__module__.startswith("sqlglot.dialects.")
                  and module and vars(module).get(cls.__name__) is cls and attr not in vars(obj))
+        if stdlib is not None:
+            valid = obj is not None and obj is sys.modules.get(stdlib)
         test = int.from_bytes(current[:], "little", signed=True)
         tag = f"{'seen' if valid else 'unsafe'}-{site}-{test}"
         if tag not in touched:
             mark(tag)
             touched.add(tag)
 
-    mon.use_tool_id(4, "dialect-attribute-receivers")
+    mon.use_tool_id(4, "attribute-receivers")
     mon.register_callback(4, mon.events.PY_START, start)
     mon.register_callback(4, mon.events.INSTRUCTION, instruction)
     mon.set_events(4, mon.events.PY_START)
