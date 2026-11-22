@@ -183,12 +183,19 @@ def cold_module_tests(path, coverage, nodeids):
     return sorted(selected | source_observers(path, coverage))
 
 
+@lru_cache(maxsize=64)
 def source_observers(path, coverage):
     selected = set()
     # Reads and directory enumeration can observe a deletion without importing it.
     for opened, tests in coverage.opened.items():
         if path == opened or (opened.endswith("/") and path.startswith(opened)):
             selected.update(tests)
+    return frozenset(selected) | process_observers(coverage)
+
+
+@lru_cache(maxsize=2)
+def process_observers(coverage):
+    selected = set()
     for file in ("tests/test_typing.py", "tests/test_sqlglotc.py", "tests/test_build.py",
                  "tests/test_dialect_entry_points.py", "tests/test_dialect_imports.py"):
         selected.update(coverage.tests_in_file(file))
@@ -199,7 +206,7 @@ def source_observers(path, coverage):
             for number, line in enumerate((REPO / file).read_text().splitlines(), 1):
                 if "subprocess" in line and number in line_map:
                     selected.update(coverage.sets[line_map[number]])
-    return selected
+    return frozenset(selected)
 
 
 def calibrate_cpu():
@@ -320,6 +327,23 @@ def main():
                     and len(D.files) == 1 and "comment=" in patch_text):
                 import generatorsites
                 D.cands.difference_update(generatorsites.cleared(D.files, REPO, M) - D.must)
+            comparison_same = set()
+            if (len(D.files) == 1 and D.rt_lines and D.rt_lines == D.ch_lines and not D.all and not fixture_edits
+                    and not fixture_only_tests and not mixed_source_tests and not fixture_reach):
+                path, after = next(iter(D.files.items()))
+                if path.startswith("sqlglot/") and path in D.parsed:
+                    import branchreach
+                    import comparisonreads
+                    import guardreads
+                    before = (REPO / path).read_text()
+                    row = comparisonreads.changed_row(before, after)
+                    if row:
+                        for module in (comparisonreads, guardreads, branchreach):
+                            comparison_same.update(module.unchanged(path, before, D.parsed[path], nodeids, row))
+                    if comparison_same:
+                        comparison_same.difference_update(source_observers(path, M) | D.must)
+                        if not D.import_change:
+                            D.cands.difference_update(comparison_same)
             if D.must:
                 must[cid] = set(D.must)
             if not D.all and not fixture_edits and D.parsed and all(r.endswith(".py") for r in D.files):
@@ -453,7 +477,7 @@ def main():
                 if not D.import_change:
                     continue
             jobs.append(dict(
-                cid=cid, files=D.files, fixture_edits=fixture_edits, overlay_readers=overlay_readers, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
+                cid=cid, files=D.files, fixture_edits=fixture_edits, overlay_readers=overlay_readers, comparison_same=comparison_same, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
                 runtime_lines_only=bool(D.rt_lines) and D.ch_lines == D.rt_lines,
@@ -2834,6 +2858,8 @@ def _child(j, nodeids, ms, runner, modules):
         FORCED.update(forced)
         fixture_readers = j["overlay_readers"] - forced
         source_readers = set(res["cands"])
+        if res.get("pure") and not forced and not res.get("unknown"):
+            source_readers.difference_update(j.get("comparison_same", ()))
         fixture_only = fixture_readers - source_readers
         cands = sorted(source_readers - forced - fixture_readers)
         j["unknown"] = res.get("unknown", False)
