@@ -22,6 +22,21 @@ def formula(node, atoms):
     if isinstance(node, ast.BoolOp):
         args = tuple(formula(v, atoms) for v in node.values)
         return None if None in args else ("and" if isinstance(node.op, ast.And) else "or", *args)
+    if isinstance(node, ast.Call):
+        if (isinstance(node.func, ast.Name) and node.func.id == "isinstance" and len(node.args) == 2
+                and not node.keywords and isinstance(node.args[0], ast.Name)):
+            klass = node.args[1]
+            if isinstance(klass, ast.Attribute) and isinstance(klass.value, ast.Name) and klass.value.id == "exp":
+                return atom(("instance", node.args[0].id, klass.attr))
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "_match"
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
+                and len(node.args) == 1 and len(node.keywords) == 1
+                and node.keywords[0].arg == "advance" and isinstance(node.keywords[0].value, ast.Constant)
+                and node.keywords[0].value.value is False):
+            token = node.args[0]
+            if isinstance(token, ast.Attribute) and isinstance(token.value, ast.Name) and token.value.id == "TokenType":
+                return atom(("peek", "self", token.attr))
+        return None
     if not isinstance(node, ast.Compare) or len(node.ops) != 1 or not isinstance(node.left, ast.Name):
         return None
     op = node.ops[0]

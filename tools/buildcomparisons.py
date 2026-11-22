@@ -1,7 +1,7 @@
 """Trace literal comparisons, simple guards and short-circuit operands on the pinned checkout.
 
 Run in the selector image with /app on PYTHONPATH. The cold and warm passes use
-different hash seeds. Use cold/warm, guard-cold/guard-warm, or reach-cold/reach-warm,
+different hash seeds. Use cold/warm, guard-cold/guard-warm, reach-cold/reach-warm, or index-cold/index-warm,
 then merge the two matching traces with: merge COLD WARM OUTPUT.
 """
 import ast
@@ -19,6 +19,7 @@ import pickle
 import shutil
 import sys
 import tempfile
+import types
 
 LIMIT = 16
 UNKNOWN = ("unknown",)
@@ -26,6 +27,9 @@ values = {}
 external = False
 active = True
 guard_sites = {}
+index_sites = {}
+parser_match = None
+importing = True
 
 
 @functools.lru_cache(maxsize=2048)
@@ -92,15 +96,72 @@ def field(local, name):
     return value
 
 
+@functools.lru_cache(maxsize=1024)
+def ordinary_instance(cls):
+    return (type(cls) is type and cls.__getattribute__ is object.__getattribute__
+            and inspect.getattr_static(cls, "__class__") is vars(object)["__class__"])
+
+
+def guard_call(spec, frame):
+    global parser_match
+    kind, name, attr = spec
+    value = frame.f_locals[name]
+    if kind == "instance":
+        module = frame.f_globals.get("exp")
+        if (module is not sys.modules.get("sqlglot.expressions") or not isinstance(module, types.ModuleType)
+                or frame.f_globals.get("isinstance", builtins.isinstance) is not builtins.isinstance):
+            raise ValueError
+        target = vars(module).get(attr)
+        if type(target) is not type or not ordinary_instance(type(value)):
+            raise ValueError
+        return target in type(value).__mro__
+    if parser_match is None and importing:
+        parser_match = save_parser_match()
+    if parser_match is None or type(value).__getattribute__ is not object.__getattribute__:
+        raise ValueError
+    fn, code, parser, token, token_type = parser_match
+    if (inspect.getattr_static(value, "_match") is not fn or fn.__code__ is not code
+            or frame.f_globals.get("TokenType") is not token_type or token_type.__eq__ is not int.__eq__
+            or inspect.getattr_static(value, "_curr") is not vars(parser)["_curr"]):
+        raise ValueError
+    curr = object.__getattribute__(value, "_curr")
+    if type(curr) is not token or type(vars(token).get("token_type")) is not types.MemberDescriptorType:
+        raise ValueError
+    actual = object.__getattribute__(curr, "token_type")
+    expected = vars(token_type).get(attr)
+    if type(actual) is not token_type or type(expected) is not token_type or actual is expected:
+        # On matching input _match also calls _add_comments. Leave that
+        # execution to verification instead of assuming the method is pure.
+        raise ValueError
+    return False
+
+
+def save_parser_match():
+    mod = sys.modules.get("sqlglot.parser")
+    if mod is None:
+        return None
+    parser = vars(mod).get("Parser")
+    if parser is None:
+        return None
+    fn = vars(parser).get("_match")
+    if (type(fn) is not types.FunctionType or fn.__qualname__ != "Parser._match"
+            or fn.__code__.co_filename != mod.__file__):
+        return None
+    return fn, fn.__code__, parser, vars(mod)["Token"], vars(mod)["TokenType"]
+
+
 def observe_guard(site):
     if not active or values.get(site) == {UNKNOWN}:
         return False
-    local = sys._getframe(1).f_locals
+    frame = sys._getframe(1)
+    local = frame.f_locals
     mask = 0
     try:
         for i, spec in enumerate(guard_sites[site]):
             kind, name, *tail = spec
-            if kind == "field":
+            if kind in ("instance", "peek"):
+                truth = guard_call(spec, frame)
+            elif kind == "field":
                 truth = safe_truth(field(local, name))
             else:
                 value = local[name]
@@ -124,6 +185,19 @@ def observe_guard(site):
     return False
 
 
+def observe_index(site, sequence):
+    from indexreads import INDICES
+    index = index_sites[site]
+    mask = 0
+    if type(sequence) in (list, tuple) and -len(sequence) <= index < len(sequence):
+        value = sequence[index]
+        for i, alternate in enumerate(INDICES):
+            if -len(sequence) <= alternate < len(sequence) and sequence[alternate] is value:
+                mask |= 1 << i
+    values.setdefault(site, set()).add(mask)
+    return sequence
+
+
 def mark_branch(site):
     values[site] = (True,)
     return False
@@ -138,6 +212,8 @@ def audit(event, args):
 def instrument(repo, dst, kind):
     from guardreads import formula
     from branchreach import parts
+    if kind == "index":
+        from indexreads import INDICES, literal
     files = {}
     locations = {}
     source_lines = set()
@@ -169,7 +245,16 @@ def instrument(repo, dst, kind):
                     if label != "parent":
                         source_lines.update((rel, i) for i in range(expr.lineno, expr.end_lineno + 1))
                 continue
-            if kind == "guard":
+            if kind == "index":
+                if not (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+                        and literal(node.slice) in INDICES):
+                    continue
+                site = len(locations)
+                index_sites[site] = literal(node.slice)
+                locations[(rel, node.lineno, node.col_offset)] = site
+                left = node.value
+                prefix = f"_br_observe_index({site}, (".encode()
+            elif kind == "guard":
                 if not isinstance(node, (ast.If, ast.IfExp, ast.While)):
                     continue
                 left = node.test
@@ -210,12 +295,17 @@ def instrument(repo, dst, kind):
 
 
 def run(t):
-    global values, external
+    global values, external, parser_match, importing
     values, external = {}, False
     if mode == "cold":
         runner.zygote_import({runner.module_name_for(tests[t]["file"])})
+    imports = {}
+    if kind == "guard":
+        parser_match = save_parser_match()
+        imports, values = values, {}
+    importing = False
     failed = runner.run_tests([t], ids, timeouts=[300.0])
-    return t, values, bool(failed or external)
+    return t, values, imports, bool(failed or external)
 
 
 def save(path, data):
@@ -232,14 +322,23 @@ if __name__ == "__main__" and sys.argv[1] == "merge":
         assert result[key] == other[key]
     from functools import reduce
     from operator import or_
-    result["both"] = {s: reduce(or_, rows.values(), 0) & reduce(or_, other["reads"].get(s, {}).values(), 0)
-                      for s, rows in result["reads"].items()}
-    # Only clear a test when both hash seeds and import orders reported the
-    # same set of values. A warm cache can make an operand appear less varied.
-    for site, reads in result["reads"].items():
-        alt = other["reads"].get(site, {})
-        for value in reads.keys() | alt.keys():
-            result["both"][site] &= ~(reads.get(value, 0) ^ alt.get(value, 0))
+    def stable_masks(first, second):
+        both = {site: reduce(or_, rows.values(), 0) & reduce(or_, second.get(site, {}).values(), 0)
+                for site, rows in first.items()}
+        for site, rows in first.items():
+            alt = second.get(site, {})
+            for value in rows.keys() | alt.keys():
+                both[site] &= ~(rows.get(value, 0) ^ alt.get(value, 0))
+        return both
+
+    result["both"] = stable_masks(result["reads"], other["reads"])
+    if "body_reads" in result and "body_reads" in other:
+        # A warm interpreter runs all module initializers together. Their
+        # extra observations need not make a repeated test body unstable.
+        # Keep every import observation in the outcome checks below.
+        stable = stable_masks(result.pop("body_reads"), other.pop("body_reads"))
+        for site, bits in stable.items():
+            result["both"][site] = result["both"].get(site, 0) | bits
     result["unknown"] |= other["unknown"]
     for site, reads in other["reads"].items():
         dest = result["reads"].setdefault(site, {})
@@ -268,9 +367,10 @@ elif __name__ == "__main__":
         import runner
         builtins._br_observe_operand = observe
         builtins._br_observe_guard = observe_guard
+        builtins._br_observe_index = observe_index
         builtins._br_mark_branch = mark_branch
         sys.addaudithook(audit)
-        reads = {}
+        reads, body_reads = {}, {}
         unknown = 0
         if mode == "warm":
             runner.zygote_import({runner.module_name_for(r["file"]) for r in tests})
@@ -280,13 +380,21 @@ elif __name__ == "__main__":
         # The source tree and maps are immutable. Each fork starts with fresh
         # test state and includes setup, teardown, and inline pool work.
         with multiprocessing.get_context("fork").Pool(4, maxtasksperchild=1) as pool:
-            for t, observed, failed in pool.imap_unordered(run, range(len(ids))):
+            for t, observed, imports, failed in pool.imap_unordered(run, range(len(ids))):
                 if failed:
                     unknown |= 1 << t
-                for site, seen in observed.items():
-                    readers = reads.setdefault(site, {})
-                    for v in seen:
-                        readers[v] = readers.get(v, 0) | (1 << t)
-        assert len(reads) > (100 if kind == "guard" else 500) and unknown.bit_count() < len(ids) // 8, (len(reads), unknown.bit_count())
+                sources = [(observed, reads)]
+                if kind == "guard":
+                    sources.extend(((imports, reads), (observed, body_reads)))
+                for observations, output_reads in sources:
+                    for site, seen in observations.items():
+                        readers = output_reads.setdefault(site, {})
+                        for v in seen:
+                            readers[v] = readers.get(v, 0) | (1 << t)
+        assert sites and len(reads) * 2 >= len(sites), (len(reads), len(sites))
+        assert unknown.bit_count() < len(ids) // 8, unknown.bit_count()
         print(mode, len(sites), "sites", len(reads), "executed", unknown.bit_count(), "unknown tests")
-        save(output, {"ids": ids, "sites": sites, "files": files, "reads": reads, "lines": lines, "unknown": unknown})
+        record = {"ids": ids, "sites": sites, "files": files, "reads": reads, "lines": lines, "unknown": unknown}
+        if kind == "guard":
+            record["body_reads"] = body_reads
+        save(output, record)

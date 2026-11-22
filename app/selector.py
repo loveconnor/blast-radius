@@ -209,6 +209,58 @@ def process_observers(coverage):
     return frozenset(selected)
 
 
+_SIZE_WORDS = re.compile(r"\d|limit|count|len\s*\(|max_|recurs|depth|width|size", re.I)
+
+
+def stress_limit_edit(patch):
+    """Large-input branches must run the original node-limit test or keep it selected."""
+    for line in patch.splitlines():
+        if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+            continue
+        code = line[1:].strip()
+        if code.startswith("#"):
+            continue
+        if re.search(r"max_nodes|_node_count|Maximum number of AST nodes", code):
+            return True
+        if re.search(r"(?:[<>]=?|==|!=)|\b(?:min|max|range)\(", code):
+            if re.search(r"\b(?:[1-9][\d_]{2,}|0[xX][0-9a-fA-F_]{3,})\b", code):
+                return True
+            if re.search(r"(?:len\s*\(|(?:^|[._])(?:count|index|offset|position|width|depth|size|limit)\b)", code):
+                return True
+    return False
+
+
+def scalable_node_edit(patch, files, repo):
+    """Screen size-sensitive source changes before using the scaled stress test."""
+    flagged = {line[1:] for line in patch.splitlines()
+               if line.startswith(("+", "-")) and not line.startswith(("+++", "---")) and _SIZE_WORDS.search(line[1:])}
+    if not flagged:
+        return True
+    if any(not line.lstrip().startswith("#") for line in flagged):
+        return False
+    # A leading # may belong to a multiline string. Count it as a comment
+    # only when Python's tokenizer classifies the whole physical line as one.
+    import io
+    import tokenize
+    seen = set()
+    for path, after in files.items():
+        if not after or not (repo / path).is_file():
+            return False
+        for source in ((repo / path).read_text(), after):
+            rows = {i: line for i, line in enumerate(source.splitlines(), 1) if line in flagged}
+            if not rows:
+                continue
+            try:
+                comments = {tok.start[0] for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+                            if tok.type == tokenize.COMMENT}
+            except (IndentationError, tokenize.TokenError):
+                return False
+            if not rows.keys() <= comments:
+                return False
+            seen.update(rows.values())
+    return seen == flagged
+
+
 def calibrate_cpu():
     global CPU_FACTOR
     if "BR_CPU_FACTOR" not in os.environ and os.environ.get("BR_CALIBRATE", "1") == "1":
@@ -335,10 +387,11 @@ def main():
                     import branchreach
                     import comparisonreads
                     import guardreads
+                    import indexreads
                     before = (REPO / path).read_text()
                     row = comparisonreads.changed_row(before, after)
                     if row:
-                        for module in (comparisonreads, guardreads, branchreach):
+                        for module in (comparisonreads, guardreads, indexreads, branchreach):
                             comparison_same.update(module.unchanged(path, before, D.parsed[path], nodeids, row))
                     if comparison_same:
                         comparison_same.difference_update(source_observers(path, M) | D.must)
@@ -440,11 +493,8 @@ def main():
                     if t not in mids:
                         cur = CPU_OVR.get(t, CPU["test"].get(str(t), 1.0))
                         CPU_OVR[t] = min(cur, 0.08)
-            scale_nodes = pure_src and not any(
-                re.search(r"\d|limit|count|len\s*\(|max_|recurs|depth|width|size", line, re.I)
-                for line in patch_text.splitlines()
-                if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
-            )
+            node_limit_edit = pure_src and stress_limit_edit(patch_text)
+            scale_nodes = pure_src and not node_limit_edit and scalable_node_edit(patch_text, D.files, REPO)
             if scale_nodes:
                 t = _nodeid_pos(nodeids).get("tests/test_parser.py::TestParser::test_max_nodes")
                 if t is not None:
@@ -482,10 +532,7 @@ def main():
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
                 body_lines=D.body_lines,
                 fixture_sql_only=fixture_sql_only, fixture_only_tests=fixture_only_tests, mixed_source_tests=mixed_source_tests, scale_nodes=scale_nodes,
-                node_limit_edit=not scale_nodes and any(
-                    re.search(r"max_nodes|_node_count|Maximum number of AST nodes", line)
-                    for line in patch_text.splitlines() if line.startswith(("+", "-"))
-                ),
+                node_limit_edit=node_limit_edit,
                 default_edit=D.default_edit if len(D.files.keys() - D.ast_unchanged) == 1 else None,
                 precise=sorted(D.precise), broad=sorted(D.cands), was_import=bool(D.import_change),
                 reasons=" ".join(D.reasons)[:200],
@@ -3272,7 +3319,7 @@ def _child(j, nodeids, ms, runner, modules):
         if unrun and not failed and hits and not bad and all(hits.get(k, 0) > 0 for k in range(n_sites)) \
                 and (n_ran >= 0.5 * (n_ran + len(unrun)) or (n_ran >= 8 and all(hits.get(k, 0) >= 30 for k in range(n_sites)))):
             note += " EQUIV->drop heavy"
-            unrun = []
+            unrun = [t for t in unrun if t == SIZE_SENSITIVE_TEST[0]]
     # second phase: the light tests are done; a heavy test left unrun is run after
     # all when the schedule time it would free outweighs its cpu
     if unrun and not (j["overlay"] and j.get("unknown")):

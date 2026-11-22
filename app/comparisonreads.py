@@ -106,7 +106,7 @@ def changed_row(before, after):
     return rows[0] if len(rows) == 1 else None
 
 
-@functools.lru_cache(maxsize=2)
+@functools.lru_cache(maxsize=3)
 def site_lines(loader):
     data = loader()
     return {(p, line) for p, line, _ in data["sites"]} if data else set()
