@@ -1384,6 +1384,33 @@ def memo_skippable(ch_lines, nodeids):
     return out
 
 
+def plan_query_stages(runner, lines, cands, nodeids):
+    """Allow a matching plan to stand in only for an unaffected query execution."""
+    lite = _memo_lite() or {}
+    if any(lite.get("stage_shared", {}).get(path, set()).intersection(rows)
+           for path, rows in lines.items()):
+        return
+    pos = _nodeid_pos(nodeids)
+    for tid, (count, phases, shared, stable) in lite.get("stage_index", {}).items():
+        t = pos.get(tid)
+        if t not in cands:
+            continue
+        targets = [runner.MEMO_QUERIES, runner.UNCHANGED_OPT_QUERIES]
+        # Generator edits can change the eager pretty-print between optimization
+        # and planning. Run it before comparing the expression given to Plan.
+        if all(p == "sqlglot/generator.py" or p.startswith("sqlglot/generators/") for p in lines):
+            targets.append(runner.PLAN_QUERIES)
+        for target, hits, outside, repeated in zip(targets, phases, shared, stable):
+            if any(outside.get(path, set()).intersection(rows) for path, rows in lines.items()):
+                continue
+            changed = 0
+            for path, rows in lines.items():
+                by_line = hits.get(path, {})
+                for row in rows:
+                    changed |= by_line.get(row, 0)
+            target[t] = {i for i in range(count) if (repeated & ~changed) & (1 << i)}
+
+
 def memo_cpu(memo_skip, nodeids, subf=None, opt_aff=None, fixture_sql_only=False):
     ml = _memo_lite()
     if ml is None:
@@ -2797,7 +2824,10 @@ def _child(j, nodeids, ms, runner, modules):
     runner.MEMO_SKIP.update(j.get("memo_skip") or [])
     tempfile.tempdir = j["tmp"]
     if not j["overlay"] and j.get("pure_src") and j.get("ch_lines"):
-        _, runner.PARSE_ONLY = query_filter(j["ch_lines"], j["light"] + j["heavy"], nodeids)
+        candidates = j["light"] + j["heavy"]
+        _, runner.PARSE_ONLY = query_filter(j["ch_lines"], candidates, nodeids)
+        if not j.get("fixture_edits"):
+            plan_query_stages(runner, j["ch_lines"], candidates, nodeids)
     if not j["overlay"]:
         for r in j["hot"]:
             if r.startswith("sqlglot/") or r.startswith("tests/"):
@@ -2905,6 +2935,8 @@ def _child(j, nodeids, ms, runner, modules):
         if res.get("fn_only") and ov_lines is not None:
             if res.get("pure"):
                 plan_fixture_workers(cands, ov_lines)
+                if j.get("pure_src") and not j.get("fixture_edits") and not res.get("unknown"):
+                    plan_query_stages(runner, ov_lines, cands, nodeids)
             plan_scope_check(runner, cands, nodeids, ov_lines)
             filter_validators(runner, cands, nodeids, ov_lines)
             aff = opt_affected(ov_lines)

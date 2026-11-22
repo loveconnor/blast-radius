@@ -218,6 +218,8 @@ MEMO_IDS: dict = {}     # test number -> test id
 MEMO_DUCK = False       # reuse reference dataframes / duckdb results when sql is unchanged
 MEMO_SKIP: set = set()  # tests whose queries may skip execution when their plan is unchanged
 UNCHANGED_OPT_QUERIES = {}
+PLAN_QUERIES = {}       # query indices unaffected from Plan construction onward
+PLAN_TRACE = None       # build-time callback at the executor planning boundary
 MEMO_QUERIES = {}       # query indices with unchanged downstream setting reads
 FAST_PROJECTIONS = False
 MEMO_STAT = [0, 0]      # queries skipped, queries re-run after a reference mismatch
@@ -320,6 +322,22 @@ def _memo_optimize(real):
         return r
     optimize._br_memo = True
     return optimize
+
+
+def _plan_checkpoint(real):
+    def plan(expression):
+        cur, t = _SUB["cur"], _SUB["t"]
+        if cur is not None:
+            key = (MEMO_IDS.get(t), cur)
+            if PLAN_TRACE is not None:
+                PLAN_TRACE()
+                MEMO_REC.setdefault("plan_inputs", {})[key] = snapshot_digest(expression)
+            elif cur in PLAN_QUERIES.get(t, ()):
+                previous = MEMO.get("plan_inputs", {}).get(key)
+                if previous is not None and snapshot_digest(expression) == previous:
+                    raise _SkipExec()
+        return real(expression)
+    return plan
 
 
 def _memo_cached_execute(self, sql, tpch=True):
@@ -1349,6 +1367,11 @@ def _timed(run, seconds, t=None, gate=None):
         _SUB["deadline"] = time.time() + seconds
         c0 = time.process_time()
         _FILTER_FIXTURE_ROWS = t in FIXTURE_ONLY_TESTS
+        executor = sys.modules.get("sqlglot.executor")
+        wrap_plan = executor is not None and t in SUBMIT_LAZY and (PLAN_TRACE is not None or t in PLAN_QUERIES)
+        if wrap_plan:
+            original_plan = executor.Plan
+            executor.Plan = _plan_checkpoint(original_plan)
         try:
             if FAST_PROJECTIONS and t in SUBMIT_LAZY:
                 import rowprojection
@@ -1358,6 +1381,8 @@ def _timed(run, seconds, t=None, gate=None):
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             _SUB["deadline"] = None
+            if wrap_plan:
+                executor.Plan = original_plan
             _FILTER_FIXTURE_ROWS = False
             _ITER["allow"] = None   # class fixtures of the next test load everything
             TEST_CPU[t] = TEST_CPU.get(t, 0.0) + time.process_time() - c0

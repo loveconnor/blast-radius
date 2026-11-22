@@ -26,8 +26,11 @@ RUN PYTHONHASHSEED=59 PYTHONDONTWRITEBYTECODE=1 python /app/buildopt.py /app/opt
     || (rm -f /app/optmemo.idx /app/optmemo.bin; echo "optimizer memo build failed: running without it")
 COPY app /app
 # baseline memo for the TPC executor tests, computed from the pinned checkout
-RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /app/memo.pkl \
+RUN PYTHONHASHSEED=59 BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /app/memo.pkl \
     || (rm -f /app/memo.pkl; echo "memo build failed: running without it")
+RUN if [ -s /app/memo.pkl ]; then \
+      PYTHONHASHSEED=157 BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildmemo.py /tmp/stages.pkl /app/memo.pkl && rm -f /tmp/stages*.pkl /tmp/stages.bin; \
+    fi
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildqueryattrs.py /app/queryattrs.pkl
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildvalidators.py /app/validatorcalls.idx
 RUN BR_REPO=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1 python /app/buildscope.py

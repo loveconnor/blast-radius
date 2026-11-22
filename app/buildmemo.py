@@ -1,6 +1,6 @@
 """Image build time: baseline memo for the TPC executor and DuckDB optimizer tests.
 
-usage: python buildmemo.py <out.pkl>
+usage: python buildmemo.py <out.pkl> [baseline.pkl to verify]
 Records, while running the tests once on the unmodified checkout:
   - the duckdb reference dataframe of every reference query (stored lazily in <out>.bin)
   - a digest of every query's optimized expression
@@ -51,20 +51,29 @@ runner.MEMO_IDS = dict(enumerate(IDS))
 runner.SUBMIT_LAZY = {0, 1}
 
 depth = [0]
+in_optimize = [0]
+stage_context = None
+after_plan = False
 
 
-def front(f):
+def front(f, optimizing=False):
     def w(*a, **k):
         depth[0] += 1
+        if optimizing:
+            in_optimize[0] += 1
+            mon.restart_events()
         try:
             return f(*a, **k)
         finally:
             depth[0] -= 1
+            if optimizing:
+                in_optimize[0] -= 1
+                mon.restart_events()
     return w
 
 
 runner.install_memo()
-E.optimize = front(E.optimize)
+E.optimize = front(E.optimize, optimizing=True)
 E.optimize._br_memo = True
 T.transpile = front(T.transpile)
 T.parse_one = front(T.parse_one)
@@ -79,9 +88,17 @@ def on_line(code, line):
     fn = code.co_filename
     if not fn.startswith(REPO) or "/tests/" in fn[len(REPO) - 1:]:
         return mon.DISABLE
+    path = fn[len(REPO):]
+    if stage_context is not None and in_optimize[0]:
+        stage_context[1].setdefault(path, set()).add(line)
+        return None
     if depth[0]:
         return None
-    cur.setdefault(fn[len(REPO):], set()).add(line)
+    if stage_context is not None and after_plan:
+        stage_context[2].setdefault(path, set()).add(line)
+    if stage_context is not None:
+        stage_context[0].setdefault(path, set()).add(line)
+    cur.setdefault(path, set()).add(line)
     return mon.DISABLE
 
 
@@ -91,12 +108,24 @@ outer_events = lineevents.register(mon, TOOL, on_line)
 QUERY_TOOL = 3
 mon.use_tool_id(QUERY_TOOL, "brquery")
 query_maps = {}
+stage_maps = {}
 
 
 def switch_query(index, at_parse=False):
-    global current_query
+    global current_query, stage_context, after_plan
+    after_plan = False
     current_query = contexts.setdefault((index, at_parse), {})
+    stage_context = stages.setdefault(index, [{}, {}, {}])
     mon.restart_events()
+
+
+def start_plan():
+    global after_plan
+    after_plan = True
+    mon.restart_events()
+
+
+runner.PLAN_TRACE = start_plan
 
 
 def query_line(code, line):
@@ -109,6 +138,7 @@ def query_line(code, line):
 query_events = lineevents.register(mon, QUERY_TOOL, query_line)
 for i, tid in enumerate(IDS):
     contexts = {}
+    stages = {}
     if i < 2:
         switch_query(None)
         runner.QUERY_TRACE = switch_query
@@ -123,6 +153,8 @@ for i, tid in enumerate(IDS):
     runner.QUERY_TRACE = None
     if i < 2:
         query_maps[tid] = contexts
+        stage_maps[tid] = stages
+        stage_context = None
     if failed:
         print("baseline test failed:", tid, file=sys.stderr)
         sys.exit(1)
@@ -235,6 +267,7 @@ base_sqls = {
 meta = {
     "parsed": rec.get("parsed", {}),
     "executor_keys": rec.get("executor_keys", {}),
+    "plan_inputs": rec.get("plan_inputs", {}),
     "dsql": rec["dsql"],
     "opt": rec["opt"],
     "rlines": rec["rlines"],
@@ -264,7 +297,26 @@ for tid, contexts in query_maps.items():
                 masks[line] = masks.get(line, 0) | (1 << i)
     if indices == set(range(len(indices))):
         query_index[tid] = (len(indices), by_phase)
+# For each query separately record the work after optimization, outside the
+# memoized reference transpile, and inside the actual optimizer call.
+stage_index = {}
+for tid, stages in stage_maps.items():
+    if tid not in query_index:
+        continue
+    count = query_index[tid][0]
+    shared_stages = stages.pop(None)
+    if set(stages) != set(range(count)):
+        continue
+    masks = [{}, {}, {}]
+    for i, phases in stages.items():
+        for phase, files in enumerate(phases):
+            for file, lines in files.items():
+                target = masks[phase].setdefault(file, {})
+                for line in lines:
+                    target[line] = target.get(line, 0) | (1 << i)
+    stage_index[tid] = (count, masks, shared_stages)
 lite = {
+    "stage_candidate": stage_index,
     "query_shared": shared,
     "query_index": query_index,
     "opt": {k: bool(v) for k, v in rec["opt"].items()},
@@ -275,3 +327,45 @@ lite = {
 }
 with open(out_pkl.replace(".pkl", "_lite.pkl"), "wb") as fh:
     pickle.dump(lite, fh, protocol=4)
+
+# A second hash seed independently exercises the executor, including set-based
+# plan scheduling. Reuse a phase only for queries whose snapshots agree, and
+# treat a line seen in either interpreter as executed.
+if len(sys.argv) > 2:
+    primary = sys.argv[2]
+    with open(primary, "rb") as fh:
+        initial = pickle.load(fh)
+    lite_path = primary.replace(".pkl", "_lite.pkl")
+    with open(lite_path, "rb") as fh:
+        first = pickle.load(fh)
+    verified = {}
+    for tid, (n, phases, setup) in first.pop("stage_candidate", {}).items():
+        alt = stage_index.get(tid)
+        if not alt or alt[0] != n:
+            continue
+        for table, other in zip(phases, alt[1]):
+            for path, rows in other.items():
+                target = table.setdefault(path, {})
+                for row, mask in rows.items():
+                    target[row] = target.get(row, 0) | mask
+        for table, other in zip(setup, alt[2]):
+            for path, rows in other.items():
+                table.setdefault(path, set()).update(rows)
+        stable = [0, 0, 0]
+        for i in range(n):
+            key = tid, i
+            plan = initial["opt"].get(tid, {}).get(i)
+            if plan is not None and plan == meta["opt"].get(tid, {}).get(i):
+                stable[0] |= 1 << i
+                args = initial["executor_keys"].get(key)
+                if args is not None and args == meta["executor_keys"].get(key):
+                    stable[1] |= 1 << i
+            tree = initial["plan_inputs"].get(key)
+            if tree is not None and tree == meta["plan_inputs"].get(key):
+                stable[2] |= 1 << i
+        verified[tid] = (n, phases, setup, stable)
+    first["stage_index"] = verified
+    first["stage_shared"] = {path: set(first["query_shared"].get(path, ())) | set(shared.get(path, ()))
+                             for path in first["query_shared"].keys() | shared.keys()}
+    with open(lite_path, "wb") as fh:
+        pickle.dump(first, fh, protocol=4)
