@@ -6,6 +6,7 @@ actually take are accepted. Anything else is left to the rest of the selector.
 from __future__ import annotations
 
 import ast
+import copy
 import enum
 import os
 import sys
@@ -483,37 +484,33 @@ def _provable_shape(old, new):
     return all(isinstance(s, _CONST_SHAPES) for s in (old.left, *old.comparators))
 
 
-def maybe_equivalent(files: dict, repo, trees=None) -> bool:
-    """Cheap screen for proven_equivalent: False means the proof would fail."""
-    return proven_equivalent(files, repo, _provable_shape, trees)
-
-
-def proven_equivalent(files: dict, repo, prove=None, trees=None) -> bool:
-    """True when every edited file is behavior-preserving and at least one edit was proven so.
-
-    `files` maps a repo-relative path to its new text (None when the file is deleted).
-    """
-    proved = False
+def proof_candidates(files, repo, trees=None):
+    """Capture exactly the changed expressions before probe instrumentation."""
+    changes = []
     for rel, new in files.items():
         if new is None or not rel.endswith(".py"):
-            return False
-        old_path = os.path.join(str(repo), rel)
+            return ()
         try:
-            old = open(old_path, encoding="utf-8").read()
+            with open(os.path.join(repo, rel), encoding="utf-8") as fh:
+                old = fh.read()
         except OSError:
-            return False
+            return ()
         if old == new:
             continue
         pairs = _pairs(old, new, trees.get(rel) if trees else None)
-        if pairs is None:
-            return False
-        if not pairs:
-            continue
+        if pairs is None or any(not _provable_shape(a, b) for a, b in pairs):
+            return ()
         for a, b in pairs:
-            if not (prove(a, b) if prove else _prove(a, b, repo, rel)):
-                return False
-        proved = True
-    return proved
+            # Known unequal literals can never pass the proof.
+            if isinstance(a, ast.Constant) and isinstance(b, ast.Constant):
+                if type(a.value) is not type(b.value) or a.value != b.value:
+                    return ()
+            changes.append((rel, copy.deepcopy(a), copy.deepcopy(b)))
+    return changes
+
+
+def proven_equivalent(changes, repo):
+    return bool(changes) and all(_prove(a, b, repo, rel) for rel, a, b in changes)
 
 
 def unused_initial_value(files, repo, trees):

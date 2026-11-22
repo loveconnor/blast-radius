@@ -402,15 +402,16 @@ def main():
             if not D.all and not fixture_edits and D.parsed and all(r.endswith(".py") for r in D.files):
                 # only the cheap screen here; the proof itself runs after the tests
                 try:
-                    from equiv import maybe_equivalent, unused_initial_value
+                    from equiv import proof_candidates, unused_initial_value
                     if (not D.import_change and not D.must and len(D.files) == 1
                             and re.search(r"(?m)^[-+]\s+\w+(?:: [^=\n]+)? = (?:None|False|True|[0-9]+)\s*$", patch_text)
                             and unused_initial_value(D.files, REPO, D.parsed)):
                         answers[cid] = []
                         log(cid, "none (unobserved local initializer)")
                         continue
-                    if maybe_equivalent(D.files, REPO, D.parsed):
-                        maybe_equiv[cid] = D.files
+                    possible = proof_candidates(D.files, REPO, D.parsed)
+                    if possible:
+                        maybe_equiv[cid] = possible
                 except Exception as e:  # noqa
                     log(cid, "equiv screen failed", repr(e))
             guard_tests = None
@@ -2586,9 +2587,9 @@ def prove_equivalent(maybe_equiv, answers):
     except Exception as e:  # noqa
         log("equiv unavailable", repr(e))
         return
-    for cid, files in maybe_equiv.items():
+    for cid, changes in maybe_equiv.items():
         try:
-            if proven_equivalent(files, REPO):
+            if proven_equivalent(changes, REPO):
                 answers[cid] = []
                 log(cid, "none equiv")
         except Exception as e:  # noqa
@@ -2657,6 +2658,7 @@ def run_jobs(jobs, answers, nodeids, ms, deadline):
                     log("shared overlay executor fixtures failed", repr(e))
     # maps every child would otherwise load for itself
     try:
+        call_observers(MAP_OBJ)
         _submap()
         if REPLAY_ON and len(jobs) >= 2 and any(j.get("pure_src") for j in jobs):
             R = _replay()
