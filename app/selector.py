@@ -160,6 +160,38 @@ def supervise():
     emit([{"commit": c, "workers": [w for w in workers if w]} for c in cids])
 
 
+def broken_leaf_tests(decision, coverage, nodeids):
+    """Bound a single missing/unparseable dialect implementation using cold import traces."""
+    if len(decision.files) != 1 or coverage.tests != nodeids or STATIC_ONLY[0]:
+        return None
+    path, content = next(iter(decision.files.items()))
+    if not re.fullmatch(r"sqlglot/(?:dialects|generators|parsers|typing)/[a-z][a-z0-9_]*\.py", path):
+        return None
+    if content is not None and f"syntax-error {path}" not in decision.reasons:
+        return None
+    imports = load_imports()
+    module = _modname(path)
+    if not imports or module not in imports["by_mod"]:
+        return None
+    selected = set(imports["by_mod"][module]) | coverage.file_users(path)
+    selected.update(set(range(len(nodeids))) - imports["known"])
+    # Reads and directory enumeration can observe a deletion without importing it.
+    for opened, tests in coverage.opened.items():
+        if path == opened or (opened.endswith("/") and path.startswith(opened)):
+            selected.update(tests)
+    for file in ("tests/test_typing.py", "tests/test_sqlglotc.py", "tests/test_build.py",
+                 "tests/test_dialect_entry_points.py", "tests/test_dialect_imports.py"):
+        selected.update(coverage.tests_in_file(file))
+    # A fresh Python launched from a test is outside the import trace. Include
+    # those call sites, even when the outer process never imported this module.
+    for file, line_map in coverage.lines.items():
+        if file.startswith("tests/"):
+            for number, line in enumerate((REPO / file).read_text().splitlines(), 1):
+                if "subprocess" in line and number in line_map:
+                    selected.update(coverage.sets[line_map[number]])
+    return sorted(selected)
+
+
 def calibrate_cpu():
     global CPU_FACTOR
     if "BR_CPU_FACTOR" not in os.environ and os.environ.get("BR_CALIBRATE", "1") == "1":
@@ -258,8 +290,9 @@ def main():
                 except Exception as e:  # noqa
                     log(cid, "equiv screen failed", repr(e))
             if D.all:
-                answers[cid] = sorted(all_tests)
-                log(cid, "ALL", " ".join(D.reasons)[:200])
+                affected = broken_leaf_tests(D, M, nodeids)
+                answers[cid] = sorted(all_tests) if affected is None else affected
+                log(cid, "ALL" if affected is None else f"cold-imports={len(affected)}", " ".join(D.reasons)[:200])
                 continue
             cands = sorted(t for t in D.cands if t is not None)
             answers[cid] = cands  # static fallback

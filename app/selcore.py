@@ -371,7 +371,7 @@ def _fixture(p, fp, M, D):
 # The same goes for the lazy loaders: the dialect registry (a dialect is imported by name
 # the first time anything asks for it) and the packages that resolve attributes on demand.
 CACHE_FILL = {"sqlglot/generator.py": [(71, 92), (1003, 1009)],
-              "sqlglot/dialects/dialect.py": [(98, 305)],   # the Dialects enum and the registry built from it
+              "sqlglot/dialects/dialect.py": [(98, 185), (214, 305)],   # the Dialects enum and the registry built from it
               "sqlglot/dialects/__init__.py": [(1, 10 ** 6)],
               "sqlglot/optimizer/__init__.py": [(1, 10 ** 6)]}
 
