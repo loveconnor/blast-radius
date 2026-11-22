@@ -33,7 +33,7 @@ def setting(key):
         current_settings.add(key)
 
 
-tracked = settingtrace.install(setting)
+tracked = settingtrace.install(setting, schemas=True)
 
 
 def line(code, number):

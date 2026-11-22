@@ -28,7 +28,7 @@ def setting(key):
         blocks[current][1].add(key)
 
 
-tracked = settingtrace.install(setting)
+tracked = settingtrace.install(setting, schemas=True)
 root = str(Path(runner.REPO)) + "/"
 prefix = root + "sqlglot/"
 monitor = sys.monitoring

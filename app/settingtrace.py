@@ -10,7 +10,7 @@ def effective(key):
     return key[0], "read:" + key[1]
 
 
-def install(record, escaped=False):
+def install(record, escaped=False, schemas=False):
     import sys
     from sqlglot import exp
     from sqlglot.generator import Generator
@@ -66,6 +66,25 @@ def install(record, escaped=False):
                     setattr(cls, name, EscapeSetting(key, value))
                 else:
                     setattr(cls, name, Setting(key, value))
+    if schemas:
+        # Each subclass has its own required_args set. An inherited arg_types
+        # access resolves to the descriptor on the class defining that dict.
+        seen = set()
+        pending = [exp.Expr]
+        while pending:
+            cls = pending.pop()
+            if cls in seen:
+                continue
+            seen.add(cls)
+            pending.extend(cls.__subclasses__())
+            if not cls.__module__.startswith("sqlglot.expressions"):
+                continue
+            for attr, typ in (("arg_types", dict), ("required_args", set)):
+                value = vars(cls).get(attr)
+                if type(value) is typ:
+                    key = (cls.__module__ + ":" + cls.__qualname__, attr)
+                    tracked.add(key)
+                    setattr(cls, attr, Setting(key, value))
     return tracked
 
 

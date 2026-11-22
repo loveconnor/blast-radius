@@ -1,6 +1,8 @@
 """Look up exact identifier mentions in the pinned source without rescanning files."""
 import ast
 import functools
+import gzip
+import json
 import pickle
 import re
 import zlib
@@ -83,3 +85,18 @@ def find(name):
         fh.seek(offset)
         source, tests = pickle.loads(zlib.decompress(fh.read(size)))
     return {paths[f]: set(lines) for f, lines in source.items()}, tests
+
+
+@functools.lru_cache(maxsize=1)
+def dialect_readers():
+    """Per-site tests that resolved an attribute through a builtin dialect."""
+    path = Path(__file__).with_name("bindings.json.gz")
+    if not path.exists():
+        return (), {}
+    with gzip.open(path, "rt") as fh:
+        data = json.load(fh)
+    sites = {}
+    for location, tests in data["sites"].items():
+        file, line, name = location.split("|")
+        sites.setdefault(name, {})[(file, int(line))] = frozenset(tests)
+    return data["tests"], sites

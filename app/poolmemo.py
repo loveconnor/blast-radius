@@ -26,6 +26,11 @@ def plan(lines, settings=()):
     global PLAN
     PLAN = None
     eligible = ("sqlglot/optimizer/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/dialects/", "sqlglot/typing/")
+    schema_only = bool(settings) and all(
+        owner.startswith("sqlglot.expressions.") and attr in ("arg_types", "required_args")
+        for owner, attr in settings)
+    if schema_only:
+        eligible += ("sqlglot/expressions/",)
     if not lines or any(not (path.startswith(eligible) or path in ("sqlglot/generator.py", "sqlglot/parser.py"))
                         for path in lines):
         return {}

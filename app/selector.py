@@ -446,6 +446,7 @@ def main():
                 cid=cid, files=D.files, fixture_edits=fixture_edits, overlay_readers=overlay_readers, olds=olds, hot=hot, overlay=bool(D.import_change), guard_tests=guard_tests, guard_routes=guard_routes, guard_direct=guard_direct,
                 light=light, heavy=heavy, instr=instr, n_sites=n_sites, subf=subf, cpu_ovr=dict(CPU_OVR), iterf={t: sorted(v) for t, v in iterf.items()}, opt_aff=opt_aff,
                 memo_duck=memo_duck, memo_skip=memo_skip, ch_lines=ch_lines, pure_src=pure_src,
+                runtime_lines_only=bool(D.rt_lines) and D.ch_lines == D.rt_lines,
                 fixture_sql_only=fixture_sql_only, fixture_only_tests=fixture_only_tests, mixed_source_tests=mixed_source_tests, scale_nodes=scale_nodes,
                 node_limit_edit=not scale_nodes and any(
                     re.search(r"max_nodes|_node_count|Maximum number of AST nodes", line)
@@ -1776,6 +1777,47 @@ def _diff_scope(old_mods, new_mods, seeds, files=None):
     return scope | reached
 
 
+def _body_line_changes(job, delta, old_modules, new_modules):
+    """Limit a reimported method to its edited lines when only its own body changed."""
+    if not job.get("runtime_lines_only") or not delta:
+        return False
+    import types
+    for kind, owner, name, _ in delta:
+        if kind != "methcode":
+            return False
+        module, _, cls_name = owner.partition(":")
+        path = module.replace(".", "/") + ".py"
+        if not job["ch_lines"].get(path):
+            return False
+        previous = None
+        for modules in (old_modules, new_modules):
+            target = modules.get(module)
+            if target is None:
+                return False
+            if cls_name:
+                target = vars(target).get(cls_name)
+                if not isinstance(target, type):
+                    return False
+            fn = vars(target).get(name)
+            if isinstance(fn, (staticmethod, classmethod)):
+                fn = fn.__func__
+            qualname = cls_name + "." + name if cls_name else name
+            if (type(fn) is not types.FunctionType or fn.__module__ != module or fn.__qualname__ != qualname
+                    or fn.__code__.co_qualname != qualname or fn.__closure__ or hasattr(fn, "__wrapped__")):
+                return False
+            if modules is old_modules:
+                code_lines = {n for _, _, n in fn.__code__.co_lines() if n}
+                if code_lines.isdisjoint(job["ch_lines"][path]):
+                    return False
+                previous = fn
+            else:
+                import statediff
+                compare = statediff._Cmp()
+                if not compare.same(previous.__defaults__, fn.__defaults__) or not compare.same(previous.__kwdefaults__, fn.__kwdefaults__):
+                    return False
+    return True
+
+
 def overlay_candidates(j, old_mods, nodeids):
     """After re-importing the changed sqlglot: what changed in import-time state, and
     which tests read it."""
@@ -1814,6 +1856,7 @@ def overlay_candidates(j, old_mods, nodeids):
                  or (c[2] != "_abc_impl" and not statediff.reordered_only(old_mods, new_mods, c))]
     except Exception as e:  # noqa
         return {"cands": broad | precise, "note": f"diff-failed {e!r}"}
+    exact_bodies = _body_line_changes(j, delta, old_mods, new_mods)
     cands = set(precise)
     unknown = []
     M = MAP_OBJ
@@ -1860,7 +1903,7 @@ def overlay_candidates(j, old_mods, nodeids):
                     for k2, i in OR[1].get((owner, attr), []):
                         outside |= OR[0][i]
             rngs = _function_ranges(old_mods, new_mods, owner, attr)
-            if rngs:
+            if rngs and not exact_bodies:
                 for rng in rngs:
                     fn_lines.setdefault(rng[0], set()).update(range(rng[1], rng[2] + 1))
             if kind == "meth" or not precise:
@@ -1898,11 +1941,25 @@ def overlay_candidates(j, old_mods, nodeids):
             if refs is None:
                 unknown.append((kind, owner, attr))
             else:
-                # a module global: its readers are the lines that name it
+                # A module dictionary and a dialect class field can share a
+                # name. Only discard a module read when the upstream test
+                # actually resolved that lookup through a builtin dialect.
+                instance_reads = {}
+                if key is not None and type(vars(old_mods[owner]).get(attr)) is dict and type(vars(new_mods[owner]).get(attr)) is dict:
+                    import sourcerefs
+                    tests, sites = sourcerefs.dialect_readers()
+                    if tests == nodeids:
+                        instance_reads = sites.get(attr, {})
                 for f, ls in refs[0].items():
-                    fn_lines.setdefault(f, set()).update(ls)
-                    for l in ls:
-                        cands |= M.covering(f, l, l)
+                    for line in ls:
+                        readers = M.covering(f, line, line)
+                        traced = instance_reads.get((f, line))
+                        if traced and f not in j["files"]:
+                            readers = readers - traced
+                            if not readers:
+                                continue
+                        fn_lines.setdefault(f, set()).add(line)
+                        cands.update(readers)
                 cands |= refs[1]
                 outside |= refs[1]
                 cls_readers |= refs[1]
@@ -1993,7 +2050,19 @@ def overlay_candidates(j, old_mods, nodeids):
                 note += f" settings={len(setting_delta)}"
         if len(setting_delta) != sum(d[0] == "cls" for d in delta):
             setting_delta.clear()
-    return {"cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
+    # Changing an expression's argument schema changes both the dictionary and
+    # its derived required_args set. Track whole-attribute reads for each row.
+    # Do this only when the state comparison saw exclusively schema changes.
+    schema = set()
+    if (delta and not unknown and not forced and all(
+            kind == "cls" and owner.startswith("sqlglot.expressions.")
+            and attr in ("arg_types", "required_args") for kind, owner, attr, _ in delta)):
+        schema = {(owner, attr) for _, owner, attr, _ in delta}
+        if schema <= tracked_query_settings():
+            note += f" schema-attributes={len(schema)}"
+        else:
+            schema.clear()
+    return {"cands": cands, "validator_routes": validator_routes, "direct_dispatch": direct, "default_sites": default_sites, "settings": setting_delta, "schema": schema, "note": note, "unknown": bool(unknown), "forced": forced, "disp": disp,
             "scalar_only": bool(setting_delta) and all(d[0] in ("cls", "methcode") for d in delta),
             "pure": all(d[0] in ("methcode", "dictcode") for d in delta) and not forced,
             "fn_only": all(d[0] in ("methcode", "dictcode", "meth") for d in delta) and not forced and not unknown,
@@ -2629,11 +2698,12 @@ def _child(j, nodeids, ms, runner, modules):
             runner.ITER_FILTER.update(itf)
             if itf:
                 note += f" iter={ {t: len(v) for t, v in itf.items()} }"[:120]
-        if res.get("settings") and ov_lines is not None:
-            plan_fixture_workers(cands, ov_lines, res["settings"])
-            plan_scope_check(runner, cands, nodeids, ov_lines, res["settings"])
-            filter_validators(runner, cands, nodeids, ov_lines, res["settings"])
-            subf = setting_queries(res["settings"], ov_lines, cands, nodeids)
+        query_settings = res.get("settings") or res.get("schema")
+        if query_settings and ov_lines is not None:
+            plan_fixture_workers(cands, ov_lines, query_settings)
+            plan_scope_check(runner, cands, nodeids, ov_lines, query_settings)
+            filter_validators(runner, cands, nodeids, ov_lines, query_settings)
+            subf = setting_queries(query_settings, ov_lines, cands, nodeids)
             runner.SUBMIT_FILTER.update(subf)
             j["subf"].update(subf)
             CPU_OVR.update(sub_cpu(subf))
